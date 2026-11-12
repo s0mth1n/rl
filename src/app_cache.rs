@@ -19,11 +19,43 @@ fn directory_mtimes() -> BTreeMap<PathBuf, (u64, u32)> {
         .into_iter()
         .filter_map(|base| {
             let dir = base.join("applications");
-            let modified = std::fs::metadata(&dir).ok()?.modified().ok()?;
-            let elapsed = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
-            Some((dir, (elapsed.as_secs(), elapsed.subsec_nanos())))
+            directory_signature(&dir).map(|signature| (dir, signature))
         })
         .collect()
+}
+
+/// Newest mtime among the directory and every .desktop file inside it.
+/// A directory's own mtime only tracks entry creation and removal, so
+/// in-place edits of existing desktop files must contribute their own.
+fn directory_signature(dir: &Path) -> Option<(u64, u32)> {
+    let mut newest = mtime(std::fs::metadata(dir).ok()?)?;
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(d) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if entry.path().extension().is_some_and(|ext| ext == "desktop") {
+                if let Some(t) = entry.metadata().ok().and_then(mtime) {
+                    if t > newest {
+                        newest = t;
+                    }
+                }
+            }
+        }
+    }
+    Some(newest)
+}
+
+fn mtime(metadata: std::fs::Metadata) -> Option<(u64, u32)> {
+    let modified = metadata.modified().ok()?;
+    let elapsed = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
+    Some((elapsed.as_secs(), elapsed.subsec_nanos()))
 }
 
 fn cache_path() -> Option<PathBuf> {
@@ -140,6 +172,29 @@ mod tests {
             [app("Usable")]
         );
     }
+}
+
+#[test]
+fn in_place_desktop_edit_changes_the_directory_signature() {
+    let _env = crate::testutil::ENV_LOCK.lock().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let apps = root.path().join("data/applications");
+    std::fs::create_dir_all(&apps).unwrap();
+    let entry = apps.join("fixture.desktop");
+    std::fs::write(&entry, "[Desktop Entry]\nName=One\nExec=one\n").unwrap();
+    let old = std::env::var_os("XDG_DATA_HOME");
+    std::env::set_var("XDG_DATA_HOME", root.path().join("data"));
+    let before = directory_mtimes();
+    // Editing the file in place must invalidate the cache even though the
+    // directory's own mtime only tracks entry creation and removal.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&entry, "[Desktop Entry]\nName=Two\nExec=two\n").unwrap();
+    let after = directory_mtimes();
+    match old {
+        Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+        None => std::env::remove_var("XDG_DATA_HOME"),
+    }
+    assert_ne!(before, after, "in-place edit went unnoticed");
 }
 
 #[cfg(test)]

@@ -404,9 +404,17 @@ impl Canvas {
         let asc = font.v_metrics(sc).ascent;
         let mut text = s.to_string();
         if Self::text_width(font, size, &text) > max_w {
-            while !text.is_empty() && Self::text_width(font, size, &format!("{text}…")) > max_w {
-                text.pop();
+            let ellipsis = font.glyph('…').scaled(sc);
+            let advance = ellipsis.h_metrics().advance_width;
+            let mut keep = 0;
+            for ((index, ch), glyph) in s.char_indices().zip(font.layout(s, sc, point(0.0, 0.0))) {
+                let end = glyph.position().x + glyph.unpositioned().h_metrics().advance_width;
+                let width = end + font.pair_kerning(sc, glyph.id(), ellipsis.id()) + advance;
+                if width <= max_w {
+                    keep = index + ch.len_utf8();
+                }
             }
+            text.truncate(keep);
             text.push('…');
         }
         let mut end = x;
@@ -769,7 +777,7 @@ fn action_label(a: &Action) -> &'static str {
         Action::System(_) => "Run",
         Action::Calculate(_) => "Copy",
         Action::Window(_) => "Switch",
-        Action::Clip(_) | Action::ClipFiles(_) | Action::ClipImg(_) => "Copy",
+        Action::Clip(..) | Action::ClipFiles(..) | Action::ClipImg(..) => "Copy",
         Action::View(_) => "→",
         Action::Theme(_) => "Apply",
     }
@@ -1037,6 +1045,21 @@ fn input_start(font: &Font, size: f32, query: &str, caret: usize, max_w: f32) ->
     head.len() - tail.len()
 }
 
+fn input_glyphs<'a>(
+    font: &'a Font<'_>,
+    size: f32,
+    text: &'a str,
+) -> impl Iterator<Item = (usize, f32)> + 'a {
+    text.char_indices()
+        .zip(font.layout(text, Scale::uniform(size), point(0.0, 0.0)))
+        .map(|((i, ch), glyph)| {
+            (
+                i + ch.len_utf8(),
+                glyph.position().x + glyph.unpositioned().h_metrics().advance_width,
+            )
+        })
+}
+
 pub fn input_at_mode(
     font: &Font,
     query: &str,
@@ -1045,31 +1068,25 @@ pub fn input_at_mode(
     x: f64,
     literal: bool,
 ) -> usize {
-    let shown = if literal {
-        query
-    } else {
-        query
-            .strip_prefix([':', ';', '#'])
-            .map(str::trim_start)
-            .unwrap_or(query)
-    };
+    let shown = input_visible_text(if literal { "" } else { query }, query);
     let prefix = query.len() - shown.len();
     let caret = caret.saturating_sub(prefix).min(shown.len());
     let start = input_start(
         font,
-        14.0,
+        16.0,
         shown,
         caret,
         (width as f32 - INPUT_X - INPUT_RIGHT).max(0.0),
     );
     let x = x as f32 - INPUT_X;
     let mut previous = 0.0;
-    for (i, ch) in shown[start..].char_indices() {
-        let next = Canvas::text_width(font, 14.0, &shown[start..start + i + ch.len_utf8()]);
+    let mut index = 0;
+    for (end, next) in input_glyphs(font, 16.0, &shown[start..]) {
         if x < (previous + next) / 2.0 {
-            return prefix + start + i;
+            return prefix + start + index;
         }
         previous = next;
+        index = end;
     }
     query.len()
 }
@@ -1166,11 +1183,11 @@ pub fn draw_input_with_placeholder(
     let caret = caret.saturating_sub(prefix).min(query.len());
     let start = input_start(font, fs, query, caret, max_w);
     let mut end = start;
-    for (i, ch) in query[start..].char_indices() {
-        if Canvas::text_width(font, fs, &query[start..start + i + ch.len_utf8()]) > max_w {
+    for (index, width) in input_glyphs(font, fs, &query[start..]) {
+        if width > max_w {
             break;
         }
-        end = start + i + ch.len_utf8();
+        end = start + index;
     }
     if let Some(anchor) = anchor {
         let anchor = anchor.saturating_sub(prefix).min(query.len());
@@ -1620,6 +1637,99 @@ mod tests {
         (x0..x1)
             .flat_map(|x| (y0..y1).map(move |y| (x, y)))
             .any(|(x, y)| px(cv, x, y) == want)
+    }
+
+    #[test]
+    fn combining_pointer_can_hit_the_end_of_a_long_zero_advance_run() {
+        let font = Font::try_from_vec(
+            std::fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf").unwrap(),
+        )
+        .unwrap();
+        let text = format!("e{}", "\u{301}".repeat(10000));
+        assert_eq!(input_at_mode(&font, &text, 0, 600, 400.0, true), text.len());
+    }
+
+    #[test]
+    fn input_glyph_widths_match_independent_prefix_layout() {
+        let font = Font::try_from_vec(
+            std::fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf").unwrap(),
+        )
+        .unwrap();
+        for text in [
+            "",
+            "AVATAR WAVE",
+            "éā",
+            "中文",
+            "مرحبا",
+            "👩🏽‍💻 x",
+            "a\u{200b}b",
+        ] {
+            for size in [13.0, 16.0, 32.0] {
+                let expected: Vec<_> = text
+                    .char_indices()
+                    .map(|(i, ch)| {
+                        let end = i + ch.len_utf8();
+                        (end, Canvas::text_width(&font, size, &text[..end]))
+                    })
+                    .collect();
+                assert_eq!(
+                    input_glyphs(&font, size, text).collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn input_hit_uses_the_rendered_font_size_and_visible_prefix() {
+        let font = Font::try_from_vec(
+            std::fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf").unwrap(),
+        )
+        .unwrap();
+        let text = "WWWWWWWWWW";
+        let x = INPUT_X + Canvas::text_width(&font, 16.0, &text[..5]);
+        assert_eq!(
+            input_at_mode(&font, text, text.len(), 600, x as f64, true),
+            5
+        );
+        let theme = "#  WWWWWWWWWW";
+        assert_eq!(
+            input_at_mode(&font, theme, theme.len(), 600, INPUT_X as f64, false),
+            1
+        );
+    }
+
+    #[test]
+    fn linear_ellipsis_keeps_the_scalar_output_for_unicode_and_kerning() {
+        let font = Font::try_from_vec(
+            std::fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf").unwrap(),
+        )
+        .unwrap();
+        for text in [
+            "AVATAR WAVE",
+            "é界🙂 café",
+            "i̇ ā",
+            "WWWWWWWWWW",
+            "",
+            "👨‍👩‍👧 long title",
+        ] {
+            for width in [0.0, 1.0, 12.0, 25.0, 49.5, 80.0, 500.0] {
+                let mut expected = text.to_string();
+                if Canvas::text_width(&font, 16.0, text) > width {
+                    while !expected.is_empty()
+                        && Canvas::text_width(&font, 16.0, &format!("{expected}…")) > width
+                    {
+                        expected.pop();
+                    }
+                    expected.push('…');
+                }
+                let mut fast = Canvas::new(600, 35);
+                let mut scalar = Canvas::new(600, 35);
+                fast.text(&font, 16.0, 0.0, 0.0, text, [255; 3], 1.0, width);
+                scalar.text(&font, 16.0, 0.0, 0.0, &expected, [255; 3], 1.0, 1000.0);
+                assert_eq!(fast.buf, scalar.buf, "{text:?} {width}");
+            }
+        }
     }
 
     #[test]

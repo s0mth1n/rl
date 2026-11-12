@@ -246,6 +246,10 @@ pub fn is_image_path(path: &str) -> bool {
 pub fn parse_color(text: &str) -> Option<[u8; 4]> {
     let text = text.trim();
     if let Some(hex) = text.strip_prefix('#') {
+        // Byte lengths below only match for ASCII hex digits.
+        if !hex.is_ascii() {
+            return None;
+        }
         let c = |i: usize| u8::from_str_radix(&hex[i..i + 1].repeat(2), 16).ok();
         let p = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
         return match hex.len() {
@@ -346,6 +350,7 @@ pub(crate) fn esc(t: &str) -> String {
     t.replace('\\', "\\\\")
         .replace('\n', "\\n")
         .replace('\t', "\\t")
+        .replace('\r', "\\r")
 }
 pub(crate) fn unesc(t: &str) -> String {
     let mut out = String::with_capacity(t.len());
@@ -355,6 +360,7 @@ pub(crate) fn unesc(t: &str) -> String {
             match c.next() {
                 Some('n') => out.push('\n'),
                 Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
                 Some('\\') => out.push('\\'),
                 Some(o) => {
                     out.push('\\');
@@ -393,6 +399,20 @@ impl History {
     /// Add a text/uri-list capture: decoded paths, one per line.
     pub fn push_files(&mut self, text: &str) -> bool {
         self.push_kind(text, true)
+    }
+
+    /// Add a text/uri-list clipboard read. A list with no file:// URIs (a
+    /// dragged web link, say) is kept as plain text, like a text read.
+    pub fn push_uri_list(&mut self, text: &str) -> bool {
+        let paths = uri_list_paths(text).unwrap_or_default();
+        if paths.is_empty() {
+            self.push(text)
+        } else {
+            self.push_files(&paths.join(
+                "
+",
+            ))
+        }
     }
 
     /// True when the newest copy overall is an image: zlaunch dedups against
@@ -612,13 +632,29 @@ impl History {
     /// Remove the entry an action points at. False when it is not a history entry or is already gone.
     pub fn remove(&mut self, action: &crate::items::Action) -> bool {
         use crate::items::Action;
-        let (a, b) = (self.entries.len(), self.images.len());
-        match action {
-            Action::Clip(t) => self.entries.retain(|e| &e.text != t),
-            Action::ClipImg(id) => self.images.retain(|i| i.id != *id),
-            _ => return false,
-        }
-        a != self.entries.len() || b != self.images.len()
+        // Only the selected copy goes: duplicates with the same text stay.
+        let removed = match action {
+            Action::Clip(t, at) => self
+                .entries
+                .iter()
+                .position(|e| &e.text == t && !e.files && e.at == *at)
+                .map(|pos| self.entries.remove(pos))
+                .is_some(),
+            Action::ClipFiles(t, at) => self
+                .entries
+                .iter()
+                .position(|e| &e.text == t && e.files && e.at == *at)
+                .map(|pos| self.entries.remove(pos))
+                .is_some(),
+            Action::ClipImg(id, at) => self
+                .images
+                .iter()
+                .position(|i| i.id == *id && i.at == *at)
+                .map(|pos| self.images.remove(pos))
+                .is_some(),
+            _ => false,
+        };
+        removed
     }
 
     #[cfg(test)]
@@ -626,6 +662,20 @@ impl History {
         self.entries.clear();
         self.images.clear();
     }
+}
+
+/// Minimal RGBA PNG for previews in tests.
+#[cfg(test)]
+pub(crate) fn tests_png(w: u32, h: u32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut encoder = png::Encoder::new(&mut bytes, w, h);
+    encoder.set_color(png::ColorType::Rgba);
+    let mut writer = encoder.write_header().unwrap();
+    writer
+        .write_image_data(&vec![255; (w * h * 4) as usize])
+        .unwrap();
+    writer.finish().unwrap();
+    bytes
 }
 
 #[cfg(test)]
@@ -669,9 +719,10 @@ mod tests {
         let mut history = History::new(4);
         history.push("first");
         history.push("second");
-        assert!(history.remove(&crate::items::Action::Clip("first".into())));
+        let at = history.entries[1].at;
+        assert!(history.remove(&crate::items::Action::Clip("first".into(), at)));
         assert_eq!(texts(&history), v(&["second"]));
-        assert!(!history.remove(&crate::items::Action::Clip("missing".into())));
+        assert!(!history.remove(&crate::items::Action::Clip("missing".into(), at)));
         assert_eq!(texts(&history), v(&["second"]));
         history.images.push(Img {
             id: 1,
@@ -687,12 +738,67 @@ mod tests {
             path: std::path::PathBuf::new(),
             w: 1,
             h: 1,
-            at: 0,
+            at: 1,
         });
-        assert!(history.remove(&crate::items::Action::ClipImg(1)));
+        assert!(history.remove(&crate::items::Action::ClipImg(1, 0)));
         assert_eq!(history.images.iter().map(|i| i.id).collect::<Vec<_>>(), [2]);
-        assert!(!history.remove(&crate::items::Action::ClipImg(3)));
+        assert!(!history.remove(&crate::items::Action::ClipImg(3, 0)));
         assert_eq!(history.images.len(), 1);
+    }
+
+    #[test]
+    fn deleting_a_duplicate_removes_only_that_copy() {
+        let mut h = History::new(9);
+        assert!(h.push("dup"));
+        assert!(h.push("between"));
+        assert!(h.push("dup"));
+        // Deleting the older copy keeps the newer one in place.
+        let older = h.entries[2].at;
+        assert!(h.remove(&crate::items::Action::Clip("dup".into(), older)));
+        assert_eq!(texts(&h), vec!["dup", "between"]);
+        // A stale action no longer matches; the remaining copy deletes by its own timestamp.
+        let newer = h.entries[0].at;
+        assert!(!h.remove(&crate::items::Action::Clip("dup".into(), older)));
+        assert!(h.remove(&crate::items::Action::Clip("dup".into(), newer)));
+        assert_eq!(texts(&h), vec!["between"]);
+    }
+
+    #[test]
+    fn file_entries_delete_independently_of_text_entries() {
+        let mut h = History::new(9);
+        assert!(h.push_files("/tmp/a\n/tmp/b"));
+        assert!(h.push("/tmp/a\n/tmp/b"));
+        // Same text, different kinds: deleting one keeps the other.
+        let files_at = h.entries.iter().find(|e| e.files).map(|e| e.at).unwrap();
+        let text_at = h.entries.iter().find(|e| !e.files).map(|e| e.at).unwrap();
+        assert!(h.remove(&crate::items::Action::ClipFiles(
+            "/tmp/a\n/tmp/b".into(),
+            files_at
+        )));
+        assert_eq!(h.entries.len(), 1);
+        assert!(!h.entries[0].files);
+        assert!(h.remove(&crate::items::Action::Clip(
+            "/tmp/a\n/tmp/b".into(),
+            text_at
+        )));
+        assert!(h.entries.is_empty());
+    }
+
+    #[test]
+    fn uri_list_without_file_uris_falls_back_to_text() {
+        let mut h = History::new(9);
+        // A dragged web link is a uri-list with no file:// lines: keep the URL.
+        assert!(h.push_uri_list("https://example.com/page"));
+        assert_eq!(texts(&h), vec!["https://example.com/page"]);
+        assert!(!h.entries[0].files);
+        // File URIs still decode to paths, and comments are skipped.
+        assert!(h.push_uri_list("# comment\nfile:///tmp/a%20b.png"));
+        assert_eq!(h.entries[0].text, "/tmp/a b.png");
+        assert!(h.entries[0].files);
+        // A uri-list read that is only comments drops nothing silently either.
+        assert!(h.push_uri_list("# just a comment"));
+        assert_eq!(h.entries[0].text, "# just a comment");
+        assert!(!h.entries[0].files);
     }
 
     #[test]
@@ -832,15 +938,7 @@ mod tests {
         assert_eq!(strip_html("AT&T; verizon"), "AT&T; verizon");
     }
     fn png(w: u32, h: u32) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        let mut encoder = png::Encoder::new(&mut bytes, w, h);
-        encoder.set_color(png::ColorType::Rgba);
-        let mut writer = encoder.write_header().unwrap();
-        writer
-            .write_image_data(&vec![255; (w * h * 4) as usize])
-            .unwrap();
-        writer.finish().unwrap();
-        bytes
+        crate::clip::tests_png(w, h)
     }
     #[test]
     fn text_limit_counts_bytes_and_rejections_leave_history_unchanged() {
@@ -1017,12 +1115,24 @@ mod tests {
         assert!(h.push_image(&png(2, 1)));
         let image_ids = h.images.iter().map(|i| i.id).collect::<Vec<_>>();
         h.save_to(d.path());
-        assert!(h.remove(&Action::Clip("first".into())));
+        let first_at = h
+            .entries
+            .iter()
+            .find(|e| e.text == "first")
+            .map(|e| e.at)
+            .unwrap();
+        assert!(h.remove(&Action::Clip("first".into(), first_at)));
         assert_eq!(texts(&h), v(&["second"]));
-        assert!(!h.remove(&Action::Clip("first".into())));
+        assert!(!h.remove(&Action::Clip("first".into(), first_at)));
         assert_eq!(h.images.iter().map(|i| i.id).collect::<Vec<_>>(), image_ids);
-        assert!(h.remove(&Action::ClipImg(image_ids[0])));
-        assert!(!h.remove(&Action::ClipImg(image_ids[0])));
+        let img0_at = h
+            .images
+            .iter()
+            .find(|i| i.id == image_ids[0])
+            .map(|i| i.at)
+            .unwrap();
+        assert!(h.remove(&Action::ClipImg(image_ids[0], img0_at)));
+        assert!(!h.remove(&Action::ClipImg(image_ids[0], img0_at)));
         assert_eq!(
             h.images.iter().map(|i| i.id).collect::<Vec<_>>(),
             vec![image_ids[1]]
@@ -1049,8 +1159,8 @@ mod tests {
         for action in [
             Action::App(0),
             Action::View(";".into()),
-            Action::ClipImg(u64::MAX),
-            Action::Clip("missing".into()),
+            Action::ClipImg(u64::MAX, 0),
+            Action::Clip("missing".into(), 0),
         ] {
             assert!(!h.remove(&action), "{action:?}");
             assert_eq!(h.entries, before);
@@ -1064,6 +1174,19 @@ mod tests {
         assert_eq!(esc(text), "λ\\t\\n\\\\n\\\\t\\\\\\\\end\\\\");
         assert_eq!(unesc(&esc(text)), text);
         assert_eq!(unesc("\\q\\"), "\\q\\");
+        // A trailing carriage return survives the save/load round trip.
+        let text = "line\r\ntrailing\r";
+        assert_eq!(unesc(&esc(text)), text);
+    }
+
+    #[test]
+    fn color_parsing_ignores_non_ascii_hex() {
+        // Multi-byte characters must never index into the hex digits.
+        assert_eq!(parse_color("#aé"), None);
+        assert_eq!(parse_color("#aébcd"), None);
+        assert_eq!(parse_color("#aébcdef"), None);
+        assert_eq!(parse_color("#éé"), None);
+        assert_eq!(parse_color("#abc"), Some([0xaa, 0xbb, 0xcc, 255]));
     }
     #[test]
     fn bounded_and_deduped() {

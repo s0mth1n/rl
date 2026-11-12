@@ -6,9 +6,10 @@ A small CPU-rendered Wayland launcher. This branch includes:
 - An emoji picker with name and shortcode search.
 - Text and PNG clipboard history.
 - Web search with configurable providers and prefix triggers.
+- A calculator, system actions and window switching.
 
 There are no quicklinks, notes, window controls, process browser,
-file search, calculator, currency conversion or other utility views.
+file search, currency conversion or other utility views.
 
 ## Build and run
 
@@ -25,8 +26,24 @@ cargo build --release
 
 CLI commands, as in zlaunch: `show [-m MODES]`, `hide`, `toggle [-m MODES]`, `quit`,
 `reload`, `theme` (prints the current theme), `theme list` and `theme set NAME`.
-Modes include combined, applications, emojis, clipboard, themes and search.
+Modes are combined, applications, emojis, calculator, clipboard, actions,
+search, themes and windows.
 The daemon stays alive while the panel is hidden.
+
+## Install (optional)
+
+The files in packaging/ are templates: replace @BINARY@ with the installed
+binary path before use.
+
+```sh
+install -Dm755 target/release/zl ~/.local/bin/zl
+sed "s|@BINARY@|$HOME/.local/bin/zl|" packaging/zl.desktop > ~/.local/share/applications/zl.desktop
+sed "s|@BINARY@|$HOME/.local/bin/zl|" packaging/zl.service > ~/.config/systemd/user/zl.service
+install -Dm644 packaging/zl.svg ~/.local/share/icons/hicolor/scalable/apps/zl.svg
+systemctl --user enable --now zl.service   # to run the daemon as a service
+```
+
+To uninstall, disable the service if it was enabled and remove those files.
 
 ## Controls
 
@@ -34,8 +51,7 @@ Type to search applications. Select Emoji Picker, Clipboard History or Themes
 from the launcher, or type `:`, `;` or `#` directly.
 Use Up/Down or Tab/Shift-Tab to select and Enter to activate. Escape clears
 the current view, then closes the panel. Ctrl+A selects the query; Backspace then clears it. Home and End move the
-text caret, and Shift extends the text selection. By default a double click
-activates a row; single-click activation is a config key. In the emoji grid,
+text caret, and Shift extends the text selection. A double click activates a row. In the emoji grid,
 Left/Right moves one cell and Up/Down moves one grid row, wrapping in the
 same column. Search covers the full emoji list.
 
@@ -66,7 +82,8 @@ font_size = 14.0
 Font settings are optional. Theme font settings override the global table at startup;
 changing the picker selection previews colors without changing the startup fonts.
 
-`hyprland_auto_blur` is parsed but has no effect in this renderer.
+On Hyprland, `hyprland_auto_blur` sends the layer rules that blur behind
+the panel; elsewhere it does nothing.
 Panel dimensions are rounded to whole pixels; invalid or nonpositive dimensions
 use defaults, and dimensions above 8192 are capped. Panels needing more than
 256 MiB at the output scale are refused.
@@ -84,8 +101,9 @@ Clipboard history is local and saved under `$XDG_STATE_HOME/zl/clipboard`
 (normally `~/.local/state/zl/clipboard`), with a private directory and files.
 Copies marked with password-manager/concealed MIME hints are ignored unless
 `store_passwords = true`. Other unmarked secrets can still enter history.
-Text is capped at 16 KiB, PNG data at 4 MiB per image, with at most eight images.
-An omitted or zero `max_clipboard_history` uses 500 text entries.
+Text is capped at 16 KiB and PNG data at 4 MiB per image; text and images
+share the history limit.
+An omitted or zero `max_clipboard_history` uses 500 entries.
 Emoji sequences copy in full; some color-font
 sequences display their first base glyph rather than a composed glyph.
 
@@ -117,8 +135,6 @@ Set `OUT=/tmp/rl-shots` to keep its screenshots and logs. Downloads happen only 
 this development script, never in the launcher. `RL_HEADLESS_CACHE` overrides the
 tool cache location. This is a headless compositor check, not a physical display
 or GPU test.
-Emoji picks are remembered locally: the most recent copies appear first in the
-empty emoji grid.
 
 Clicking outside the panel closes it on the output where it is shown. The panel
 uses a fullscreen transparent input surface and a small panel subsurface. With

@@ -152,6 +152,9 @@ pub fn surrounding_with_prefix(
             start += 1;
         }
     }
+    if query[start..end].contains('\0') {
+        return None;
+    }
     Some((
         query[start..end].to_string(),
         (caret - start) as i32,
@@ -162,6 +165,19 @@ pub fn surrounding_with_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn surrounding_omits_nul_windows_without_losing_byte_offsets() {
+        for text in ["ab\0cd", ";é\0界", "#\0", "\0"] {
+            assert!(surrounding(text, text.len(), text.len()).is_none());
+        }
+        let text = format!("\0{}", "é".repeat(3000));
+        let (window, caret, anchor) = surrounding(&text, text.len(), text.len()).unwrap();
+        assert!(!window.contains('\0'));
+        assert_eq!(caret, window.len() as i32);
+        assert_eq!(anchor, caret);
+        assert_eq!(surrounding(";é界", 3, 6), Some(("é界".into(), 2, 5)));
+    }
+
     #[test]
     fn batches_replace_preedit_and_commit_once_without_leaking_mode_prefix() {
         let mut query = ";café".to_string();

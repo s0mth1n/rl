@@ -118,8 +118,11 @@ pub fn handle(st: &mut KeyState, key: &KeyIn) -> Effect {
     }
     let editing = match key.sym {
         k::KEY_z | k::KEY_y if key.ctrl => {
-            st.edit.history(st.query, key.sym == k::KEY_y);
-            Some(Effect::Edited)
+            Some(if st.edit.history(st.query, key.sym == k::KEY_y) {
+                Effect::Edited
+            } else {
+                Effect::Ignore
+            })
         }
         k::KEY_a if key.ctrl => {
             st.edit.select_all(st.query);
@@ -300,6 +303,25 @@ mod tests {
                 assert_eq!(self.press(c as u32, &c.to_string(), false), Effect::Edited);
             }
         }
+    }
+
+    #[test]
+    fn empty_history_commands_do_not_request_a_search_refresh() {
+        for sym in [k::KEY_z, k::KEY_y] {
+            let mut r = Rig::new("", 3);
+            r.sel = 2;
+            assert_eq!(r.press(sym, "", true), Effect::Ignore);
+            assert_eq!(r.sel, 2);
+            assert_eq!(r.query, "");
+        }
+        let mut r = Rig::new("", 3);
+        r.typ("a");
+        assert_eq!(r.press(k::KEY_z, "", true), Effect::Edited);
+        assert_eq!(r.query, "");
+        assert_eq!(r.press(k::KEY_z, "", true), Effect::Ignore);
+        assert_eq!(r.press(k::KEY_y, "", true), Effect::Edited);
+        assert_eq!(r.query, "a");
+        assert_eq!(r.press(k::KEY_y, "", true), Effect::Ignore);
     }
 
     #[test]

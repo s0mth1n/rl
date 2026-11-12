@@ -45,7 +45,7 @@ impl SystemAction {
         }
     }
 
-    pub fn execute(self) -> std::io::Result<()> {
+    pub fn execute(self) -> std::io::Result<std::process::Child> {
         if let Self::Command(cmd) = &self {
             // Custom commands are disowned from the daemon, like zlaunch's
             // DetachedProcess::shell.
@@ -63,12 +63,10 @@ impl SystemAction {
                     Ok(())
                 });
             }
-            command.spawn()?;
-            return Ok(());
+            return command.spawn();
         }
         let (program, args) = self.command();
-        std::process::Command::new(program).args(args).spawn()?;
-        Ok(())
+        std::process::Command::new(program).args(args).spawn()
     }
 }
 
@@ -97,7 +95,7 @@ mod tests {
         let old = std::env::var_os("PATH");
         std::env::set_var("PATH", dir.path());
         for action in SystemAction::ALL {
-            action.execute().unwrap();
+            action.execute().unwrap().wait().unwrap();
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {

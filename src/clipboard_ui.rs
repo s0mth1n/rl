@@ -16,8 +16,59 @@ struct Preview {
 }
 
 type CachedPreview = (u64, u32, u32, Option<Rc<Preview>>);
+type CachedFile = (
+    String,
+    Option<std::time::SystemTime>,
+    u64,
+    u32,
+    u32,
+    Option<Rc<Preview>>,
+);
 thread_local! {
     static IMAGE: RefCell<Option<CachedPreview>> = const { RefCell::new(None) };
+    static FILE_IMAGE: RefCell<Option<CachedFile>> = const { RefCell::new(None) };
+}
+
+/// Image files larger than this are not previewed.
+const MAX_FILE_IMAGE: u64 = 64 * 1024 * 1024;
+
+/// Read up to `limit` bytes of a file without blocking: a FIFO or device at a
+/// clipboard path must not stall the preview render.
+fn read_capped(path: &str, limit: u64) -> Option<(Vec<u8>, Option<u64>)> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let total = file.metadata().ok().map(|m| m.len());
+    let mut bytes = Vec::new();
+    file.take(limit).read_to_end(&mut bytes).ok()?;
+    Some((bytes, total))
+}
+
+/// Preview an image file, cached per content and pane size like `image_preview`.
+fn file_image_preview(path: &str, w: u32, h: u32) -> Option<Rc<Preview>> {
+    FILE_IMAGE.with(|slot| {
+        let mut cache = slot.borrow_mut();
+        let meta = std::fs::metadata(path).ok()?;
+        let key = (path.to_string(), meta.modified().ok(), meta.len());
+        if let Some((p, mtime, len, cw, ch, result)) = cache.as_ref() {
+            if (p, mtime, len, cw, ch) == (&key.0, &key.1, &key.2, &w, &h) {
+                return result.clone();
+            }
+        }
+        let result = read_capped(path, MAX_FILE_IMAGE + 1)
+            .and_then(|(bytes, _)| {
+                (bytes.len() as u64 <= MAX_FILE_IMAGE)
+                    .then_some(bytes)
+                    .and_then(|b| decode(&b, w, h))
+            })
+            .map(Rc::new);
+        *cache = Some((key.0, key.1, key.2, w, h, result.clone()));
+        result
+    })
 }
 
 fn fit(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
@@ -359,7 +410,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
             th.icon_placeholder_background.alpha,
         );
         if let Some(color) = match &item.action {
-            Action::Clip(text) => clip::parse_color(text),
+            Action::Clip(text, _) => clip::parse_color(text),
             _ => None,
         } {
             // Colour text gets a filled circle inside the icon box, like zlaunch.
@@ -386,15 +437,15 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
         } else {
             // zlaunch's phosphor icon per content type.
             let icon = match &item.action {
-                Action::ClipImg(_) => "phosphor:image",
-                Action::ClipFiles(text) => {
+                Action::ClipImg(..) => "phosphor:image",
+                Action::ClipFiles(text, _) => {
                     let mut lines = text.lines();
                     match (lines.next(), lines.next()) {
                         (Some(path), None) => clip::clip_file_icon(path),
                         _ => "phosphor:file",
                     }
                 }
-                Action::Clip(text) => match clip::file_url_path(text) {
+                Action::Clip(text, _) => match clip::file_url_path(text) {
                     Some(path) => clip::clip_file_icon(&path),
                     None => "phosphor:clipboard-text",
                 },
@@ -489,7 +540,7 @@ fn draw_preview(
     let th = v.theme;
     let fs = v.font_size * s;
     let action = v.items.get(v.sel).map(|item| &item.action);
-    if let Some(Action::ClipImg(id)) = action {
+    if let Some(Action::ClipImg(id, _)) = action {
         if let Some(image) = history
             .images
             .iter()
@@ -519,8 +570,8 @@ fn draw_preview(
     } else {
         IMAGE.with(|slot| *slot.borrow_mut() = None);
         let (text, files) = match action {
-            Some(Action::Clip(text)) => (text.as_str(), false),
-            Some(Action::ClipFiles(text)) => (text.as_str(), true),
+            Some(Action::Clip(text, _)) => (text.as_str(), false),
+            Some(Action::ClipFiles(text, _)) => (text.as_str(), true),
             _ => {
                 centered_label(
                     cv,
@@ -571,7 +622,100 @@ fn draw_preview(
     }
 }
 
+/// File text preview: the first 10000 bytes (cut at a char boundary, never
+/// mid-character) with the total size, like zlaunch's file preview.
+fn truncate_file_text(content: &str, total: u64) -> String {
+    if total > 10000 {
+        format!(
+            "{}...\n\n[Content truncated - {} bytes total]",
+            &content[..content.floor_char_boundary(10000)],
+            total
+        )
+    } else {
+        content.to_string()
+    }
+}
+
+/// Preview text from a file: a bounded, nonblocking read, so a huge file is
+/// truncated by its real size and a FIFO cannot hang the render.
+fn file_text_preview(path: &str) -> Option<String> {
+    let (bytes, total) = read_capped(path, 10001)?;
+    let content = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        // The capped read may split a character: keep the valid prefix.
+        Err(e) if e.utf8_error().valid_up_to() >= 10000 => {
+            let up = e.utf8_error().valid_up_to();
+            String::from_utf8(e.into_bytes()[..up].to_vec()).ok()?
+        }
+        Err(_) => return None,
+    };
+    let total = total.unwrap_or(0).max(content.len() as u64);
+    Some(truncate_file_text(&content, total))
+}
+
 /// Preview one or more clipboard file paths, like zlaunch's preview panel.
+#[cfg(test)]
+mod truncation_tests {
+    #[test]
+    fn file_text_truncation_respects_char_boundaries() {
+        let content = format!("{}é{}", "x".repeat(9999), "y".repeat(200));
+        let preview = super::truncate_file_text(&content, content.len() as u64);
+        assert!(preview.starts_with(&"x".repeat(9999)));
+        assert!(preview.contains("[Content truncated - 10201 bytes total]"));
+        let short = "é".repeat(100);
+        assert_eq!(super::truncate_file_text(&short, short.len() as u64), short);
+    }
+
+    #[test]
+    fn file_preview_reports_the_real_size_of_large_files() {
+        let dir = std::env::temp_dir().join(format!("zl-fp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.txt");
+        std::fs::write(&path, "x".repeat(1 << 20)).unwrap();
+        let preview = super::file_text_preview(path.to_str().unwrap()).unwrap();
+        assert!(preview.starts_with(&"x".repeat(10000)));
+        assert!(preview.ends_with("[Content truncated - 1048576 bytes total]"));
+        let invalid = dir.join("binary.txt");
+        let mut bytes = "ok".repeat(5000).into_bytes();
+        bytes.push(0xff);
+        std::fs::write(&invalid, &bytes).unwrap();
+        assert!(super::file_text_preview(invalid.to_str().unwrap()).is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_preview_never_blocks_on_special_files() {
+        let dir = std::env::temp_dir().join(format!("zl-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pipe.txt");
+        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        // No writer ever opens the FIFO: the read must finish instead of blocking.
+        assert_eq!(
+            super::file_text_preview(path.to_str().unwrap()).as_deref(),
+            Some("")
+        );
+        assert!(super::file_image_preview(path.to_str().unwrap(), 100, 100).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn image_file_preview_caches_by_content_and_size() {
+        let dir = std::env::temp_dir().join(format!("zl-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shot.png");
+        std::fs::write(&path, crate::clip::tests_png(20, 10)).unwrap();
+        let first = super::file_image_preview(path.to_str().unwrap(), 200, 100).unwrap();
+        // Same bytes again: the cached preview is reused.
+        let second = super::file_image_preview(path.to_str().unwrap(), 200, 100).unwrap();
+        assert!(std::rc::Rc::ptr_eq(&first, &second));
+        // Replaced file: the stale preview is not served.
+        std::fs::write(&path, crate::clip::tests_png(8, 4)).unwrap();
+        let third = super::file_image_preview(path.to_str().unwrap(), 200, 100).unwrap();
+        assert!(!std::rc::Rc::ptr_eq(&first, &third));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
 #[allow(clippy::too_many_arguments)]
 fn draw_paths_preview(
     cv: &mut Canvas,
@@ -587,29 +731,18 @@ fn draw_paths_preview(
     if paths.len() == 1 {
         let path = &paths[0];
         if clip::is_image_path(path) {
-            if let Ok(bytes) = std::fs::read(path) {
-                if let Some(image) = decode(&bytes, pw as u32, ph as u32) {
-                    draw_image(
-                        cv,
-                        &image,
-                        (x + (pw - image.w as f32) * 0.5) as u32,
-                        (y + (ph - image.h as f32) * 0.5) as u32,
-                    );
-                    return;
-                }
+            if let Some(image) = file_image_preview(path, pw as u32, ph as u32) {
+                draw_image(
+                    cv,
+                    &image,
+                    (x + (pw - image.w as f32) * 0.5) as u32,
+                    (y + (ph - image.h as f32) * 0.5) as u32,
+                );
+                return;
             }
         }
         if clip::is_text_path(path) {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                let preview = if content.len() > 10000 {
-                    format!(
-                        "{}...\n\n[Content truncated - {} bytes total]",
-                        &content[..10000],
-                        content.len()
-                    )
-                } else {
-                    content
-                };
+            if let Some(preview) = file_text_preview(path) {
                 draw_wrapped(cv, font, s, x, y, pw, ph, &preview, th.text, th.text_alpha);
                 return;
             }

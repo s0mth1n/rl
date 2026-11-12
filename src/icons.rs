@@ -398,6 +398,10 @@ impl Cache {
         self.window_pngs.insert(address.to_string(), png);
     }
     pub fn ensure(&mut self, name: &str, size: u32) {
+        // Raster icons are limited to 4 MiB each, including theme and scale overrides.
+        if size == 0 || size > 1024 {
+            return;
+        }
         let key = (name.to_string(), size);
         if self.map.contains_key(&key) {
             return;
@@ -772,6 +776,27 @@ mod resolver_tests {
             "{}{}",
             String::from_utf8_lossy(&result.stdout),
             String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_theme_icons_are_not_allocated_or_cached() {
+        let mut cache = Cache::new("", "");
+        for name in ["phosphor:palette", SEARCH, "😀", "/missing.png"] {
+            for size in [0, 1025, 65536, u32::MAX] {
+                cache.ensure(name, size);
+                assert!(cache.get(name, size).is_none());
+            }
+        }
+        cache.ensure("phosphor:palette", 24);
+        assert_eq!(
+            cache.get("phosphor:palette", 24).unwrap().px.len(),
+            24 * 24 * 4
         );
     }
 }

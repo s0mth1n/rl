@@ -83,9 +83,45 @@ pub fn application(exec: &str, terminal: bool) -> Result<Child, String> {
         .map_err(|e| e.to_string())
 }
 
+pub fn reap(children: &mut Vec<Child>) {
+    children.retain_mut(|child| match child.try_wait() {
+        Ok(Some(_)) => false,
+        Ok(None) => true,
+        Err(error) => {
+            eprintln!("zl: cannot reap application: {error}");
+            false
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn finished_applications_are_reaped_without_waiting_for_running_ones() {
+        let env: HashMap<_, _> = std::env::vars().collect();
+        let mut children = vec![
+            command("/bin/sleep 2", false, &env)
+                .unwrap()
+                .spawn()
+                .unwrap(),
+            command("/bin/true", false, &env).unwrap().spawn().unwrap(),
+        ];
+        let finished_pid = children[1].id();
+        let start = std::time::Instant::now();
+        while children.len() != 1 && start.elapsed() < std::time::Duration::from_secs(1) {
+            reap(&mut children);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(children.len(), 1);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(!std::path::Path::new(&format!("/proc/{finished_pid}")).exists());
+        children[0].kill().unwrap();
+        children[0].wait().unwrap();
+        reap(&mut children);
+        assert!(children.is_empty());
+    }
+
     #[test]
     fn argv_matches_reference_without_shell_expansion() {
         let env = HashMap::new();

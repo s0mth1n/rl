@@ -1,6 +1,7 @@
 //! Test helper: a virtual keyboard for headless compositors.
 //! Commands on stdin: `t TEXT` types text (US layout), `k enter|bs|esc|ctrl-l|ctrl-k|ctrl-o|down|up|left|right`, `s SECONDS` sleeps.
 //! `a PATH` writes an acknowledgement after earlier commands finish.
+//! `d CODE` / `u CODE` press / release an evdev key without an automatic pair.
 use std::io::{BufRead, Write};
 use std::os::fd::AsFd;
 use wayland_client::protocol::{wl_registry, wl_seat::WlSeat};
@@ -139,6 +140,7 @@ fn main() {
             }
         } else if let Some(k) = line.strip_prefix("k ") {
             match k.trim() {
+                "shift" => key(&kb, 42, false, false),
                 "compose" => key(&kb, 127, false, false),
                 "apostrophe" => key(&kb, 40, false, false),
                 "enter" => key(&kb, 28, false, false),
@@ -201,6 +203,10 @@ fn main() {
                 "pgdn" => key(&kb, 109, false, false),
                 _ => {}
             }
+        } else if let Some(code) = line.strip_prefix("d ") {
+            kb.key(0, code.trim().parse().unwrap(), 1);
+        } else if let Some(code) = line.strip_prefix("u ") {
+            kb.key(0, code.trim().parse().unwrap(), 0);
         } else if let Some(path) = line.strip_prefix("a ") {
             conn.flush().unwrap();
             q.roundtrip(&mut s).unwrap();

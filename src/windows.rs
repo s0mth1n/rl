@@ -100,6 +100,7 @@ fn read_capped(
     line_framed: bool,
 ) -> Result<(), String> {
     let deadline = Instant::now() + IO_TIMEOUT;
+    let mut message = Vec::new();
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -111,10 +112,10 @@ fn read_capped(
             .map_err(|e| e.to_string())?;
         let bytes = reader.fill_buf().map_err(|e| e.to_string())?;
         if bytes.is_empty() {
-            if out.is_empty() {
+            if message.is_empty() {
                 return Err("compositor closed the socket without a reply".into());
             }
-            return Ok(());
+            break;
         }
         let end = if line_framed {
             bytes.iter().position(|b| *b == b'\n').map(|i| i + 1)
@@ -122,15 +123,17 @@ fn read_capped(
             None
         };
         let take = end.unwrap_or(bytes.len());
-        if out.len() + take > MAX_REPLY {
+        if message.len() + take > MAX_REPLY {
             return Err("compositor reply exceeds 1 MiB".into());
         }
-        out.push_str(&String::from_utf8_lossy(&bytes[..take]));
+        message.extend_from_slice(&bytes[..take]);
         reader.consume(take);
         if end.is_some() {
-            return Ok(());
+            break;
         }
     }
+    *out = String::from_utf8(message).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 // ---------- Hyprland (IPC socket, "j/clients" JSON) ----------
@@ -532,6 +535,36 @@ mod tests {
             String::from_utf8(command).unwrap()
         });
         (dir, worker)
+    }
+
+    #[test]
+    fn invalid_utf8_replies_are_rejected_instead_of_replaced() {
+        for line_framed in [false, true] {
+            let (reader, mut writer) = UnixStream::pair().unwrap();
+            writer.write_all(b"bad\xff\n").unwrap();
+            drop(writer);
+            let mut out = String::new();
+            assert!(read_capped(&mut BufReader::new(reader), &mut out, line_framed).is_err());
+            assert!(out.is_empty());
+        }
+    }
+
+    #[test]
+    fn fragmented_multibyte_replies_preserve_exact_utf8() {
+        for line_framed in [false, true] {
+            let (reader, mut writer) = UnixStream::pair().unwrap();
+            let worker = std::thread::spawn(move || {
+                writer.write_all(b"caf\xc3").unwrap();
+                std::thread::sleep(Duration::from_millis(25));
+                writer.write_all(b"\xa9\xf0\x9f").unwrap();
+                std::thread::sleep(Duration::from_millis(25));
+                writer.write_all(b"\x98\x80\n").unwrap();
+            });
+            let mut out = String::new();
+            read_capped(&mut BufReader::new(reader), &mut out, line_framed).unwrap();
+            worker.join().unwrap();
+            assert_eq!(out, "café😀\n");
+        }
     }
 
     #[test]

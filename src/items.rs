@@ -16,9 +16,11 @@ pub enum Action {
     System(crate::system_actions::SystemAction),
     Calculate(crate::calculator::CalculatorItem),
     Window(String),
-    Clip(String),
-    ClipFiles(String),
-    ClipImg(u64),
+    /// Clipboard text entry: the text and its history timestamp, so delete
+    /// removes exactly this copy (emoji copies use timestamp 0).
+    Clip(String, u64),
+    ClipFiles(String, u64),
+    ClipImg(u64, u64),
     View(String),
     Theme(String),
 }
@@ -150,9 +152,9 @@ impl Search<'_> {
                                 )
                             },
                             action: if c.files {
-                                Action::ClipFiles(c.text.clone())
+                                Action::ClipFiles(c.text.clone(), c.at)
                             } else {
-                                Action::Clip(c.text.clone())
+                                Action::Clip(c.text.clone(), c.at)
                             },
                             best: false,
                         },
@@ -168,7 +170,7 @@ impl Search<'_> {
                             sub: clip::timestamp(i.at, now),
                             tag: "Clipboard",
                             icon: Some("phosphor:image".into()),
-                            action: Action::ClipImg(i.id),
+                            action: Action::ClipImg(i.id, i.at),
                             best: false,
                         },
                     )
@@ -533,7 +535,7 @@ pub fn emoji_items(q: &str) -> Vec<Item> {
             sub: format!(":{}:", e.shortcode().unwrap_or("")),
             tag: "Emoji",
             icon: Some(format!("emoji:{}", e.as_str())),
-            action: Action::Clip(e.as_str().to_string()),
+            action: Action::Clip(e.as_str().to_string(), 0),
             best: false,
         })
         .collect()
@@ -587,7 +589,7 @@ mod tests {
         let matches = emoji_items("face");
         assert!(matches.len() > 80);
         for item in &all {
-            let Action::Clip(sequence) = &item.action else {
+            let Action::Clip(sequence, _) = &item.action else {
                 panic!("not a clipboard action")
             };
             assert_eq!(
@@ -765,11 +767,13 @@ mod tests {
             history: &history,
         };
         let emoji = search.run(":grinning");
-        assert!(emoji.iter().any(|r| r.action == Action::Clip("😀".into())));
-        assert_eq!(
-            search.run(";unique")[0].action,
-            Action::Clip("unique clipboard text".into())
-        );
+        assert!(emoji
+            .iter()
+            .any(|r| r.action == Action::Clip("😀".into(), 0)));
+        assert!(matches!(
+            &search.run(";unique")[0].action,
+            Action::Clip(t, _) if t == "unique clipboard text"
+        ));
         assert_eq!(search.run(";").len(), 1);
         assert!(search.run(";missing").is_empty());
     }
@@ -872,18 +876,12 @@ mod tests {
             history: &history,
         };
         assert!(search.run(";ac").is_empty());
-        assert_eq!(
-            search.run(";BETA")[0].action,
-            Action::Clip("Alpha beta\nÉCOLE".into())
-        );
-        assert_eq!(
-            search.run(";école")[0].action,
-            Action::Clip("Alpha beta\nÉCOLE".into())
-        );
-        assert_eq!(
-            search.run(";beta\nÉCOLE")[0].action,
-            Action::Clip("Alpha beta\nÉCOLE".into())
-        );
+        for q in [";BETA", ";école", ";beta\nÉCOLE"] {
+            assert!(matches!(
+                &search.run(q)[0].action,
+                Action::Clip(t, _) if t == "Alpha beta\nÉCOLE"
+            ));
+        }
         assert!(search.run(";apbt").is_empty());
     }
     #[test]
@@ -909,23 +907,14 @@ mod tests {
         assert!(search
             .run(";")
             .iter()
-            .all(|r| matches!(r.action, Action::Clip(_) | Action::ClipImg(_))));
-        assert_eq!(
-            search
-                .run(";PREVIEW")
-                .iter()
-                .map(|r| r.action.clone())
-                .collect::<Vec<_>>(),
-            vec![Action::ClipImg(42)]
-        );
-        assert_eq!(
-            search
-                .run(";image")
-                .iter()
-                .map(|r| r.action.clone())
-                .collect::<Vec<_>>(),
-            vec![Action::ClipImg(42), Action::Clip("image notes".into())]
-        );
+            .all(|r| matches!(r.action, Action::Clip(..) | Action::ClipImg(..))));
+        let rows = search.run(";PREVIEW");
+        assert!(matches!(&rows[0].action, Action::ClipImg(42, _)));
+        assert_eq!(rows.len(), 1);
+        let rows = search.run(";image");
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(&rows[0].action, Action::ClipImg(42, _)));
+        assert!(matches!(&rows[1].action, Action::Clip(t, _) if t == "image notes"));
         assert!(search.run(";iae").is_empty());
         let empty = clip::History::new(0);
         let empty_search = Search {
@@ -987,11 +976,11 @@ mod tests {
                 .map(|r| r.action)
                 .collect::<Vec<_>>(),
             vec![
-                Action::ClipImg(1),
-                Action::Clip("new text".into()),
-                Action::Clip("tied text".into()),
-                Action::ClipImg(2),
-                Action::Clip("old text".into()),
+                Action::ClipImg(1, 40),
+                Action::Clip("new text".into(), 30),
+                Action::Clip("tied text".into(), 20),
+                Action::ClipImg(2, 20),
+                Action::Clip("old text".into(), 10),
             ]
         );
         assert_eq!(
@@ -1001,9 +990,9 @@ mod tests {
                 .map(|r| r.action)
                 .collect::<Vec<_>>(),
             vec![
-                Action::Clip("new text".into()),
-                Action::Clip("tied text".into()),
-                Action::Clip("old text".into()),
+                Action::Clip("new text".into(), 30),
+                Action::Clip("tied text".into(), 20),
+                Action::Clip("old text".into(), 10),
             ]
         );
     }
@@ -1021,7 +1010,10 @@ mod tests {
         let rows = search.run("; needle");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].title, "first line");
-        assert_eq!(rows[0].action, Action::Clip("first line\nneedle\tλ".into()));
+        assert!(matches!(
+            &rows[0].action,
+            Action::Clip(t, _) if t == "first line\nneedle\tλ"
+        ));
         let rows = search.run(";");
         assert_eq!(rows.len(), 1);
     }
@@ -1171,7 +1163,7 @@ mod scan_tests {
 
 /// History key of a result.
 pub fn key_of(it: &Item) -> String {
-    if let Action::ClipImg(id) = &it.action {
+    if let Action::ClipImg(id, _) = &it.action {
         return format!("clipimg:{id}");
     }
     format!("{}:{}", it.tag, it.title)

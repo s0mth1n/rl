@@ -6,6 +6,7 @@ mod cli;
 mod clip;
 mod clipboard_ui;
 mod config;
+mod control_io;
 #[allow(dead_code)]
 mod dates;
 #[allow(dead_code)]
@@ -21,6 +22,7 @@ mod launch;
 mod modes;
 mod scorer;
 mod scroll;
+mod socket_path;
 mod system_actions;
 #[cfg(test)]
 mod testutil;
@@ -149,6 +151,7 @@ struct App {
     mono_font_family: Option<String>,
     bold_font: Option<Font<'static>>,
     apps: Vec<DesktopApp>,
+    launched: Vec<std::process::Child>,
     windows: Vec<windows::Window>,
     items: Vec<Item>,
     query: String,
@@ -171,6 +174,7 @@ struct App {
     cur_h: u32,
     scale: u32,
     outputs: Vec<Out>,
+    active_output: Option<WlOutput>,
     repeat_rate: i32,
     repeat_delay: i32,
     repeating: Option<(u32, Instant)>,
@@ -567,6 +571,7 @@ impl App {
     }
 
     fn hide(&mut self) {
+        self.active_output = None;
         self.theme_catalog = None;
         self.theme_palettes.clear();
         self.input_menu = None;
@@ -585,6 +590,7 @@ impl App {
         self.pointer = None;
         self.scrollbar = scroll::State::default();
         self.input_drag = false;
+        self.input_click = None;
         if let Some(b) = self.backdrop.as_ref() {
             b.panel.destroy();
         }
@@ -840,7 +846,7 @@ impl App {
         };
         if matches!(
             it.action,
-            Action::App(_) | Action::Clip(_) | Action::ClipFiles(_) | Action::ClipImg(_)
+            Action::App(_) | Action::Clip(..) | Action::ClipFiles(..) | Action::ClipImg(..)
         ) {
             let key = items::key_of(&it);
             self.hist.record(&key);
@@ -848,14 +854,16 @@ impl App {
         match it.action {
             Action::WebSearch(url) => {
                 self.hide();
-                if let Err(error) = web_search::open(&url) {
-                    eprintln!("zl: failed to open search URL: {error}");
+                match web_search::open(&url) {
+                    Ok(child) => self.launched.push(child),
+                    Err(error) => eprintln!("zl: failed to open search URL: {error}"),
                 }
             }
             Action::System(action) => {
                 self.hide();
-                if let Err(error) = action.execute() {
-                    eprintln!("zl: failed to execute action: {error}");
+                match action.execute() {
+                    Ok(child) => self.launched.push(child),
+                    Err(error) => eprintln!("zl: failed to execute action: {error}"),
                 }
             }
             Action::Calculate(result) => {
@@ -871,15 +879,16 @@ impl App {
             Action::App(i) => {
                 self.hide();
                 let a = &self.apps[i];
-                if let Err(error) = launch::application(&a.exec, a.terminal) {
-                    eprintln!("zl: failed to launch application: {error}");
+                match launch::application(&a.exec, a.terminal) {
+                    Ok(child) => self.launched.push(child),
+                    Err(error) => eprintln!("zl: failed to launch application: {error}"),
                 }
             }
-            Action::Clip(t) | Action::ClipFiles(t) => {
+            Action::Clip(t, _) | Action::ClipFiles(t, _) => {
                 self.hide();
                 self.set_clipboard(t.as_bytes(), false, qh);
             }
-            Action::ClipImg(id) => {
+            Action::ClipImg(id, _) => {
                 if let Some(image) = self.clip.images.iter().find(|i| i.id == id) {
                     if let Some(png) = image.bytes() {
                         self.hide();
@@ -941,13 +950,33 @@ impl App {
     }
 
     fn key(&mut self, key: u32, qh: &QueueHandle<App>) -> bool {
+        let Some(st) = &self.xkb else { return false };
+        let code = xkb::Keycode::new(key + 8);
+        let sym = st.key_get_one_sym(code).raw();
+        if matches!(
+            sym,
+            xkb::keysyms::KEY_Shift_L
+                | xkb::keysyms::KEY_Shift_R
+                | xkb::keysyms::KEY_Control_L
+                | xkb::keysyms::KEY_Control_R
+                | xkb::keysyms::KEY_Alt_L
+                | xkb::keysyms::KEY_Alt_R
+                | xkb::keysyms::KEY_Super_L
+                | xkb::keysyms::KEY_Super_R
+                | xkb::keysyms::KEY_Meta_L
+                | xkb::keysyms::KEY_Meta_R
+                | xkb::keysyms::KEY_ISO_Level3_Shift
+                | xkb::keysyms::KEY_ISO_Level5_Shift
+                | xkb::keysyms::KEY_Caps_Lock
+                | xkb::keysyms::KEY_Num_Lock
+        ) {
+            return false;
+        }
         if self.ime.clear() {
             self.refresh();
         }
         self.pause_caret();
         let Some(st) = &self.xkb else { return false };
-        let code = xkb::Keycode::new(key + 8);
-        let sym = st.key_get_one_sym(code).raw();
         let mut utf8 = st.key_get_utf8(code);
         let ctrl = st.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE);
         if let Some(menu) = &mut self.input_menu {
@@ -1267,8 +1296,7 @@ impl App {
                     self.clip.push_image(&r.buf);
                 } else if let Ok(t) = String::from_utf8(r.buf) {
                     if r.files {
-                        let paths = clip::uri_list_paths(&t).unwrap_or_default();
-                        self.clip.push_files(&paths.join("\n"));
+                        self.clip.push_uri_list(&t);
                     } else {
                         self.clip
                             .push(&if r.html { clip::strip_html(&t) } else { t });
@@ -1349,6 +1377,10 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for App {
                     a.offers.clear();
                 }
                 a.offers.insert(id.id(), Vec::new());
+            }
+            zwlr_data_control_device_v1::Event::PrimarySelection { id: Some(offer) } => {
+                a.offers.remove(&offer.id());
+                offer.destroy();
             }
             zwlr_data_control_device_v1::Event::Selection { id } => {
                 let Some(offer) = id else { return };
@@ -1447,14 +1479,20 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for App {
 impl Dispatch<WlSurface, ()> for App {
     fn event(
         a: &mut Self,
-        _: &WlSurface,
+        surface: &WlSurface,
         ev: wayland_client::protocol::wl_surface::Event,
         _: &(),
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
+        if a.surface.as_ref() != Some(surface)
+            && a.backdrop.as_ref().is_none_or(|b| &b.surface != surface)
+        {
+            return;
+        }
         if let wayland_client::protocol::wl_surface::Event::Enter { output } = ev {
             if let Some(o) = a.outputs.iter().find(|o| o.obj == output) {
+                a.active_output = Some(output);
                 if o.scale != a.scale {
                     a.scale = o.scale.max(1);
                     a.redraw(qh);
@@ -1471,14 +1509,20 @@ impl Dispatch<WlOutput, ()> for App {
         ev: wayland_client::protocol::wl_output::Event,
         _: &(),
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
     ) {
         use wayland_client::protocol::wl_output::Event;
         let Some(e) = a.outputs.iter_mut().find(|e| e.obj == *o) else {
             return;
         };
         match ev {
-            Event::Scale { factor } => e.scale = factor.max(1) as u32,
+            Event::Scale { factor } => {
+                e.scale = factor.max(1) as u32;
+                if a.active_output.as_ref() == Some(o) && a.scale != e.scale {
+                    a.scale = e.scale;
+                    a.redraw(qh);
+                }
+            }
             Event::Name { name } => e.name = name,
             _ => {}
         }
@@ -1678,6 +1722,9 @@ impl Dispatch<WlKeyboard, ()> for App {
             Event::RepeatInfo { rate, delay } => {
                 a.repeat_rate = rate;
                 a.repeat_delay = delay;
+                if rate <= 0 {
+                    a.repeating = None;
+                }
             }
             Event::Key {
                 key,
@@ -2107,9 +2154,7 @@ fn main() {
                     s.set_write_timeout(Some(Duration::from_secs(2)))?;
                     s.write_all(wire.as_bytes())?;
                     s.shutdown(std::net::Shutdown::Write)?;
-                    let mut reply = String::new();
-                    s.read_to_string(&mut reply)?;
-                    Ok(reply)
+                    control_io::read_message(&mut s, 4 * 1024 * 1024, Duration::from_secs(2))
                 })();
                 match result {
                     Ok(reply) if reply.starts_with("ok\n") => {
@@ -2148,19 +2193,27 @@ fn main() {
         }
         return;
     }
+    if let Err(error) = run_daemon() {
+        eprintln!("zl: daemon stopped: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     launch::capture_environment();
     let cfg = Config::load();
     if UnixStream::connect(sock()).is_ok() {
         eprintln!("zl: already running");
-        return;
+        return Ok(());
     }
     let _ = std::fs::remove_file(sock());
     if let Err(error) = hyprland_blur::apply(cfg.hyprland_auto_blur) {
         eprintln!("zl: failed to apply Hyprland blur rules: {error}");
     }
-    let listener = UnixListener::bind(sock()).expect("cannot create the control socket");
-    listener.set_nonblocking(true).unwrap();
-    let conn = Connection::connect_to_env().expect("no Wayland display");
+    let listener = UnixListener::bind(sock())?;
+    let _socket_path = socket_path::SocketPath::new(sock())?;
+    listener.set_nonblocking(true)?;
+    let conn = Connection::connect_to_env()?;
     let mut queue = conn.new_event_queue::<App>();
     let qh = queue.handle();
     conn.display().get_registry(&qh, ());
@@ -2177,6 +2230,7 @@ fn main() {
         mono_font_family: cfg.startup_fonts().mono_font_family,
         bold_font: load_bold_font(&cfg),
         apps: app_cache::load(&cfg),
+        launched: vec![],
         windows: vec![],
         items: vec![],
         query: String::new(),
@@ -2199,6 +2253,7 @@ fn main() {
         cur_h: 0,
         scale: 1,
         outputs: vec![],
+        active_output: None,
         repeat_rate: 25,
         repeat_delay: 400,
         repeating: None,
@@ -2244,19 +2299,19 @@ fn main() {
     } else {
         clip::History::new(app.cfg.clipboard_limit())
     };
-    queue.roundtrip(&mut app).unwrap();
-    queue.roundtrip(&mut app).unwrap();
+    queue.roundtrip(&mut app)?;
+    queue.roundtrip(&mut app)?;
     app.init_clip(&qh);
     if app.shell.is_none() {
-        eprintln!("zl: the compositor has no wlr-layer-shell support");
-        std::process::exit(1);
+        return Err("the compositor has no wlr-layer-shell support".into());
     }
     let mut app_watch = app_watch::AppWatch::new()
         .map_err(|error| eprintln!("zl: cannot start application watcher: {error}"))
         .ok();
     loop {
-        queue.dispatch_pending(&mut app).unwrap();
-        queue.flush().unwrap();
+        launch::reap(&mut app.launched);
+        queue.dispatch_pending(&mut app)?;
+        queue.flush()?;
         let Some(guard) = queue.prepare_read() else {
             continue;
         };
@@ -2307,7 +2362,7 @@ fn main() {
                 timeout = if timeout < 0 { wait } else { timeout.min(wait) };
             }
         }
-        if !app.reads.is_empty() {
+        if !app.reads.is_empty() || !app.launched.is_empty() {
             timeout = if timeout < 0 { 500 } else { timeout.min(500) };
         }
         unsafe {
@@ -2337,8 +2392,13 @@ fn main() {
             app.redraw(&qh);
             app.scrollbar.finish_frame();
         }
-        if fds[0].revents & libc::POLLIN != 0 {
-            let _ = guard.read();
+        if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            if let Err(error) = guard.read() {
+                if !matches!(&error, wayland_client::backend::WaylandError::Io(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+                {
+                    return Err(error.into());
+                }
+            }
         } else {
             drop(guard);
         }
@@ -2355,9 +2415,15 @@ fn main() {
         if fds[1].revents & libc::POLLIN != 0 {
             if let Ok((mut s, _)) = listener.accept() {
                 s.set_nonblocking(false).ok();
-                s.set_read_timeout(Some(Duration::from_millis(200))).ok();
-                let mut b = String::new();
-                let _ = s.read_to_string(&mut b);
+                s.set_write_timeout(Some(Duration::from_millis(200))).ok();
+                let b =
+                    match control_io::read_message(&mut s, 64 * 1024, Duration::from_millis(200)) {
+                        Ok(message) => message,
+                        Err(error) => {
+                            let _ = writeln!(s, "err Invalid control request: {error}");
+                            continue;
+                        }
+                    };
                 let (word, arg) = b.split_once(' ').unwrap_or((b.as_str(), ""));
                 match word {
                     "show" => {
@@ -2387,7 +2453,7 @@ fn main() {
                             let err = std::process::Command::new(exe).exec();
                             eprintln!("zl: reload failed: {err}");
                         }
-                        return;
+                        return Ok(());
                     }
                     "theme-set" => {
                         let ok = config::load_theme(arg).is_some() && {
@@ -2423,7 +2489,7 @@ fn main() {
                     "quit" => {
                         let _ = s.write_all(b"ok\n");
                         let _ = std::fs::remove_file(sock());
-                        return;
+                        return Ok(());
                     }
                     _ => {
                         let _ = s.write_all(b"err Unknown command\n");
@@ -2501,6 +2567,7 @@ mod picker_tests {
             mono_font_family: cfg.startup_fonts().mono_font_family,
             bold_font: load_bold_font(&cfg),
             apps: items::scan_apps(&cfg),
+            launched: vec![],
             windows: vec![],
             items: vec![],
             query: String::new(),
@@ -2523,6 +2590,7 @@ mod picker_tests {
             cur_h: 0,
             scale: 1,
             outputs: vec![],
+            active_output: None,
             repeat_rate: 25,
             repeat_delay: 400,
             repeating: None,
@@ -2674,7 +2742,7 @@ mod picker_tests {
                 assert!(a
                     .items
                     .iter()
-                    .all(|item| !matches!(item.action, Action::Clip(_) | Action::Theme(_))));
+                    .all(|item| !matches!(item.action, Action::Clip(..) | Action::Theme(_))));
                 if mode == "search" && query == ":foo" {
                     assert!(a.items.iter().any(|item| item.action
                         == Action::WebSearch("https://www.google.com/search?q=%3Afoo".into())));
@@ -2845,6 +2913,15 @@ mod picker_tests {
     }
 
     #[test]
+    fn hiding_discards_input_click_count_before_the_next_panel() {
+        let _env = crate::testutil::ENV_LOCK.lock().unwrap();
+        let mut a = app(Config::default());
+        a.input_click = Some((Instant::now(), 2, 65.0, 29.0));
+        a.hide();
+        assert!(a.input_click.is_none());
+    }
+
+    #[test]
     fn configured_height_drives_viewport_and_emoji_paging() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();
         let mut a = app(Config {
@@ -2904,5 +2981,59 @@ mod picker_tests {
         assert_eq!(a.theme, config::theme("nord"));
         assert_eq!(a.cfg.theme, "nord");
         assert!(!a.previewing);
+    }
+
+    #[test]
+    fn manifest_drops_dependencies_nothing_uses() {
+        // llm, tokio, futures, anyhow and pulldown-cmark were inherited from the
+        // zlaunch port but no rl source file references them.
+        let manifest =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+        for removed in ["llm", "tokio", "futures", "anyhow", "pulldown-cmark"] {
+            assert!(
+                !manifest
+                    .lines()
+                    .any(|line| line.starts_with(removed) && line.contains('=')),
+                "unused dependency {removed} is back in Cargo.toml"
+            );
+        }
+    }
+
+    #[test]
+    fn readme_matches_the_implemented_surface() {
+        let readme =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")).unwrap();
+        // Calculator, actions and windows modes exist; the README must not deny them.
+        assert!(!readme.contains("file search, calculator, currency conversion"));
+        assert!(readme.contains("emojis, calculator, clipboard, actions,"));
+        assert!(readme.contains("search, themes and windows."));
+        // Images share the history limit with text; there is no eight-image cap.
+        assert!(!readme.contains("at most eight images"));
+        // The single_click key is ignored, not an activation switch.
+        assert!(!readme.contains("single-click activation is a config key"));
+        // Emoji order is crate order; picked emojis are not promoted.
+        assert!(!readme.contains("most recent copies appear first"));
+        // The packaging templates and their @BINARY@ placeholder are documented.
+        assert!(readme.contains("@BINARY@"));
+        // hyprland_auto_blur drives real Hyprland layer rules, not a no-op.
+        assert!(!readme.contains("parsed but has no effect"));
+    }
+
+    #[test]
+    fn notice_names_every_top_level_icon() {
+        // Each shipped icon needs a license attribution; brain.svg went unlisted.
+        let notice =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/NOTICE")).unwrap();
+        let icons =
+            std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons")).unwrap();
+        for entry in icons {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            if let Some(stem) = name.strip_suffix(".svg") {
+                assert!(
+                    notice.contains(stem),
+                    "NOTICE does not name assets/icons/{name}"
+                );
+            }
+        }
     }
 }

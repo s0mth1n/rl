@@ -95,6 +95,9 @@ impl Edit {
         r.start = r.start.max(start);
         r.end = r.end.max(start);
         if text[r.clone()] == *insert {
+            self.caret = r.end;
+            self.anchor = None;
+            self.selected_word = None;
             return;
         }
         if self
@@ -234,6 +237,39 @@ fn selection_class(c: char) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn identical_replacement_finishes_selection_without_a_text_history_entry() {
+        for (initial, literal) in [("hello", false), (";café", false), ("#café", true)] {
+            let mut text = initial.to_string();
+            let mut e = Edit {
+                literal_prefix: literal,
+                ..Edit::default()
+            };
+            e.sync(&text);
+            e.select_all(&text);
+            let same = text[e.range().unwrap()].to_string();
+            e.replace(&mut text, &same);
+            assert_eq!(text, initial);
+            assert_eq!(e.caret, text.len());
+            assert!(e.range().is_none());
+            assert!(e.anchor.is_none());
+            assert!(!e.history(&mut text, false));
+            e.replace(&mut text, "x");
+            assert_eq!(text, format!("{initial}x"));
+            assert!(e.history(&mut text, false));
+            assert_eq!(text, initial);
+        }
+        let mut text = "one two".to_string();
+        let mut e = Edit::default();
+        e.sync(&text);
+        e.select_word(&text, 1);
+        e.replace(&mut text, "one");
+        assert_eq!(e.caret, 3);
+        assert!(e.selected_word.is_none());
+        e.move_to(&text, 4, true);
+        assert_eq!(e.range(), Some(3..4));
+    }
+
     #[test]
     fn composition_can_finish_the_selection_replacement_history_group() {
         let mut text = String::from("original");
