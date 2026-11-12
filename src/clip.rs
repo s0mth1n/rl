@@ -353,6 +353,18 @@ impl History {
         h
     }
 
+    /// Remove the entry an action points at. False when it is not a history entry or is already gone.
+    pub fn remove(&mut self, action: &crate::items::Action) -> bool {
+        use crate::items::Action;
+        let (a, b) = (self.entries.len(), self.images.len());
+        match action {
+            Action::Clip(t) => self.entries.retain(|e| &e.text != t),
+            Action::ClipImg(id) => self.images.retain(|i| i.id != *id),
+            _ => return false,
+        }
+        a != self.entries.len() || b != self.images.len()
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
         self.images.clear();
@@ -467,6 +479,130 @@ mod tests {
         );
         assert!(strip_html("<div></div>").is_empty());
         assert_eq!(strip_html("AT&T; verizon"), "AT&T; verizon");
+    }
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut encoder = png::Encoder::new(&mut bytes, w, h);
+        encoder.set_color(png::ColorType::Rgba);
+        let mut writer = encoder.write_header().unwrap();
+        writer
+            .write_image_data(&vec![255; (w * h * 4) as usize])
+            .unwrap();
+        writer.finish().unwrap();
+        bytes
+    }
+    #[test]
+    fn text_limit_counts_bytes_and_rejections_leave_history_unchanged() {
+        let mut h = History::new(2);
+        let boundary = "é".repeat(MAX_ENTRY / 2);
+        assert_eq!(boundary.len(), MAX_ENTRY);
+        assert!(h.push("older"));
+        assert!(h.push(&boundary));
+        let before = h.entries.clone();
+        for rejected in [format!("{boundary}a"), " \t\n".into(), String::new()] {
+            assert!(!h.push(&rejected));
+            assert_eq!(h.entries, before);
+        }
+    }
+    #[test]
+    fn zero_limit_rejects_both_kinds_and_trim_removes_existing_entries() {
+        let mut h = History::new(2);
+        let image = png(1, 1);
+        assert!(h.push("kept"));
+        assert!(h.push_image(&image));
+        h.max = 0;
+        h.trim();
+        assert!(h.entries.is_empty());
+        assert!(h.images.is_empty());
+        assert!(!h.push("dropped"));
+        assert!(!h.push_image(&image));
+    }
+    #[test]
+    fn image_limit_and_dedup_keep_newest_copies_first() {
+        let mut h = History::new(1);
+        for width in 1..=(MAX_IMAGES as u32 + 1) {
+            assert!(h.push_image(&png(width, 1)));
+        }
+        assert_eq!(
+            h.images.iter().map(|i| i.w).collect::<Vec<_>>(),
+            (2..=(MAX_IMAGES as u32 + 1)).rev().collect::<Vec<_>>()
+        );
+        assert!(h.push_image(&png(3, 1)));
+        assert_eq!(
+            h.images.iter().map(|i| i.w).collect::<Vec<_>>(),
+            std::iter::once(3)
+                .chain((2..=(MAX_IMAGES as u32 + 1)).rev().filter(|w| *w != 3))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(h.images.len(), MAX_IMAGES);
+        let before = h.images.iter().map(|i| i.id).collect::<Vec<_>>();
+        assert!(!h.push_image(&vec![0; MAX_IMAGE + 1]));
+        assert_eq!(h.images.iter().map(|i| i.id).collect::<Vec<_>>(), before);
+    }
+    #[test]
+    fn concealed_hints_override_every_supported_mime_order() {
+        let formats = [
+            "text/plain;charset=utf-8",
+            "text/plain",
+            "UTF8_STRING",
+            "STRING",
+            "TEXT",
+            "text/html",
+            "image/png",
+        ];
+        for hint in [SENSITIVE_MIME, "vicinae/concealed"] {
+            for format in formats {
+                for mimes in [v(&[hint, format]), v(&[format, hint])] {
+                    assert_eq!(pick_mime(&mimes), None, "{mimes:?}");
+                    assert_eq!(pick_image(&mimes), None, "{mimes:?}");
+                }
+            }
+        }
+        assert_eq!(pick_mime(&[]), None);
+        assert_eq!(pick_image(&[]), None);
+    }
+    #[test]
+    fn malformed_text_records_are_skipped_and_load_obeys_limit() {
+        let d = tempfile::tempdir().unwrap();
+        let text = format!("v1\nt\tbad-time\tbad\nt\t1\t   \nt\t2\t{}\nt\t3\tnew\\nline\nt\t4\tolder\ni\t5\t999\t1\t1\nunknown\t6\tignored\n", "x".repeat(MAX_ENTRY + 1));
+        std::fs::write(d.path().join("state"), text).unwrap();
+        let h = History::load_from(d.path(), 1);
+        assert_eq!(
+            h.entries,
+            vec![Clip {
+                text: "new\nline".into(),
+                at: 3
+            }]
+        );
+        assert!(h.images.is_empty());
+        let disabled = History::load_from(d.path(), 0);
+        assert!(disabled.entries.is_empty());
+        assert!(disabled.images.is_empty());
+    }
+    #[test]
+    fn saving_after_clear_removes_old_images_and_text() {
+        let d = tempfile::tempdir().unwrap();
+        let mut h = History::new(2);
+        assert!(h.push("private"));
+        assert!(h.push_image(&png(1, 1)));
+        h.save_to(d.path());
+        let image = d.path().join(format!("{}.png", h.images[0].id));
+        assert!(image.is_file());
+        assert!(d.path().join("state").is_file());
+        h.clear();
+        h.save_to(d.path());
+        assert!(!image.exists());
+        assert_eq!(std::fs::read(d.path().join("state")).unwrap(), b"v1\n");
+        let loaded = History::load_from(d.path(), 2);
+        assert!(loaded.entries.is_empty());
+        assert!(loaded.images.is_empty());
+    }
+    #[test]
+    fn index_escaping_round_trips_unicode_and_literal_backslashes() {
+        let text = "λ\t\n\\n\\t\\\\end\\";
+        assert_eq!(esc(text), "λ\\t\\n\\\\n\\\\t\\\\\\\\end\\\\");
+        assert_eq!(unesc(&esc(text)), text);
+        assert_eq!(unesc("\\q\\"), "\\q\\");
     }
     #[test]
     fn bounded_and_deduped() {

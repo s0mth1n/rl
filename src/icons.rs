@@ -341,7 +341,7 @@ impl Cache {
         if self.map.contains_key(&key) {
             return;
         }
-        if self.map.len() >= 96 {
+        if self.map.len() >= 256 {
             self.map.clear();
         }
         let icon = if let Some(g) = name.strip_prefix("emoji:") {
@@ -430,6 +430,22 @@ mod tests {
         c.ensure("definitely-not-an-icon-zzz", 32);
         assert!(c.get("definitely-not-an-icon-zzz", 32).is_none());
         assert_eq!(c.map.len(), 1);
+    }
+    #[test]
+    fn cache_holds_twenty_rows_of_eight_emoji() {
+        let _env = crate::testutil::ENV_LOCK.lock().unwrap();
+        let mut cache = Cache::new("", "");
+        let names: Vec<_> = emojis::iter()
+            .take(160)
+            .map(|e| format!("emoji:{}", e.as_str()))
+            .collect();
+        for name in &names {
+            cache.ensure(name, 28);
+        }
+        assert_eq!(cache.map.len(), 160);
+        assert!(names
+            .iter()
+            .all(|name| cache.map.contains_key(&(name.clone(), 28))));
     }
     #[test]
     fn png_roundtrip() {
