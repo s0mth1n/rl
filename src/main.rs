@@ -1,8 +1,14 @@
 //! zl: a small Wayland launcher. One daemon, a unix socket, a layer-shell panel drawn on the CPU.
+mod actions_ui;
 mod clip;
 mod config;
+#[allow(dead_code)]
+mod dates;
+#[allow(dead_code)]
+mod hist;
 mod icons;
 mod items;
+mod keys;
 mod settings;
 #[cfg(test)]
 mod testutil;
@@ -55,6 +61,7 @@ struct App {
     icons: icons::Cache,
     font: Font<'static>,
     apps: Vec<DesktopApp>,
+    files: items::FileIndex,
     items: Vec<Item>,
     query: String,
     sel: usize,
@@ -67,9 +74,13 @@ struct App {
     repeat_rate: i32,
     repeat_delay: i32,
     repeating: Option<(u32, Instant)>,
-    pointer_over_row: bool,
+    /// Last pointer position on the panel, in surface pixels. Hover never moves the selection.
+    pointer: Option<(f64, f64)>,
     last_click: Option<(usize, Instant)>,
     settings_error: Option<String>,
+    hist: hist::Hist,
+    panel: Option<(String, Vec<Item>, usize)>,
+    panel_filter: String,
     compositor: Option<WlCompositor>,
     shm: Option<WlShm>,
     shell: Option<ZwlrLayerShellV1>,
@@ -99,17 +110,55 @@ struct PipeRead {
 }
 
 impl App {
-    fn rows(&self) -> usize {
-        self.items.len().min(self.cfg.max_rows).max(1)
+    fn columns(&self) -> usize {
+        if self.query.starts_with(':') {
+            ui::emoji_columns(self.cfg.width)
+        } else {
+            1
+        }
+    }
+
+    fn emoji_rows(&self) -> usize {
+        ui::emoji_rows(self.items.len(), self.cfg.width, self.cfg.max_rows)
+    }
+
+    fn vp(&self) -> f32 {
+        if self.query.starts_with(':') {
+            self.emoji_rows() as f32 * ui::EMOJI_CELL
+        } else {
+            ui::viewport(&self.items, self.cfg.max_rows)
+        }
+    }
+
+    fn panel_height(&self) -> u32 {
+        if self.query.starts_with(':') {
+            ui::emoji_panel_height(self.emoji_rows())
+        } else {
+            ui::panel_height(&self.items, self.cfg.max_rows)
+        }
     }
 
     fn refresh(&mut self) {
+        if self.query.starts_with('/') {
+            self.files
+                .load(&self.cfg.file_roots, &self.cfg.file_excludes);
+        }
         let s = Search {
             cfg: &self.cfg,
             apps: &self.apps,
+            files: self.files.files(),
             history: &self.clip,
         };
         self.items = s.run(&self.query);
+        if !self.query.starts_with([':', ';']) && !self.query.starts_with("settings") {
+            self.items.sort_by_key(|it| {
+                let key = items::key_of(it);
+                (
+                    self.hist.pin_order(&key).unwrap_or(usize::MAX),
+                    std::cmp::Reverse(self.hist.bonus(&key)),
+                )
+            });
+        }
         self.sel = 0;
         self.top = 0;
         if let Some(message) = self.settings_error.take() {
@@ -121,20 +170,29 @@ impl App {
                     tag: "Error",
                     icon: None,
                     action: Action::View(self.query.clone()),
+                    best: false,
                 },
             );
         }
     }
 
     fn ensure_visible(&mut self) {
-        let rows = self.cfg.max_rows.min(self.items.len()).max(1);
-        if self.sel < self.top {
-            self.top = self.sel;
+        if self.query.starts_with(':') {
+            let columns = self.columns();
+            let rows = self.emoji_rows();
+            let selected_row = self.sel / columns;
+            let mut top_row = self.top / columns;
+            if selected_row < top_row {
+                top_row = selected_row;
+            }
+            if selected_row >= top_row + rows {
+                top_row = selected_row + 1 - rows;
+            }
+            self.top =
+                top_row.min(self.items.len().div_ceil(columns).saturating_sub(rows)) * columns;
+        } else {
+            self.top = ui::scroll_to(&self.items, self.sel, self.top, self.vp());
         }
-        if self.sel >= self.top + rows {
-            self.top = self.sel + 1 - rows;
-        }
-        self.top = self.top.min(self.items.len().saturating_sub(rows));
     }
 
     fn show(&mut self, qh: &QueueHandle<App>) {
@@ -169,7 +227,7 @@ impl App {
             .max(1);
         let s = c.create_surface(qh, ());
         let l = sh.get_layer_surface(&s, out, Layer::Overlay, "zl".into(), qh, ());
-        self.cur_h = ui::panel_height(self.rows());
+        self.cur_h = self.panel_height();
         l.set_size(self.cfg.width, self.cur_h);
         l.set_anchor(Anchor::empty());
         l.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
@@ -181,7 +239,9 @@ impl App {
     }
 
     fn hide(&mut self) {
+        self.files.clear();
         self.repeating = None;
+        self.close_panel();
         if let Some(l) = self.layer.take() {
             l.destroy();
         }
@@ -200,7 +260,7 @@ impl App {
             return;
         }
         self.ensure_visible();
-        let h = ui::panel_height(self.rows());
+        let h = self.panel_height();
         if h != self.cur_h {
             self.cur_h = h;
             if let Some(l) = &self.layer {
@@ -211,10 +271,25 @@ impl App {
             return;
         }
         let s = self.scale;
-        let rows = self.rows();
-        for it in self.items.iter().skip(self.top).take(rows) {
-            if let Some(n) = &it.icon {
-                self.icons.ensure(n, ui::icon_px(s));
+        let vp = self.vp();
+        let (visible, icon_size): (Vec<usize>, u32) = if self.query.starts_with(':') {
+            (
+                (self.top..(self.top + self.emoji_rows() * self.columns()).min(self.items.len()))
+                    .collect(),
+                ui::emoji_icon_px(s),
+            )
+        } else {
+            (
+                ui::slots(&self.items, self.top, vp)
+                    .iter()
+                    .filter_map(|x| x.item)
+                    .collect(),
+                ui::icon_px(s),
+            )
+        };
+        for i in visible {
+            if let Some(n) = &self.items[i].icon {
+                self.icons.ensure(n, icon_size);
             }
         }
         let Some(surf) = &self.surface else { return };
@@ -225,7 +300,7 @@ impl App {
             items: &self.items,
             sel: self.sel,
             top: self.top,
-            rows: self.rows(),
+            vp,
             theme: self.theme,
             w: self.cfg.width,
             h,
@@ -233,6 +308,19 @@ impl App {
             font_size: self.cfg.font_size,
         };
         ui::draw(&mut cv, &self.font, &v);
+        if let Some((title, actions, sel)) = &self.panel {
+            actions_ui::draw(
+                &mut cv,
+                &self.font,
+                &v,
+                &actions_ui::PanelView {
+                    title,
+                    actions,
+                    sel: *sel,
+                    filter: &self.panel_filter,
+                },
+            );
+        }
         let size = cv.buf.len();
         let fd = unsafe { libc::memfd_create(c"zl".as_ptr(), 0) };
         if fd < 0 {
@@ -267,10 +355,60 @@ impl App {
         }
     }
 
+    fn change_setting(&mut self, key: &str, dir: i32, qh: &QueueHandle<App>) {
+        if !settings::step(&mut self.cfg, key, dir) {
+            self.settings_error = Some("Could not save settings".into());
+        }
+        if key == "clipboard_persist" && !self.cfg.clipboard_persist {
+            if let Err(error) = std::fs::remove_dir_all(clip::dir()) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    self.settings_error = Some("Could not remove saved clipboard".into());
+                }
+            }
+        }
+        if !self.cfg.clipboard_history {
+            self.reads.clear();
+        }
+        self.theme = self.cfg.theme();
+        self.clip.max = self.cfg.clipboard_max;
+        self.clip.trim();
+        if self.cfg.clipboard_persist {
+            self.clip.save();
+        }
+        let error = self.settings_error.take();
+        self.hide();
+        self.show(qh);
+        self.settings_error = error;
+        self.query = "settings".into();
+        self.refresh();
+        self.redraw(qh);
+    }
+
     fn activate(&mut self, qh: &QueueHandle<App>) {
-        let Some(it) = self.items.get(self.sel).cloned() else {
-            return;
+        let picked = if self.panel.is_some() {
+            let vis = self.panel_vis();
+            self.panel
+                .as_ref()
+                .and_then(|p| vis.get(p.2).map(|&i| p.1[i].clone()))
+        } else {
+            self.items.get(self.sel).cloned()
         };
+        let Some(it) = picked else { return };
+        self.close_panel();
+        if matches!(
+            it.action,
+            Action::App(_) | Action::Clip(_) | Action::ClipImg(_)
+        ) {
+            let key = if it.tag == "Action" {
+                self.items
+                    .get(self.sel)
+                    .map(items::key_of)
+                    .unwrap_or_default()
+            } else {
+                items::key_of(&it)
+            };
+            self.hist.record(&key);
+        }
         match it.action {
             Action::App(i) => {
                 self.hide();
@@ -292,39 +430,32 @@ impl App {
                     self.set_clipboard(&png, true, qh);
                 }
             }
+            Action::Open(p) if it.tag == "File" && std::path::Path::new(&p).is_dir() => {
+                // Enter on a folder drills into it.
+                let home = std::env::var("HOME").unwrap_or_default();
+                let rel = p.strip_prefix(&format!("{home}/")).unwrap_or(&p);
+                self.query = format!("/{rel}/");
+                self.sel = 0;
+                self.top = 0;
+                self.refresh();
+                self.redraw(qh);
+            }
+            Action::Open(p) => {
+                self.hide();
+                let _ = std::process::Command::new("xdg-open")
+                    .arg(p)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+            }
+            Action::Nothing => {}
             Action::View(view) => {
                 self.query = view;
                 self.refresh();
                 self.redraw(qh);
             }
-            Action::Setting(key) => {
-                if !settings::step(&mut self.cfg, &key) {
-                    self.settings_error = Some("Could not save settings".into());
-                }
-                if key == "clipboard_persist" && !self.cfg.clipboard_persist {
-                    if let Err(error) = std::fs::remove_dir_all(clip::dir()) {
-                        if error.kind() != std::io::ErrorKind::NotFound {
-                            self.settings_error = Some("Could not remove saved clipboard".into());
-                        }
-                    }
-                }
-                if !self.cfg.clipboard_history {
-                    self.reads.clear();
-                }
-                self.theme = self.cfg.theme();
-                self.clip.max = self.cfg.clipboard_max;
-                self.clip.trim();
-                if self.cfg.clipboard_persist {
-                    self.clip.save();
-                }
-                let error = self.settings_error.take();
-                self.hide();
-                self.show(qh);
-                self.settings_error = error;
-                self.query = "settings".into();
-                self.refresh();
-                self.redraw(qh);
-            }
+            Action::Setting(key) => self.change_setting(&key, 1, qh),
             Action::Exclude(name) => {
                 if !settings::exclude(&mut self.cfg, &name) {
                     self.settings_error = Some("Could not save exclusions".into());
@@ -332,6 +463,16 @@ impl App {
                 let sel = self.sel;
                 self.refresh();
                 self.sel = sel.min(self.items.len().saturating_sub(1));
+                self.redraw(qh);
+            }
+            Action::PinToggle(key) => {
+                self.hist.toggle_pin(&key);
+                self.refresh();
+                self.redraw(qh);
+            }
+            Action::ResetRank(key) => {
+                self.hist.reset(&key);
+                self.refresh();
                 self.redraw(qh);
             }
             Action::ClearClip => {
@@ -345,11 +486,45 @@ impl App {
         }
     }
 
-    fn mv(&mut self, d: isize) {
-        let n = self.items.len() as isize;
-        if n > 0 {
-            self.sel = (self.sel as isize + d).clamp(0, n - 1) as usize;
-        }
+    /// The action row (index into the filtered list) under the surface point, if the point is on one.
+    fn panel_row_at(&self, x: f64, y: f64) -> Option<usize> {
+        let (_, _, selected) = self.panel.as_ref()?;
+        let g = actions_ui::panel_layout(
+            self.cfg.width as f32,
+            self.vp(),
+            self.panel_vis().len(),
+            *selected,
+            1.0,
+        );
+        let ry = y as f32 - g.y - actions_ui::PANEL_HEAD;
+        let row = (ry / ui::ROW) as usize;
+        let inside = x as f32 >= g.x && (x as f32) < g.x + g.w && ry >= 0.0 && row < g.cap;
+        inside.then_some(g.off + row)
+    }
+
+    fn close_panel(&mut self) {
+        self.panel = None;
+        self.panel_filter.clear();
+    }
+
+    fn panel_vis(&self) -> Vec<usize> {
+        let Some((_, acts, _)) = &self.panel else {
+            return Vec::new();
+        };
+        acts.iter()
+            .enumerate()
+            .filter(|(_, a)| a.title.to_lowercase().contains(&self.panel_filter))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn open_panel(&mut self) {
+        let Some(it) = self.items.get(self.sel) else {
+            return;
+        };
+        let acts = items::actions_for(it, self.hist.is_pinned(&items::key_of(it)), &self.cfg);
+        self.panel = Some((it.title.clone(), acts, 0));
+        self.panel_filter.clear();
     }
 
     fn key(&mut self, key: u32, qh: &QueueHandle<App>) -> bool {
@@ -360,74 +535,114 @@ impl App {
         let utf8 = st.key_get_utf8(code);
         let ctrl = st.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE);
         let mut repeatable = true;
-        match sym {
-            k::KEY_Escape => {
-                if !self.query.is_empty() {
-                    self.query.clear();
-                    self.refresh();
-                    self.redraw(qh);
-                } else {
-                    self.hide();
+        if self.panel.is_some() {
+            let n = self.panel_vis().len();
+            match sym {
+                k::KEY_Escape => self.close_panel(),
+                k::KEY_Return | k::KEY_KP_Enter => {
+                    self.activate(qh);
+                    return false;
                 }
+                k::KEY_Down | k::KEY_Tab => {
+                    if let Some(p) = &mut self.panel {
+                        p.2 = (p.2 + 1).min(n.saturating_sub(1));
+                    }
+                }
+                k::KEY_Up | k::KEY_ISO_Left_Tab => {
+                    if let Some(p) = &mut self.panel {
+                        p.2 = p.2.saturating_sub(1);
+                    }
+                }
+                k::KEY_BackSpace => {
+                    self.panel_filter.pop();
+                    if let Some(p) = &mut self.panel {
+                        p.2 = 0;
+                    }
+                }
+                _ if ctrl && sym == k::KEY_b => self.close_panel(),
+                _ if !ctrl && !utf8.is_empty() && !utf8.chars().any(char::is_control) => {
+                    self.panel_filter.push_str(&utf8.to_lowercase());
+                    if let Some(p) = &mut self.panel {
+                        p.2 = 0;
+                    }
+                }
+                _ => repeatable = false,
+            }
+            self.redraw(qh);
+            return repeatable;
+        }
+        if ctrl && sym == k::KEY_b {
+            self.open_panel();
+            self.redraw(qh);
+            return false;
+        }
+        let (columns, grid) = (self.columns(), self.query.starts_with(':'));
+        let selected = self.items.get(self.sel).map(|i| i.action.clone());
+        let effect = keys::handle(
+            &mut keys::KeyState {
+                query: &mut self.query,
+                sel: &mut self.sel,
+                len: self.items.len(),
+                rows: self.cfg.max_rows,
+                columns,
+                grid,
+                pop_on_backspace: self.cfg.pop_on_backspace,
+                close_on_escape: self.cfg.escape_key_behavior == "close_window",
+                selected: selected.as_ref(),
+            },
+            &keys::KeyIn {
+                sym,
+                utf8: &utf8,
+                ctrl,
+            },
+        );
+        let repeat = effect.repeats();
+        match effect {
+            keys::Effect::Ignore => return false,
+            keys::Effect::Hide => {
+                self.hide();
                 return false;
             }
-            k::KEY_Return | k::KEY_KP_Enter => {
+            keys::Effect::Activate => {
                 self.activate(qh);
                 return false;
             }
-            k::KEY_BackSpace => {
-                self.query.pop();
-                self.refresh();
+            keys::Effect::Edited => self.refresh(),
+            keys::Effect::Moved => {}
+            keys::Effect::Step(name, dir) => {
+                self.change_setting(&name, dir, qh);
+                return true;
             }
-            k::KEY_Down | k::KEY_Tab => self.mv(1),
-            k::KEY_Up | k::KEY_ISO_Left_Tab => self.mv(-1),
-            k::KEY_Page_Down => self.mv(self.cfg.max_rows as isize),
-            k::KEY_Page_Up => self.mv(-(self.cfg.max_rows as isize)),
-            k::KEY_Home => self.sel = 0,
-            k::KEY_End => self.sel = self.items.len().saturating_sub(1),
-            _ if ctrl => match utf8.as_str() {
-                "\u{15}" => {
-                    self.query.clear();
-                    self.refresh();
+            keys::Effect::DeleteClip => {
+                if let Some(action) = selected {
+                    if self.clip.remove(&action) && self.cfg.clipboard_persist {
+                        self.clip.save();
+                    }
                 }
-                "\u{17}" => {
-                    let t = self.query.trim_end().rfind(' ').map_or(0, |i| i + 1);
-                    self.query.truncate(t);
-                    self.refresh();
-                }
-                "\u{e}" | "\u{a}" => self.mv(1),
-                "\u{10}" | "\u{b}" => self.mv(-1),
-                "\u{7}" => {
-                    self.hide();
-                    return false;
-                }
-                _ => repeatable = false,
-            },
-            _ => {
-                if !utf8.is_empty() && !utf8.chars().any(|c| c.is_control()) {
-                    self.query.push_str(&utf8);
-                    self.refresh();
-                } else {
-                    repeatable = false;
-                }
+                self.refresh();
             }
         }
         self.redraw(qh);
-        repeatable
+        repeat
     }
 
-    fn row_at(&self, y: f64) -> Option<usize> {
-        let y = y as f32 - ui::HEAD;
-        if y < 0.0 {
-            return None;
+    fn row_at(&self, x: f64, y: f64) -> Option<usize> {
+        if self.query.starts_with(':') {
+            return ui::emoji_hit(
+                self.cfg.width,
+                self.emoji_rows(),
+                self.top,
+                self.items.len(),
+                x as f32,
+                y as f32,
+            );
         }
-        let r = (y / ui::ROW) as usize;
-        let i = self.top + r;
-        if r < self.rows() && i < self.items.len() {
-            Some(i)
-        } else {
-            None
-        }
+        ui::item_at(
+            &self.items,
+            self.top,
+            self.vp(),
+            y as f32 - ui::HEAD - ui::LIST_PAD,
+        )
     }
 }
 
@@ -839,7 +1054,13 @@ impl Dispatch<WlKeyboard, ()> for App {
                     a.repeating = None;
                 }
             }
-            Event::Leave { .. } => a.repeating = None,
+            Event::Leave { .. } => {
+                // Losing keyboard focus hides the panel, like zlaunch.
+                a.repeating = None;
+                if a.shown {
+                    a.hide();
+                }
+            }
             _ => {}
         }
     }
@@ -856,32 +1077,62 @@ impl Dispatch<WlPointer, ()> for App {
     ) {
         use wayland_client::protocol::wl_pointer::{Axis, ButtonState, Event};
         match ev {
-            Event::Motion { surface_y, .. } | Event::Enter { surface_y, .. } => {
-                let hit = a.row_at(surface_y);
-                a.pointer_over_row = hit.is_some();
-                if let Some(i) = hit {
-                    if i != a.sel {
-                        a.sel = i;
+            Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            }
+            | Event::Enter {
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                a.pointer = Some((surface_x, surface_y));
+                if a.panel.is_some() {
+                    if let Some(row) = a.panel_row_at(surface_x, surface_y) {
+                        if let Some(p) = &mut a.panel {
+                            p.2 = row;
+                        }
                         a.redraw(qh);
                     }
                 }
             }
+            Event::Leave { .. } => a.pointer = None,
             Event::Button {
                 button: 272,
                 state: WEnum::Value(ButtonState::Pressed),
                 ..
             } => {
-                // The pointer position is the selected row after the last motion.
-                if a.shown && a.pointer_over_row {
+                if a.shown && a.panel.is_some() {
+                    // A click on an action runs it; a click anywhere else only closes the panel.
+                    match a.pointer.and_then(|(x, y)| a.panel_row_at(x, y)) {
+                        Some(row) => {
+                            if let Some(p) = &mut a.panel {
+                                p.2 = row;
+                            }
+                            a.activate(qh);
+                        }
+                        None => {
+                            a.close_panel();
+                            a.redraw(qh);
+                        }
+                    }
+                    return;
+                }
+                // A click picks the row under the pointer and runs it, like zlaunch.
+                let row = a.pointer.and_then(|(x, y)| a.row_at(x, y));
+                if let (true, Some(i)) = (a.shown, row) {
+                    a.sel = i;
                     let now = Instant::now();
-                    let double = a.last_click.is_some_and(|(i, t)| {
-                        i == a.sel && now.duration_since(t) < Duration::from_millis(400)
+                    let double = a.last_click.is_some_and(|(j, t)| {
+                        j == i && now.duration_since(t) < Duration::from_millis(400)
                     });
                     if a.cfg.single_click || double {
                         a.last_click = None;
                         a.activate(qh);
                     } else {
-                        a.last_click = Some((a.sel, now));
+                        a.last_click = Some((i, now));
+                        a.redraw(qh);
                     }
                 }
             }
@@ -890,13 +1141,40 @@ impl Dispatch<WlPointer, ()> for App {
                 value,
                 ..
             } => {
-                let max_top = a.items.len().saturating_sub(a.rows());
-                let step = if value > 0.0 { 1isize } else { -1 };
-                a.top = (a.top as isize + step).clamp(0, max_top as isize) as usize;
-                a.sel = a
-                    .sel
-                    .clamp(a.top, a.top + a.rows() - 1)
-                    .min(a.items.len().saturating_sub(1));
+                if a.panel.is_some() {
+                    let n = a.panel_vis().len();
+                    if let Some(p) = &mut a.panel {
+                        p.2 = (p.2 as isize + if value > 0.0 { 1 } else { -1 })
+                            .clamp(0, n.saturating_sub(1) as isize)
+                            as usize;
+                    }
+                    a.redraw(qh);
+                    return;
+                }
+                if a.query.starts_with(':') {
+                    let columns = a.columns();
+                    let rows = a.emoji_rows();
+                    let max_top = a.items.len().div_ceil(columns).saturating_sub(rows);
+                    let step = if value > 0.0 { 1isize } else { -1 };
+                    a.top = ((a.top / columns) as isize + step).clamp(0, max_top as isize) as usize
+                        * columns;
+                    a.sel = a
+                        .sel
+                        .clamp(a.top, a.top + rows * columns - 1)
+                        .min(a.items.len().saturating_sub(1));
+                } else {
+                    let vp = a.vp();
+                    let max_top = ui::max_top(&a.items, vp);
+                    let step = if value > 0.0 { 1isize } else { -1 };
+                    a.top = (a.top as isize + step).clamp(0, max_top as isize) as usize;
+                    let shown: Vec<usize> = ui::slots(&a.items, a.top, vp)
+                        .iter()
+                        .filter_map(|x| x.item)
+                        .collect();
+                    if let (Some(&f), Some(&l)) = (shown.first(), shown.last()) {
+                        a.sel = a.sel.clamp(f, l);
+                    }
+                }
                 a.redraw(qh);
             }
             _ => {}
@@ -994,6 +1272,7 @@ fn main() {
         icons: icons::Cache::new(&cfg.icon_theme, &cfg.emoji_font),
         font: load_font(&cfg),
         apps: items::scan_apps(&cfg),
+        files: items::FileIndex::default(),
         items: vec![],
         query: String::new(),
         sel: 0,
@@ -1006,9 +1285,12 @@ fn main() {
         repeat_rate: 25,
         repeat_delay: 400,
         repeating: None,
-        pointer_over_row: false,
+        pointer: None,
         last_click: None,
         settings_error: None,
+        hist: hist::Hist::load(),
+        panel: None,
+        panel_filter: String::new(),
         cfg,
         compositor: None,
         shm: None,

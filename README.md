@@ -33,7 +33,9 @@ Settings from the launcher, or type `:`, `;` or `settings` directly.
 Use Up/Down or Tab/Shift-Tab to select and Enter to activate. Escape clears
 the current view, then closes the panel. Ctrl+U clears the query. Page Up,
 Page Down, Home and End move through results. By default a double click
-activates a row; single-click activation is a setting.
+activates a row; single-click activation is a setting. In the emoji grid,
+Left/Right moves one cell and Up/Down moves one grid row, wrapping in the
+same column. Search covers the full emoji list.
 
 In Settings, Enter cycles theme, font size, visible rows, panel width,
 clipboard collection/persistence/limit and click behavior. Open Excluded
@@ -48,10 +50,10 @@ Config is `$XDG_CONFIG_HOME/zl/config.toml` (normally
 after editing the file manually.
 
 ```toml
-theme = "dark"
-max_rows = 8
-width = 640
-font_size = 15.0
+theme = "default"
+max_rows = 6
+width = 600
+font_size = 14.0
 disabled_apps = ["Example App"]
 clipboard_history = true
 clipboard_persist = true
@@ -64,6 +66,11 @@ icon_theme = ""
 monitor = ""
 terminal = "" # e.g. "foot -e" for Terminal=true applications
 ```
+
+The built-in themes are zlaunch's default and its 15 named palettes. Run
+`zl themes` for their names. Existing `dark`, `light`, `gruvbox` and
+`catppuccin` names remain aliases. Color overrides accept hex RGB or RGBA
+(`#RGB`, `#RGBA`, `#RRGGBB`, `#RRGGBBAA`); RGB overrides are opaque.
 
 Clipboard history is local. Persistence defaults to on under
 `$XDG_STATE_HOME/zl/clipboard` (normally `~/.local/state/zl/clipboard`),
@@ -90,3 +97,18 @@ bash tests/headless.sh bash tests/basic.sh
 The headless scenario requires sway, grim, wl-clipboard, tesseract and Python Pillow.
 It uses private XDG directories and only stops its own recorded processes.
 The branch CI runs these basic checks, not the full launcher's old suite.
+
+On a Debian or Ubuntu host without sway installed, the test tools can be downloaded
+and unpacked in a private cache without sudo. This uses the host's configured apt
+repositories and does not install system packages. Pillow, fontconfig and a font
+must already be available; OCR scenarios also need tesseract.
+
+```sh
+tools/headless-sway.sh bash tests/headless.sh bash tests/basic.sh
+```
+
+The test runner starts a private headless sway session with the pixman renderer.
+Set `OUT=/tmp/rl-shots` to keep its screenshots and logs. Downloads happen only in
+this development script, never in the launcher. `RL_HEADLESS_CACHE` overrides the
+tool cache location. This is a headless compositor check, not a physical display
+or GPU test.
