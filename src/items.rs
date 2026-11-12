@@ -113,11 +113,7 @@ impl Search<'_> {
                 .history
                 .entries
                 .iter()
-                .filter(|c| {
-                    needle.is_empty()
-                        || c.text.to_lowercase().contains(&needle)
-                        || clip::preview(&c.text).to_lowercase().contains(&needle)
-                })
+                .filter(|c| clipboard_matches(&c.text, &needle))
                 .map(|c| {
                     let paths: Vec<String> = if c.files {
                         c.text.lines().map(str::to_string).collect()
@@ -324,6 +320,14 @@ impl Search<'_> {
         group_sections(scored, self.cfg)
     }
 }
+fn clipboard_matches(text: &str, needle: &str) -> bool {
+    needle.is_empty()
+        || text.to_lowercase().contains(needle)
+        // The preview only adds dots. Unicode lowercase can depend on the truncated context.
+        || ((!needle.is_ascii() || needle.contains('.'))
+            && clip::preview(text).to_lowercase().contains(needle))
+}
+
 fn item_module(item: &Item) -> config::ConfigModule {
     use config::ConfigModule::*;
     match (&item.action, item.tag) {
@@ -538,6 +542,36 @@ pub fn emoji_items(q: &str) -> Vec<Item> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn clipboard_filter_keeps_preview_ellipsis_and_unicode_lowercase_matches() {
+        let texts = [
+            "",
+            "short",
+            "  line one\nline two",
+            "a",
+            "Clipboard fixture café https://example.org/4999",
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "ΑΑΑΑΑΑΑΑΑΑΑΑΑΑΑΑΑΑΑΑΑΑΑΑΑΑΑΑΑΣx",
+            "İstanbul",
+            "FOO Σ BAR",
+        ];
+        for text in texts {
+            for needle in [
+                "", "line", "missing", "4999", "é", "ς", "σ", "i", "i̇", ".", "...", "xyz...",
+                "foo", "\n", " bar",
+            ] {
+                let expected = needle.is_empty()
+                    || text.to_lowercase().contains(needle)
+                    || clip::preview(text).to_lowercase().contains(needle);
+                assert_eq!(
+                    clipboard_matches(text, needle),
+                    expected,
+                    "{text:?} {needle:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn emoji_picker_is_not_limited_to_eighty_results() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();

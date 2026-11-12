@@ -133,6 +133,61 @@ impl Canvas {
             ((y0 - reach).floor() as i32).max(0),
             ((y1 + reach).ceil() as i32).min(self.h as i32),
         );
+        let horizontal: Vec<f32> = (px0..px1)
+            .map(|px| {
+                let fx = px as f32 + 0.5;
+                0.5 * (erf((fx - x0) / k) - erf((fx - x1) / k))
+            })
+            .collect();
+        for py in py0..py1 {
+            let fy = py as f32 + 0.5;
+            let ay = 0.5 * (erf((fy - y0) / k) - erf((fy - y1) / k));
+            for (px, ax) in (px0..px1).zip(&horizontal) {
+                let a = alpha * ax * ay;
+                if a > 0.002 {
+                    self.blend(px, py, [0, 0, 0], a);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn shadow_scalar(
+        &mut self,
+        (x, y, w, h): (f32, f32, f32, f32),
+        offset_y: f32,
+        blur: f32,
+        spread: f32,
+        alpha: f32,
+    ) {
+        // Abramowitz & Stegun constants carry more digits than f32 holds.
+        #[allow(clippy::excessive_precision)]
+        fn erf(x: f32) -> f32 {
+            let t = 1.0 / (1.0 + 0.3275911 * x.abs());
+            let poly = t
+                * (0.254829592
+                    + t * (-0.284496736
+                        + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+            let y = 1.0 - poly * (-x * x).exp();
+            if x >= 0.0 {
+                y
+            } else {
+                -y
+            }
+        }
+        let sigma = (blur / 2.0).max(0.01);
+        let k = sigma * std::f32::consts::SQRT_2;
+        let (x0, x1) = (x - spread, x + w + spread);
+        let (y0, y1) = (y + offset_y - spread, y + offset_y + h + spread);
+        let reach = blur + 1.0;
+        let (px0, px1) = (
+            ((x0 - reach).floor() as i32).max(0),
+            ((x1 + reach).ceil() as i32).min(self.w as i32),
+        );
+        let (py0, py1) = (
+            ((y0 - reach).floor() as i32).max(0),
+            ((y1 + reach).ceil() as i32).min(self.h as i32),
+        );
         for py in py0..py1 {
             let fy = py as f32 + 0.5;
             let ay = 0.5 * (erf((fy - y0) / k) - erf((fy - y1) / k));
@@ -185,6 +240,54 @@ impl Canvas {
 
     /// Rounded outline `t` pixels thick.
     pub fn rrect_outline(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        r: f32,
+        t: f32,
+        c: Rgb,
+        alpha: f32,
+    ) {
+        let (x0, y0, x1, y1) = (
+            (x.floor() as i32).max(0),
+            (y.floor() as i32).max(0),
+            ((x + w).ceil() as i32).min(self.w as i32),
+            ((y + h).ceil() as i32).min(self.h as i32),
+        );
+        let inset = r.max(t + 0.5);
+        let mut interior = (x0..x1).filter(|&px| {
+            let fx = px as f32 + 0.5 - x;
+            fx >= inset && fx <= w - inset
+        });
+        let left = interior.clone().next().unwrap_or(x1);
+        let right = interior.next_back().map_or(x1, |px| px + 1);
+        for py in y0..y1 {
+            let fy = py as f32 + 0.5 - y;
+            let middle = fy >= inset && fy <= h - inset;
+            let edges =
+                (x0..if middle { left } else { x1 }).chain((if middle { right } else { x1 })..x1);
+            for px in edges {
+                let fx = px as f32 + 0.5 - x;
+                let dx = (r - fx).max(fx - (w - r)).max(0.0);
+                let dy = (r - fy).max(fy - (h - r)).max(0.0);
+                let d = (dx * dx + dy * dy).sqrt();
+                let outer = (r - d + 0.5).clamp(0.0, 1.0);
+                let inner = (d - (r - t) + 0.5).clamp(0.0, 1.0);
+                let edge = if dx > 0.0 || dy > 0.0 {
+                    outer * inner
+                } else {
+                    let m = fx.min(w - fx).min(fy).min(h - fy);
+                    (t - m + 0.5).clamp(0.0, 1.0)
+                };
+                self.blend(px, py, c, edge * alpha);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn rrect_outline_scalar(
         &mut self,
         x: f32,
         y: f32,
@@ -1517,6 +1620,53 @@ mod tests {
         (x0..x1)
             .flat_map(|x| (y0..y1).map(move |y| (x, y)))
             .any(|(x, y)| px(cv, x, y) == want)
+    }
+
+    #[test]
+    fn separable_shadow_matches_scalar_pixels_at_fractional_offsets() {
+        for (x, y, w, h) in [(20.0, 20.0, 133.0, 104.0), (-3.25, 4.5, 51.2, 47.1)] {
+            for (offset, blur, spread, alpha) in [
+                (10.0, 3.0, 0.0, 0.1),
+                (4.0, 1.2, -1.0, 0.1),
+                (-1.0, 0.0, 2.0, 0.75),
+            ] {
+                let mut fast = Canvas::new(180, 160);
+                let mut scalar = Canvas::new(180, 160);
+                fast.buf.fill(135);
+                scalar.buf.fill(135);
+                fast.set_clip_top(3);
+                scalar.set_clip_top(3);
+                fast.set_clip_y(140);
+                scalar.set_clip_y(140);
+                fast.shadow((x, y, w, h), offset, blur, spread, alpha);
+                scalar.shadow_scalar((x, y, w, h), offset, blur, spread, alpha);
+                assert_eq!(fast.buf, scalar.buf);
+            }
+        }
+    }
+
+    #[test]
+    fn outline_skip_matches_scalar_pixels_with_fractional_bounds_and_clips() {
+        for (x, y, w, h, r, t) in [
+            (0.0, 0.0, 80.0, 60.0, 12.0, 1.0),
+            (-4.25, 2.5, 53.2, 44.7, 6.0, 2.25),
+            (3.4, -2.0, 5.0, 7.0, 9.0, 1.0),
+            (1.0, 1.0, 30.0, 22.0, 0.0, 1.0),
+        ] {
+            for alpha in [0.0, 0.1, 0.75, 1.0] {
+                let mut fast = Canvas::new(80, 60);
+                let mut scalar = Canvas::new(80, 60);
+                fast.buf.fill(73);
+                scalar.buf.fill(73);
+                fast.set_clip_top(3);
+                scalar.set_clip_top(3);
+                fast.set_clip_y(51);
+                scalar.set_clip_y(51);
+                fast.rrect_outline(x, y, w, h, r, t, [17, 93, 201], alpha);
+                scalar.rrect_outline_scalar(x, y, w, h, r, t, [17, 93, 201], alpha);
+                assert_eq!(fast.buf, scalar.buf);
+            }
+        }
     }
 
     #[test]
