@@ -14,7 +14,8 @@ shot() { grim "$OUT/$1.png"; }
 sleep .3
 printf 't #\ns .15\n' | send_test_keys
 shot scroll-initial
-printf 'm 700 450\na 60\na 60\na 60\n' | pointer
+printf 'm 700 450\n' | pointer
+printf 'a 60\na 60\na 60\n' | pointer
 shot scroll-wheel
 sleep 3.2
 shot scroll-idle

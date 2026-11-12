@@ -35,9 +35,6 @@ impl<'a> Scorer<'a> {
         kind: Kind,
         is_description: bool,
     ) -> Option<i64> {
-        let query_lower = query.to_lowercase();
-        let text_lower = text.to_lowercase();
-
         let match_result = self.matcher.fuzzy_indices(text, query);
 
         let match_result = match_result.or_else(|| {
@@ -59,6 +56,8 @@ impl<'a> Scorer<'a> {
         let mut score = base_score;
 
         if !is_description {
+            let query_lower = query.to_lowercase();
+            let text_lower = text.to_lowercase();
             if text_lower == query_lower {
                 score += self.config.exact_match_bonus;
             } else if text_lower.starts_with(&query_lower) {

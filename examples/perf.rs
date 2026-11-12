@@ -64,7 +64,11 @@ fn main() {
     let root = tempfile::tempdir().unwrap();
     let applications = root.path().join("applications");
     std::fs::create_dir(&applications).unwrap();
-    for i in 0..600 {
+    let count = std::env::var("PERF_APPS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(600);
+    for i in 0..count {
         let name = [
             "Firefox Browser",
             "Code Editor",
@@ -82,16 +86,36 @@ fn main() {
     let started = Instant::now();
     let cfg = config::Config::default();
     let apps = items::scan_apps(&cfg);
-    assert_eq!(apps.len(), 600);
+    assert_eq!(apps.len(), count);
     let font = rusttype::Font::try_from_vec(
         std::fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf").unwrap(),
     )
     .unwrap();
     let cache = icons::Cache::new("", "");
-    let history = clip::History::new(100);
-    println!("no compositor; 600 desktop files; 640px; scale 1; DejaVu Sans; warm filesystem");
+    let mut history = clip::History::new(5000);
+    for i in 0..5000 {
+        history.push(&format!(
+            "Clipboard fixture {i:04} café https://example.org/{i}"
+        ));
+    }
+    for query in [";", ";fixture", ";4999", ";missing"] {
+        let search = items::Search {
+            cfg: &cfg,
+            apps: &apps,
+            windows: &[],
+            history: &history,
+        };
+        let mut samples = Vec::new();
+        for _ in 0..50 {
+            let t = Instant::now();
+            black_box(search.run(query));
+            samples.push(t.elapsed().as_secs_f64() * 1e6);
+        }
+        report(&format!("clipboard5000 {query:?}"), samples);
+    }
+    println!("no compositor; {count} desktop files; 640px; scale 1; DejaVu Sans; warm filesystem");
     println!(
-        "init_scan_font_cache_us={:.3}; {}",
+        "setup_including_clipboard_bench_us={:.3}; {}",
         started.elapsed().as_secs_f64() * 1e6,
         rss_kib()
     );
@@ -166,6 +190,16 @@ fn main() {
     }
     report("canvas_alloc_draw_no_wayland_no_icon_io", samples);
     println!("after_draw_{}", rss_kib());
+    let mut samples = Vec::new();
+    for _ in 0..110 {
+        let t = Instant::now();
+        let mut cv = ui::Canvas::new(240, 180);
+        cv.shadow((20.0, 20.0, 133.0, 104.0), 10.0, 3.0, 0.0, 0.1);
+        cv.shadow((20.0, 20.0, 133.0, 104.0), 4.0, 1.2, -1.0, 0.1);
+        black_box(&cv.buf);
+        samples.push(t.elapsed().as_secs_f64() * 1e6);
+    }
+    report("two_context_menu_shadows", samples);
     if let Some(path) = std::env::args().nth(1) {
         for px in last.buf.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
