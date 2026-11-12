@@ -101,21 +101,6 @@ impl Hist {
         self.write_pins();
         true
     }
-    /// Bonus added to a result's score. Frequent picks count more, old ones fade over a few weeks.
-    pub fn bonus(&self, key: &str) -> i32 {
-        let Some(&(c, t)) = self.map.get(key) else {
-            return 0;
-        };
-        let days = now().saturating_sub(t) / 86400;
-        let recency = match days {
-            0 => 10,
-            1..=3 => 7,
-            4..=14 => 4,
-            15..=45 => 2,
-            _ => 0,
-        };
-        (c.min(15) as i32) * 2 + recency
-    }
     /// Forget every recorded pick for a result, so it ranks by title match alone again.
     pub fn reset(&mut self, key: &str) {
         self.map.remove(key);
@@ -148,14 +133,6 @@ impl Hist {
             let _ = std::fs::rename(&tmp, &p);
         }
     }
-}
-
-/// A history with one recorded pick, for search tests.
-#[cfg(test)]
-pub fn test_hist(key: &str, count: u32) -> Hist {
-    let mut h = Hist::default();
-    h.map.insert(key.to_string(), (count, now()));
-    h
 }
 
 /// Recently copied emoji, newest first, one per line.

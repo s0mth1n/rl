@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Edge cases in one isolated headless session: empty app list, long and rapid input,
 # oversized and rapid clipboard copies, unicode round-trips, pointer activation,
-# live settings changes, and daemon lifecycle abuse.
+# configuration at restart, and daemon lifecycle abuse.
 set -euo pipefail
 source "$here/tests/session.bash"
 start_test_keyboard
@@ -13,7 +13,7 @@ shot() {
     env -u LD_LIBRARY_PATH tesseract "$OUT/$1-ocr.png" "$OUT/$1" --psm 6 2>/dev/null
 }
 check_text() { grep -qi "$2" "$OUT/$1.txt" || { echo "FAIL $1 missing $2"; cat "$OUT/$1.txt"; exit 1; }; }
-type_query() { printf 'k ctrl-u\nt %s\ns 0.25\nk home\ns 0.1\n' "$1" | send_test_keys; }
+type_query() { "$Z" hide; "$Z" show; sleep .15; printf 't %s\ns 0.25\n' "$1" | send_test_keys; }
 panel_visible() {
     # The solid desktop background stays under ~40 luminance; panel text/border pixels are bright.
     python3 - "$1" <<'PYVIS'
@@ -26,7 +26,7 @@ sys.exit(0 if max(crop.getdata()) > 100 else 1)
 PYVIS
 }
 
-# No desktop files exist in this session: only the three basic views remain.
+# No desktop files exist in this session: only built-in views remain.
 "$Z" show
 sleep .4
 shot noapps
@@ -39,7 +39,9 @@ printf 'k enter\ns 0.2\n' | send_test_keys   # Enter with no results must do not
 printf 'k esc\ns 0.2\n' | send_test_keys
 echo 'PASS empty app list and no-result Enter'
 
-# A long query typed fast, then erased with ctrl-u and Escape.
+# A long query typed fast, then hidden and shown again.
+"$Z" show
+sleep .2
 LONG=$(printf 'a%.0s' $(seq 220))
 printf 't %s\ns 0.3\n' "$LONG" | send_test_keys
 shot longquery
@@ -111,74 +113,33 @@ timeout 5 wl-paste --no-newline > "$OUT/uni-back.txt"
 cmp "$OUT/uni.txt" "$OUT/uni-back.txt"
 echo 'PASS unicode, tab and backslash round-trip through persistence'
 
-# Pointer: with single_click off, one click selects but a double click activates.
-# single_click now defaults to on (zlaunch confirms on a single click), so turn it off first.
-printf 'close_on_focus_loss = false\nsingle_click = false\n' > "$XDG_CONFIG_HOME/zl/config.toml"
-sleep 1
-"$Z" show
-sleep .3
-Y=503  # Emoji Picker row centre in the six-row root view (panel top 214, header 57, rows 50)
-printf 'm 640 %s\np\nr\ns 0.3\n' "$Y" | "$P"
-grim "$OUT/single-noop.png"
-python3 - "$OUT/single-noop.png" <<'PYNOOP'
+# Pointer: single-click defaults to on and opens the filtered submenu.
+type_query 'Emoji Picker'
+printf 'm 640 290\np\nr\ns 0.4\n' | "$P"
+shot singleclick
+check_text singleclick 'earch emojis'
+echo 'PASS pointer single-click activation'
+
+# A configured theme is loaded on the next daemon start.
+"$Z" quit
+sleep .2
+printf 'close_on_focus_loss = false\ntheme = "nord"\n' > "$XDG_CONFIG_HOME/zl/config.toml"
+"$Z" >"$OUT/theme-restart.log" 2>&1 & record_test_pid $!
+sleep .5
+type_query '#nord'
+shot nord-picker
+python3 - "$OUT/nord-picker.png" <<'PYTHEME'
 import sys
 from PIL import Image
-img = Image.open(sys.argv[1])
-img.crop((img.width // 2 - 310, img.height // 2 - 225, img.width // 2 + 310, img.height // 2 + 225)).resize((1860, 1350)).convert('L').point(lambda v: 0 if v > 90 else 255).save('/tmp/zl-single-noop-ocr.png')
-PYNOOP
-env -u LD_LIBRARY_PATH tesseract /tmp/zl-single-noop-ocr.png "$OUT/single-noop" --psm 6 2>/dev/null
-check_text single-noop 'Emoj\|Picker\|Clipboard'   # still the root view: one click did not open it
-printf 'm 640 %s\nd\ns 0.4\n' "$Y" | "$P"
-shot doubleclick
-check_text doubleclick 'Search emoj'   # double click opened the emoji picker (grid view)
-echo 'PASS pointer double-click activation'
-
-# Live settings: single_click on, theme change, all without a restart.
-printf 'k esc\ns 0.2\n' | send_test_keys          # clear the ':' query
-type_query 'settings'
-printf 'k down\nk down\nk down\nk down\nk down\nk down\nk down\nk down\nk enter\ns 0.4\n' | send_test_keys
-grep -q 'single_click = true' "$XDG_CONFIG_HOME/zl/config.toml"
-printf 'k esc\nk esc\ns 0.2\n' | send_test_keys
-"$Z" show
-sleep .3
-printf 'm 640 %s\np\nr\ns 0.4\n' "$Y" | "$P"   # one click now opens the picker
-shot singleclick
-check_text singleclick 'grinning'
-printf 'k esc\ns 0.2\n' | send_test_keys
-echo 'PASS single_click applies live'
-
-grim "$OUT/theme-before.png"
-type_query 'settings'
-printf 'k down\nk enter\ns 0.4\n' | send_test_keys       # theme: dark -> light
-grep -q 'theme = "light"' "$XDG_CONFIG_HOME/zl/config.toml"
-shot theme-after
-python3 - "$OUT/theme-before.png" "$OUT/theme-after.png" <<'PYTHEME'
-import sys
-from PIL import Image, ImageStat
-mean = lambda p: ImageStat.Stat(Image.open(p).convert('L')).mean[0]
-before, after = mean(sys.argv[1]), mean(sys.argv[2])
-sys.exit(0 if after > before + 30 else 1)
+pixel = Image.open(sys.argv[1]).convert('RGB').getpixel((640, 450))
+expected = tuple(round(c * (179 / 255) + bg * (1 - 179 / 255))
+                 for c, bg in zip((46, 52, 64), (32, 36, 44)))
+assert all(abs(a - b) <= 2 for a, b in zip(pixel, expected)), (pixel, expected)
 PYTHEME
-echo 'PASS theme change applies live'
+echo 'PASS configured theme loads after restart'
 
-# A failed settings write surfaces an error row instead of corrupting the config.
-cp "$XDG_CONFIG_HOME/zl/config.toml" "$OUT/config.bak"
-chmod 400 "$XDG_CONFIG_HOME/zl/config.toml"
-chmod 500 "$XDG_CONFIG_HOME/zl"
-printf 'k esc\ns 0.2\n' | send_test_keys
-type_query 'settings'
-printf 'k down\nk enter\ns 0.4\n' | send_test_keys
-shot save-error
-check_text save-error 'not save sett'   # OCR garbles small text; match loosely
-chmod 700 "$XDG_CONFIG_HOME/zl"
-grep -q 'theme = "light"' "$XDG_CONFIG_HOME/zl/config.toml"   # unchanged
-echo 'PASS failed settings write is reported, config intact'
-
-# Escape behaviour: with a query it clears, without one it hides.
+# Escape in the combined list hides immediately, even with a query.
 type_query 'abc'
-printf 'k esc\ns 0.3\n' | send_test_keys
-shot escclear
-check_text escclear 'picker'   # theme may be light here; assert the root view loosely
 printf 'k esc\ns 0.3\n' | send_test_keys
 grim "$OUT/hidden.png"
 ! panel_visible "$OUT/hidden.png"
@@ -186,7 +147,7 @@ grim "$OUT/hidden.png"
 sleep .3
 grim "$OUT/shown.png"
 panel_visible "$OUT/shown.png"
-echo 'PASS Escape clears then hides'
+echo 'PASS Escape hides and show restores the launcher'
 
 # Quit while visible drops the socket; the next daemon starts clean.
 "$Z" quit

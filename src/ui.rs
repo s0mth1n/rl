@@ -20,17 +20,24 @@ pub const INPUT_RIGHT: f32 = 90.0;
 /// theme, not from the launcher theme, so they stay constant across themes
 /// (zlaunch daemon/theme.rs overrides only background and borders): query
 /// text and caret #fafafa, placeholder and header icons #737373.
-const INPUT_FG: Rgb = [250, 250, 250];
-const INPUT_DIM: Rgb = [115, 115, 115];
+pub(crate) const INPUT_FG: Rgb = [250, 250, 250];
+pub(crate) const INPUT_DIM: Rgb = [115, 115, 115];
+/// Input text selection: gpui theme.selection from Default Dark, constant
+/// across launcher themes (selection.background #1d4ed8).
+const INPUT_SELECTION: Rgb = [29, 78, 216];
 /// Header separator: gpui theme.border, which zlaunch overrides to white at
 /// 10% for every theme (daemon/theme.rs configure_theme).
-const SEPARATOR: Rgb = [255, 255, 255];
-const SEPARATOR_ALPHA: f32 = 0.1;
+pub(crate) const SEPARATOR: Rgb = [255, 255, 255];
+pub(crate) const SEPARATOR_ALPHA: f32 = 0.1;
 
 pub struct Canvas {
     pub w: u32,
     pub h: u32,
     pub buf: Vec<u8>,
+    /// Pixels at or below this y are never painted; `i32::MAX` disables the
+    /// clip. The list sets it to the viewport bottom so a partial row is cut
+    /// off mid-row, like zlaunch's overflow-hidden vlist.
+    clip_y: i32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -40,12 +47,28 @@ impl Canvas {
             w,
             h,
             buf: vec![0; (w * h * 4) as usize],
+            clip_y: i32::MAX,
         }
+    }
+
+    /// Clip all painting to y < `max_y` (physical pixels).
+    pub fn set_clip_y(&mut self, max_y: i32) {
+        self.clip_y = max_y;
+    }
+
+    pub fn clear_clip(&mut self) {
+        self.clip_y = i32::MAX;
     }
 
     #[inline]
     fn blend(&mut self, x: i32, y: i32, c: Rgb, a: f32) {
-        if x < 0 || y < 0 || x >= self.w as i32 || y >= self.h as i32 || a <= 0.0 {
+        if x < 0
+            || y < 0
+            || x >= self.w as i32
+            || y >= self.h as i32
+            || y >= self.clip_y
+            || a <= 0.0
+        {
             return;
         }
         let o = ((y as u32 * self.w + x as u32) * 4) as usize;
@@ -283,6 +306,9 @@ pub struct View<'a> {
     pub scale: u32,
     pub font_size: f32,
     pub icons: &'a Cache,
+    /// Bold face for section headers (zlaunch styles them EXTRA_BOLD); falls
+    /// back to the regular face when no bold font was found.
+    pub bold_font: Option<&'a Font<'a>>,
     /// The sub-view was entered from the main list, so the input prefix is a
     /// clickable back arrow instead of the magnifier (zlaunch mode origin).
     pub back: bool,
@@ -301,6 +327,7 @@ pub fn section_of(it: &Item) -> Option<&'static str> {
     }
     match it.tag {
         "Application" => Some("Applications"),
+        "Window" => Some("Windows"),
         "Basic" => Some("Commands"),
         _ => None,
     }
@@ -331,7 +358,11 @@ pub struct Slot {
     pub header: &'static str,
 }
 
-/// Entries that fit completely in `vp` pixels when the list starts at item `top`.
+/// Entries at least partly visible in `vp` pixels when the list starts at
+/// item `top`. The last row may be clipped partway through, like zlaunch's
+/// vlist; its `h` is the visible part only, so hit tests and the scrollbar
+/// only count the visible region. Headers are kept whole: a header is shown
+/// only when it and at least a sliver of the row below it fit.
 pub fn slots(items: &[Item], top: usize, vp: f32) -> Vec<Slot> {
     let headers = show_headers(items);
     let mut out = Vec::new();
@@ -341,7 +372,7 @@ pub fn slots(items: &[Item], top: usize, vp: f32) -> Vec<Slot> {
         let starts = i == 0 || sec != section_of(&items[i - 1]);
         if headers && starts {
             if let Some(name) = sec {
-                if y + HDR + ROW > vp + 0.01 {
+                if y + HDR >= vp {
                     break;
                 }
                 out.push(Slot {
@@ -353,12 +384,12 @@ pub fn slots(items: &[Item], top: usize, vp: f32) -> Vec<Slot> {
                 y += HDR;
             }
         }
-        if y + ROW > vp + 0.01 {
+        if y >= vp {
             break;
         }
         out.push(Slot {
             y,
-            h: ROW,
+            h: ROW.min(vp - y),
             item: Some(i),
             header: "",
         });
@@ -367,44 +398,37 @@ pub fn slots(items: &[Item], top: usize, vp: f32) -> Vec<Slot> {
     out
 }
 
-/// Height of the list area: the first `max_rows` items plus the headers among them.
-pub fn viewport(items: &[Item], max_rows: usize) -> f32 {
-    let n = items.len().min(max_rows).max(1);
-    if items.is_empty() {
-        return ROW;
-    }
-    let big = (n as f32) * (ROW + HDR) + 1.0;
-    let sl = slots(items, 0, big);
-    sl.iter()
-        .rfind(|s| s.item.is_some_and(|i| i < n))
-        .map_or(ROW, |s| s.y + s.h)
-}
-
-pub fn panel_height(items: &[Item], max_rows: usize) -> u32 {
-    (HEAD + LIST_PAD + viewport(items, max_rows) + LIST_PAD) as u32
-}
+/// Fixed panel height: zlaunch sizes every panel to `launcher_size`
+/// (default 600x400) instead of to its content (config/types.rs, render.rs).
+pub const PANEL_HEIGHT: u32 = 400;
+/// Fixed height of the list viewport inside the 400 px panel.
+pub const LIST_VP: f32 = PANEL_HEIGHT as f32 - HEAD - LIST_PAD * 2.0;
+/// Emoji grid rows that fit in the fixed panel.
+pub const EMOJI_ROWS: usize = 5; // (400 - HEAD - 2*EMOJI_PAD) / EMOJI_CELL
 
 /// Largest first item that still leaves no gap below the last row.
 pub fn max_top(items: &[Item], vp: f32) -> usize {
     let last = items.len().saturating_sub(1);
-    (0..items.len())
-        .find(|&t| {
-            slots(items, t, vp)
-                .last()
-                .is_some_and(|s| s.item == Some(last))
-        })
-        .unwrap_or(0)
+    let (mut lo, mut hi) = (0, items.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if slots(items, mid, vp)
+            .last()
+            .is_some_and(|s| s.item == Some(last))
+        {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    if lo == items.len() {
+        0
+    } else {
+        lo
+    }
 }
 
 /// First visible item so that `sel` is fully shown, moving `top` as little as possible.
-pub fn scroll_to(items: &[Item], sel: usize, top: usize, vp: f32) -> usize {
-    let mut top = top.min(sel);
-    while top < sel && !slots(items, top, vp).iter().any(|s| s.item == Some(sel)) {
-        top += 1;
-    }
-    top.min(max_top(items, vp))
-}
-
 /// Item under list-relative y (unscaled), if any.
 pub fn item_at(items: &[Item], top: usize, vp: f32, y: f32) -> Option<usize> {
     slots(items, top, vp)
@@ -415,26 +439,11 @@ pub fn item_at(items: &[Item], top: usize, vp: f32, y: f32) -> Option<usize> {
 
 fn action_label(a: &Action) -> &'static str {
     match a {
-        Action::App(_) | Action::Web(_) | Action::Details => "Open",
+        Action::App(_) => "Open",
+        Action::Window(_) => "Switch",
         Action::Clip(_) | Action::ClipImg(_) => "Copy",
-        Action::View(_) | Action::Open(_) => "Open",
-        Action::Trash(_) => "Trash",
-        Action::Nothing => "",
-        Action::Setting(_) => "Change",
-        Action::Exclude(_) => "Toggle",
-        Action::ClearClip
-        | Action::PinToggle(_)
-        | Action::ResetRank(_)
-        | Action::SetToneFor(..)
-        | Action::EmojiReset(_) => "Run",
+        Action::View(_) => "Open",
         Action::Theme(_) => "Apply",
-        Action::Script(_) | Action::AppArg(..) | Action::AppForce(..) => "Run",
-        Action::ScriptToggle(_) => "Toggle",
-        Action::ScriptSamples => "Create",
-        Action::ScriptEdit(_) => "Edit",
-        Action::ScriptDelete(_) => "Delete",
-        Action::ScriptOutput => "Copy",
-        Action::ScriptSubmit => "Run",
     }
 }
 
@@ -487,16 +496,12 @@ pub fn emoji_columns(width: u32) -> usize {
     (((width as f32 - 16.0 + EMOJI_GAP) / (EMOJI_CELL + EMOJI_GAP)) as usize).clamp(1, 8)
 }
 
-pub fn emoji_rows(count: usize, width: u32, max_rows: usize) -> usize {
-    count.div_ceil(emoji_columns(width)).min(max_rows).max(1)
+pub fn emoji_rows(count: usize, width: u32) -> usize {
+    count.div_ceil(emoji_columns(width)).clamp(1, EMOJI_ROWS)
 }
 
 pub fn emoji_icon_px(scale: u32) -> u32 {
     28 * scale
-}
-
-pub fn emoji_panel_height(rows: usize) -> u32 {
-    (HEAD + EMOJI_PAD * 2.0 + rows.max(1) as f32 * EMOJI_CELL) as u32
 }
 
 pub fn emoji_hit(
@@ -578,11 +583,14 @@ fn draw_emojis(cv: &mut Canvas, font: &Font, v: &View) {
             v.w as f32 * s,
         );
     }
+    // Rows that start above the viewport bottom are drawn and clipped
+    // mid-row, like zlaunch's overflow-hidden emoji vlist.
+    cv.set_clip_y(((HEAD + LIST_PAD + v.vp) * s) as i32);
     for (offset, item) in v
         .items
         .iter()
         .skip(v.top)
-        .take((v.vp / EMOJI_CELL) as usize * columns)
+        .take((v.vp / EMOJI_CELL).ceil() as usize * columns)
         .enumerate()
     {
         let x = (left + (offset % columns) as f32 * (EMOJI_CELL + EMOJI_GAP)) * s;
@@ -606,6 +614,7 @@ fn draw_emojis(cv: &mut Canvas, font: &Font, v: &View) {
             cv.icon((x + 18.0 * s) as i32, (y + 18.0 * s) as i32, icon);
         }
     }
+    cv.clear_clip();
 }
 
 /// Hit zone for the back arrow in the input prefix, shown when a sub-view
@@ -615,8 +624,10 @@ pub fn back_button_at(x: f64, y: f64) -> bool {
 }
 
 pub fn clear_button_at(width: u32, query: &str, x: f64, y: f64) -> bool {
-    !query.is_empty()
-        && !query.starts_with(crate::items::CONFIRM_TRASH)
+    !query
+        .strip_prefix([':', ';', '#'])
+        .unwrap_or(query)
+        .is_empty()
         && x >= width as f64 - 44.0
         && x < width as f64 - 20.0
         && y >= (HEAD as f64 - 24.0) / 2.0
@@ -647,14 +658,10 @@ fn input_start(font: &Font, size: f32, query: &str, caret: usize, max_w: f32) ->
 }
 
 pub fn input_at(font: &Font, query: &str, caret: usize, width: u32, x: f64) -> usize {
-    let shown = if query.starts_with(crate::items::CONFIRM_TRASH) {
-        &query[query.len()..]
-    } else {
-        query
-            .strip_prefix([':', ';', '#'])
-            .map(str::trim_start)
-            .unwrap_or(query)
-    };
+    let shown = query
+        .strip_prefix([':', ';', '#'])
+        .map(str::trim_start)
+        .unwrap_or(query);
     let prefix = query.len() - shown.len();
     let caret = caret.saturating_sub(prefix).min(shown.len());
     let start = input_start(
@@ -707,9 +714,6 @@ fn draw_input(cv: &mut Canvas, font: &Font, v: &View) {
         (query.trim_start(), "Search themes...")
     } else if let Some(query) = v.query.strip_prefix(';') {
         (query.trim_start(), "Search clipboard...")
-    } else if v.query.starts_with(crate::items::CONFIRM_TRASH) {
-        // the confirm view carries the path in the query; keep the box empty
-        (&v.query[v.query.len()..], "")
     } else {
         (v.query, "Search anything...")
     };
@@ -731,15 +735,7 @@ fn draw_input(cv: &mut Canvas, font: &Font, v: &View) {
         if lo < hi {
             let left = Canvas::text_width(font, fs, &query[start..lo]);
             let width = Canvas::text_width(font, fs, &query[lo..hi]);
-            cv.rrect(
-                x + left,
-                y,
-                width,
-                fs * 1.15,
-                0.0,
-                v.theme.accent,
-                0.3 * v.theme.accent_alpha,
-            );
+            cv.rrect(x + left, y, width, fs * 1.15, 0.0, INPUT_SELECTION, 1.0);
         }
     }
     if query.is_empty() {
@@ -772,7 +768,10 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
     let (w, h) = (v.w as f32 * s, v.h as f32 * s);
     let wr = th.window_border_radius * s;
     cv.rrect(0.0, 0.0, w, h, wr, th.bg, th.bg_alpha);
-    cv.rrect_outline(0.0, 0.0, w, h, wr, 1.0 * s, th.border, th.border_alpha);
+    // zlaunch's daemon forces theme.window_border transparent (daemon theme.rs),
+    // so the window outline is invisible; th.border keeps the TOML value for the
+    // theme-picker preview swatch.
+    cv.rrect_outline(0.0, 0.0, w, h, wr, 1.0 * s, th.border, 0.0);
     draw_input(cv, font, v);
     cv.rrect(0.0, (HEAD - 1.0) * s, w, s, 0.0, SEPARATOR, SEPARATOR_ALPHA);
     if v.query.starts_with(':') {
@@ -801,13 +800,16 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
         return;
     }
     let title_px = 14.0 * s;
+    // Clip rows at the viewport bottom so a partial row is cut mid-row,
+    // like zlaunch's overflow-hidden vlist.
+    cv.set_clip_y(((HEAD + LIST_PAD + v.vp) * s) as i32);
     for sl in slots(v.items, v.top, v.vp) {
         let y = (HEAD + LIST_PAD + sl.y) * s;
         let Some(i) = sl.item else {
-            // section header: 8px above, 4px below, 16px in
+            // section header: EXTRA_BOLD in zlaunch; 8px above, 4px below, 16px in
             text_lh(
                 cv,
-                font,
+                v.bold_font.unwrap_or(font),
                 12.0 * s,
                 16.0 * s,
                 y + 8.0 * s,
@@ -838,27 +840,6 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
                 bg,
                 bg_alpha,
             );
-        }
-        if it.tag == "Output" {
-            let mut x = 16.0 * s;
-            let right = w - 16.0 * s;
-            for (text, color) in crate::scripts::ansi_spans(&it.title, th.text) {
-                let width = cv.text(
-                    font,
-                    title_px,
-                    x,
-                    y + (ROW - 16.0) / 2.0 * s,
-                    &text,
-                    color,
-                    th.text_alpha,
-                    (right - x).max(0.0),
-                );
-                x += width;
-                if x >= right {
-                    break;
-                }
-            }
-            continue;
         }
         let (ix, iy) = (16.0 * s, y + (ROW - ICON) / 2.0 * s);
         let icon_name = it.icon.as_deref();
@@ -896,7 +877,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
         }
         // trailing action hint, shown on the selected row only
         let mut right = w - 24.0 * s;
-        if selected && !matches!(it.action, Action::Nothing) {
+        if selected {
             let label = action_label(&it.action);
             let kw = enter_key(cv, s, right, y + ROW / 2.0 * s, th);
             let lw = Canvas::text_width(font, 12.0 * s, label);
@@ -956,6 +937,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
             );
         }
     }
+    cv.clear_clip();
     // scroll hint
     let vp = v.vp * s;
     let max = max_top(v.items, v.vp);
@@ -981,14 +963,6 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn confirm_trash_query_is_not_shown_or_clearable() {
-        let q = crate::items::confirm_trash_query("/tmp/a b");
-        assert!(!clear_button_at(640, &q, 640.0 - 28.0, HEAD as f64 / 2.0));
-        let Some(font) = test_font() else { return };
-        assert_eq!(input_at(&font, &q, q.len(), 640, 300.0), q.len());
-    }
-
     use super::*;
     use crate::config::Rgba;
     fn app(name: &str) -> Item {
@@ -1028,8 +1002,8 @@ mod tests {
     fn drawn(font: &Font, items: &[Item], sel: usize, th: Theme) -> Canvas {
         let mut icons = Cache::new("", "");
         icons.ensure_input(1);
-        let vp = viewport(items, 8);
-        let h = panel_height(items, 8);
+        let vp = LIST_VP;
+        let h = PANEL_HEIGHT;
         let mut cv = Canvas::new(640, h);
         draw(
             &mut cv,
@@ -1047,6 +1021,7 @@ mod tests {
                 scale: 1,
                 font_size: 15.0,
                 icons: &icons,
+                bold_font: None,
                 back: false,
                 show_scrollbar: true,
             },
@@ -1104,8 +1079,8 @@ mod tests {
         // empty query: placeholder in #737373, no clear button
         let mut icons = Cache::new("", "");
         icons.ensure_input(1);
-        let vp = viewport(&items, 8);
-        let h = panel_height(&items, 8);
+        let vp = LIST_VP;
+        let h = PANEL_HEIGHT;
         let mut cv = Canvas::new(640, h);
         draw(
             &mut cv,
@@ -1125,6 +1100,7 @@ mod tests {
                 scale: 1,
                 font_size: 15.0,
                 icons: &icons,
+                bold_font: None,
             },
         );
         assert!(
@@ -1133,6 +1109,38 @@ mod tests {
         );
         assert_eq!(lit(&cv, 600, 616, 20, 37), 0, "no clear button");
         assert!(lit(&cv, 22, 38, 20, 37) > 5, "magnifier still drawn");
+
+        // selection: gpui Default Dark selection.background, constant #1d4ed8
+        let mut icons = Cache::new("", "");
+        icons.ensure_input(1);
+        let vp = LIST_VP;
+        let h = PANEL_HEIGHT;
+        let mut cv = Canvas::new(640, h);
+        draw(
+            &mut cv,
+            &font,
+            &View {
+                query: "a",
+                input: Some((1, Some(0), true)),
+                items: &items,
+                sel: 0,
+                top: 0,
+                vp,
+                theme: Theme::default(),
+                w: 640,
+                h,
+                scale: 1,
+                font_size: 15.0,
+                back: false,
+                show_scrollbar: false,
+                icons: &icons,
+                bold_font: None,
+            },
+        );
+        assert!(
+            has_solid(&cv, 50, 62, 20, 40, [216, 78, 29, 255]),
+            "selection"
+        );
     }
 
     #[test]
@@ -1145,8 +1153,8 @@ mod tests {
         let cv = drawn(&font, &items, 0, Theme::default());
         // panel: gray 15 at 0.7 alpha over a transparent buffer
         assert_eq!(px(&cv, 500, 30), [10, 10, 10, 178]);
-        // window border: white at 0.094 over the panel
-        assert_eq!(px(&cv, 0, 110), [33, 33, 33, 185]);
+        // window border: daemon forces window_border transparent, only panel shows
+        assert_eq!(px(&cv, 0, 110), [10, 10, 10, 178]);
         // selected row: white at 0.07 over the panel, not solid white
         assert_eq!(px(&cv, 480, 90), [27, 27, 27, 183]);
         // unselected row: item_background is transparent, the panel shows through
@@ -1330,10 +1338,9 @@ mod tests {
     fn emoji_grid_geometry_and_hit_testing() {
         assert_eq!(emoji_columns(640), 8);
         assert_eq!(emoji_columns(320), 4);
-        assert_eq!(emoji_rows(0, 640, 8), 1);
-        assert_eq!(emoji_rows(9, 640, 8), 2);
-        assert_eq!(emoji_rows(1000, 640, 8), 8);
-        assert_eq!(emoji_panel_height(2), (HEAD + 16.0 + 128.0) as u32);
+        assert_eq!(emoji_rows(0, 640), 1);
+        assert_eq!(emoji_rows(9, 640), 2);
+        assert_eq!(emoji_rows(1000, 640), EMOJI_ROWS);
         let left = (640.0 - (8.0 * 66.0 - 2.0)) / 2.0;
         let y = HEAD + EMOJI_PAD;
         assert_eq!(emoji_hit(640, 2, 0, 9, left + 1.0, y + 1.0), Some(0));
@@ -1410,6 +1417,15 @@ mod tests {
     fn clear_button_uses_logical_coordinates_and_needs_a_query() {
         assert!(clear_button_at(640, "zed", 608.0, HEAD as f64 / 2.0));
         assert!(!clear_button_at(640, "", 608.0, HEAD as f64 / 2.0));
+        for marker in [":", ";", "#"] {
+            assert!(!clear_button_at(640, marker, 608.0, HEAD as f64 / 2.0));
+            assert!(clear_button_at(
+                640,
+                &format!("{marker}x"),
+                608.0,
+                HEAD as f64 / 2.0
+            ));
+        }
         assert!(!clear_button_at(640, "zed", 595.0, HEAD as f64 / 2.0));
         assert!(!clear_button_at(640, "zed", 620.0, HEAD as f64 / 2.0));
         assert!(!clear_button_at(640, "zed", 608.0, HEAD as f64));
@@ -1425,21 +1441,18 @@ mod tests {
             (57.0, 50.0, 28.0, 24.0, 8.0)
         );
         assert_eq!((INPUT_X, INPUT_RIGHT), (49.7, 90.0));
-        assert_eq!(panel_height(&[], 6), 123);
-        let plain = vec![app("a"); 6];
-        assert_eq!(viewport(&plain, 6), 300.0);
-        assert_eq!(panel_height(&plain, 6), 373);
-        assert_eq!(viewport(&sectioned(6), 6), 356.0);
-        assert_eq!(panel_height(&sectioned(6), 6), 429);
+        // zlaunch's default launcher_size fixes every panel at 600x400.
+        assert_eq!(PANEL_HEIGHT, 400);
+        assert_eq!(LIST_VP, 327.0);
+        assert_eq!(EMOJI_ROWS, 5);
         for scale in 1..=4 {
             assert_eq!(icon_px(scale), 24 * scale);
         }
     }
     #[test]
-    fn list_hit_tests_exclude_headers_and_partial_rows() {
+    fn list_hit_tests_exclude_headers_and_clip_partial_rows() {
         let items = sectioned(3);
-        let vp = viewport(&items, 3);
-        assert_eq!(vp, 206.0);
+        let vp = 206.0; // two headers + three rows
         for (y, expected) in [
             (-1.0, None),
             (0.0, None),
@@ -1456,21 +1469,152 @@ mod tests {
         ] {
             assert_eq!(item_at(&items, 0, vp, y), expected, "y={y}");
         }
-        assert!(slots(&items, 0, HDR + ROW - 0.1).is_empty());
+        // A partially visible row is hit-tested by its visible region only.
+        let partial = slots(&items, 0, HDR + ROW - 0.1);
+        assert_eq!(partial.len(), 2);
+        assert_eq!(partial[0].header, "Best Match");
+        assert_eq!(partial[1].item, Some(0));
+        assert_eq!(partial[1].h, ROW - 0.1);
+        assert_eq!(
+            item_at(&items, 0, HDR + ROW - 0.1, HDR + ROW - 0.2),
+            Some(0)
+        );
+        assert_eq!(item_at(&items, 0, HDR + ROW - 0.1, HDR + ROW - 0.05), None);
         let one = slots(&items, 0, HDR + ROW);
         assert_eq!(one.len(), 2);
         assert_eq!(one[0].header, "Best Match");
         assert_eq!(one[1].item, Some(0));
+        assert_eq!(one[1].h, ROW);
         assert_eq!(item_at(&items, 0, HDR + ROW, HDR + ROW), None);
         assert!(slots(&[], 0, 200.0).is_empty());
         assert_eq!(item_at(&[], 0, 200.0, 1.0), None);
     }
     #[test]
-    fn height_follows_rows() {
-        let two: Vec<Item> = (0..2).map(|i| app(&format!("a{i}"))).collect();
-        let eight: Vec<Item> = (0..8).map(|i| app(&format!("a{i}"))).collect();
-        assert_eq!(panel_height(&[], 8), panel_height(&two[..1], 8));
-        assert!(panel_height(&eight, 8) > panel_height(&two, 8));
+    fn partial_row_is_clipped_at_the_viewport_bottom() {
+        // The fixed 327px viewport shows full rows plus a clipped last row.
+        let Some(font) = test_font() else { return };
+        let mut icons = Cache::new("", "");
+        icons.ensure_input(1);
+        let items = sectioned(30);
+        let sl = slots(&items, 0, LIST_VP);
+        let last = sl.last().unwrap();
+        assert_eq!(last.h, 21.0); // 327 - (2*28 + 5*50)
+                                  // The 7th row's box and text stop at the viewport bottom (392px).
+        let mut cv = Canvas::new(600, PANEL_HEIGHT);
+        draw(
+            &mut cv,
+            &font,
+            &View {
+                query: "a",
+                input: None,
+                items: &items,
+                sel: 5,
+                top: 0,
+                vp: LIST_VP,
+                theme: Theme::default(),
+                w: 600,
+                h: PANEL_HEIGHT,
+                scale: 1,
+                font_size: 14.0,
+                icons: &icons,
+                bold_font: None,
+                back: false,
+                show_scrollbar: false,
+            },
+        );
+        // Pixels below the viewport keep the panel background.
+        for y in 392..400 {
+            assert_eq!(px(&cv, 300, y), px(&cv, 300, 399), "y={y}");
+        }
+        assert_ne!(px(&cv, 300, 391), px(&cv, 300, 399));
+    }
+    #[test]
+    fn emoji_grid_clips_a_partial_row_at_the_viewport_bottom() {
+        // zlaunch's emoji picker is the same overflow-hidden vlist: with the
+        // fixed 400px panel a 7px sliver of the 6th emoji row is visible.
+        let Some(font) = test_font() else { return };
+        let items: Vec<Item> = (0..48).map(|i| app(&format!("a{i}"))).collect();
+        let mut icons = Cache::new("", "");
+        icons.ensure_input(1);
+        let mut cv = Canvas::new(640, PANEL_HEIGHT);
+        draw(
+            &mut cv,
+            &font,
+            &View {
+                query: ":smile",
+                input: None,
+                items: &items,
+                sel: 40, // row 5, column 0: the partially visible row
+                top: 0,
+                vp: LIST_VP,
+                theme: Theme::default(),
+                w: 640,
+                h: PANEL_HEIGHT,
+                scale: 1,
+                font_size: 14.0,
+                icons: &icons,
+                bold_font: None,
+                back: false,
+                show_scrollbar: false,
+            },
+        );
+        // Row 5's selection box starts at 385 and is cut at 392.
+        assert_ne!(px(&cv, 80, 391), px(&cv, 80, 395));
+        for y in 392..400 {
+            assert_eq!(px(&cv, 80, y), px(&cv, 80, 399), "y={y}");
+        }
+    }
+    #[test]
+    fn section_headers_use_the_bold_face_when_available() {
+        // zlaunch styles section headers EXTRA_BOLD.
+        let Some(font) = test_font() else { return };
+        let Some(bold) = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        ]
+        .iter()
+        .find_map(|p| std::fs::read(p).ok())
+        .and_then(Font::try_from_vec) else {
+            return;
+        };
+        assert!(
+            Canvas::text_width(&bold, 12.0, "Applications")
+                > Canvas::text_width(&font, 12.0, "Applications")
+        );
+        let items = sectioned(4);
+        let drawn_with = |bf: Option<&Font>| {
+            let mut icons = Cache::new("", "");
+            icons.ensure_input(1);
+            let mut cv = Canvas::new(640, PANEL_HEIGHT);
+            draw(
+                &mut cv,
+                &font,
+                &View {
+                    query: "a",
+                    input: None,
+                    items: &items,
+                    sel: 0,
+                    top: 0,
+                    vp: LIST_VP,
+                    theme: Theme::default(),
+                    w: 640,
+                    h: PANEL_HEIGHT,
+                    scale: 1,
+                    font_size: 14.0,
+                    icons: &icons,
+                    bold_font: bf,
+                    back: false,
+                    show_scrollbar: false,
+                },
+            );
+            cv
+        };
+        let plain = drawn_with(None);
+        let bolded = drawn_with(Some(&bold));
+        // The "Best Match" header band (HEAD + LIST_PAD .. +HDR) differs.
+        let band_differs =
+            (66..90).any(|y| (20..200).any(|x| px(&plain, x, y) != px(&bolded, x, y)));
+        assert!(band_differs);
     }
     #[test]
     fn headers_need_two_sections() {
@@ -1484,12 +1628,57 @@ mod tests {
         assert_eq!(sl.iter().filter(|s| s.item.is_some()).count(), 4);
     }
     #[test]
-    fn scrolling_keeps_selection_visible() {
+    fn scroll_limit_matches_linear_search_for_section_boundaries() {
+        for len in 0..65 {
+            for pattern in 0..4 {
+                let mut items: Vec<Item> = (0..len).map(|i| app(&format!("a{i}"))).collect();
+                for (i, item) in items.iter_mut().enumerate() {
+                    item.best = pattern == 1 && i == 0 || pattern == 3 && i % 3 == 0;
+                    if pattern >= 2 && i % 2 == 0 {
+                        item.tag = "Basic";
+                    }
+                }
+                for vp in [
+                    -1.0,
+                    0.0,
+                    49.98,
+                    49.99,
+                    50.0,
+                    50.01,
+                    77.98,
+                    78.0,
+                    100.0,
+                    178.0,
+                    300.0,
+                    456.0,
+                    5000.0,
+                    f32::INFINITY,
+                    f32::NAN,
+                ] {
+                    let last = items.len().saturating_sub(1);
+                    let expected = (0..items.len())
+                        .find(|&t| {
+                            slots(&items, t, vp)
+                                .last()
+                                .is_some_and(|s| s.item == Some(last))
+                        })
+                        .unwrap_or(0);
+                    assert_eq!(
+                        max_top(&items, vp),
+                        expected,
+                        "len={len}, pattern={pattern}, vp={vp}"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn selection_scrolls_to_the_top_clamped_to_a_full_page() {
+        // gpui's ScrollStrategy::Top: the selected row heads the viewport.
         let items = sectioned(30);
-        let vp = viewport(&items, 8);
-        let mut top = 0;
+        let vp = LIST_VP;
         for sel in 0..30 {
-            top = scroll_to(&items, sel, top, vp);
+            let top = sel.min(max_top(&items, vp));
             let sl = slots(&items, top, vp);
             assert!(
                 sl.iter().any(|s| s.item == Some(sel)),
@@ -1497,7 +1686,6 @@ mod tests {
             );
             assert!(sl.last().unwrap().y + sl.last().unwrap().h <= vp + 0.01);
         }
-        assert_eq!(top, max_top(&items, vp));
         assert_eq!(item_at(&items, 0, vp, 5.0), None);
         assert_eq!(item_at(&items, 0, vp, HDR + 5.0), Some(0));
     }

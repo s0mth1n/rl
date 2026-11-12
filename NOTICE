@@ -1,7 +1,8 @@
 Emoji grid geometry and styling, theme TOML files in assets/themes, default
 theme values, and the launcher layout metrics (panel size, corner radius,
 header, row, and icon measurements), clipboard split-pane layout, preview
-padding and relative timestamp labels are from zlaunch
+padding, relative timestamp labels, clipboard substring filtering and first-line
+preview behavior are from zlaunch
 (https://github.com/zortax/zlaunch), Copyright 2025 Leonard Seibold
 <git[at]zrtx.de>, MIT License. Permission notice below.
 

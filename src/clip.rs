@@ -130,12 +130,13 @@ pub fn timestamp(at: u64, now: u64) -> String {
 }
 
 pub fn preview(text: &str) -> String {
-    text.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(100)
-        .collect()
+    let line = text.trim_start().lines().next().unwrap_or("");
+    let short: String = line.chars().take(30).collect();
+    if short.len() < line.len() {
+        format!("{short}...")
+    } else {
+        short
+    }
 }
 
 pub struct Img {
@@ -423,13 +424,20 @@ mod tests {
             assert_eq!(timestamp(100000 - age, 100000), expected);
         }
         assert_eq!(timestamp(100001, 100000), "Earlier");
-        assert_eq!(
-            preview("  two\nlines\twith   space"),
-            "two lines with space"
-        );
-        assert_eq!(preview(&"é".repeat(101)), "é".repeat(100));
+        assert_eq!(preview("  two\nlines\twith   space"), "two");
+        assert_eq!(preview(&"é".repeat(101)), format!("{}...", "é".repeat(30)));
     }
 
+    #[test]
+    fn clipboard_preview_uses_the_first_line_and_thirty_unicode_characters() {
+        assert_eq!(preview(""), "");
+        assert_eq!(preview(" \t\n"), "");
+        assert_eq!(preview("\n  first\r\nsecond"), "first");
+        assert_eq!(preview("one  two\tthree\nsecond"), "one  two\tthree");
+        assert_eq!(preview(&"é".repeat(30)), "é".repeat(30));
+        assert_eq!(preview(&"é".repeat(31)), format!("{}...", "é".repeat(30)));
+        assert_eq!(preview(&"a".repeat(31)), format!("{}...", "a".repeat(30)));
+    }
     #[test]
     fn removing_one_copy_keeps_the_others() {
         let mut history = History::new(4);
@@ -722,9 +730,6 @@ mod tests {
         for action in [
             Action::App(0),
             Action::View(";".into()),
-            Action::Setting("theme".into()),
-            Action::Exclude("kept".into()),
-            Action::ClearClip,
             Action::ClipImg(u64::MAX),
             Action::Clip("missing".into()),
         ] {

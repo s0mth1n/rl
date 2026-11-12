@@ -50,9 +50,9 @@ shot repeated
 check_hidden repeated
 echo 'PASS repeated show/outside-click cleanup'
 "$Z" show
-printf 't settings\ns 0.2\n' | "$K"
-shot settings
+printf 't :\ns 0.2\n' | "$K"
+shot emoji-view
 printf 'm 10 10\ns 0.1\np\nr\ns 0.2\n' | "$P"
-shot settings-outside
-check_hidden settings-outside
+shot emoji-outside
+check_hidden emoji-outside
 echo 'PASS outside click dismisses subview after resizing'

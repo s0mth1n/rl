@@ -1,7 +1,9 @@
 //! Clipboard list and preview, using zlaunch's split-pane layout.
 use crate::clip::{History, Img};
 use crate::items::Action;
-use crate::ui::{Canvas, View, HEAD, LIST_PAD, ROW};
+use crate::ui::{
+    Canvas, View, HEAD, INPUT_DIM, INPUT_FG, LIST_PAD, ROW, SEPARATOR, SEPARATOR_ALPHA,
+};
 use rusttype::{Font, Scale};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -173,6 +175,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
         th.bg,
         th.bg_alpha,
     );
+    // Window outline: invisible, like the daemon's transparent window_border.
     cv.rrect_outline(
         0.0,
         0.0,
@@ -181,7 +184,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
         th.window_border_radius * s,
         s,
         th.border,
-        th.border_alpha,
+        0.0,
     );
     let query = v.query.strip_prefix(';').unwrap_or(v.query).trim_start();
     if v.back {
@@ -190,8 +193,8 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
                 (22.0 * s) as i32,
                 ((HEAD - 16.0) * 0.5 * s) as i32,
                 icon,
-                v.theme.dim,
-                v.theme.dim_alpha,
+                INPUT_DIM,
+                1.0,
             );
         }
     }
@@ -202,19 +205,20 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
         text_x * s,
         17.0 * s,
         if query.is_empty() {
-            "Search clipboard history..."
+            "Search clipboard..."
         } else {
             query
         },
-        if query.is_empty() { th.dim } else { th.text },
         if query.is_empty() {
-            th.dim_alpha
+            INPUT_DIM
         } else {
-            th.text_alpha
+            INPUT_FG
         },
+        1.0,
         w - 48.0 * s,
     );
-    cv.rrect(0.0, (HEAD - 1.0) * s, w, s, 0.0, th.border, th.border_alpha);
+    cv.rrect(0.0, (HEAD - 1.0) * s, w, s, 0.0, SEPARATOR, SEPARATOR_ALPHA);
+    // List/preview separator: theme.window_border, transparent under the daemon.
     cv.rrect(
         split,
         HEAD * s,
@@ -222,7 +226,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
         (h - HEAD * s - s).max(0.0),
         0.0,
         th.border,
-        th.border_alpha,
+        0.0,
     );
     for (row, item) in v.items.iter().skip(v.top).take(rows).enumerate() {
         let y = (HEAD + LIST_PAD + row as f32 * ROW) * s;
@@ -249,7 +253,6 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
         );
         let icon = match item.action {
             Action::ClipImg(_) => "▧",
-            Action::ClearClip => "×",
             _ => "≡",
         };
         cv.text(
@@ -370,7 +373,6 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
         IMAGE.with(|slot| *slot.borrow_mut() = None);
         let text = match action {
             Some(Action::Clip(text)) => text.as_str(),
-            Some(Action::ClearClip) => "Remove all saved text and images.",
             _ => "No selection",
         };
         let line_h = 20.0 * s;

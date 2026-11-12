@@ -1,22 +1,19 @@
 //! zl: a small Wayland launcher. One daemon, a unix socket, a layer-shell panel drawn on the CPU.
-mod actions_ui;
 mod clip;
 mod clipboard_ui;
 mod config;
 #[allow(dead_code)]
 mod dates;
-mod details;
 #[allow(dead_code)]
 mod hist;
 mod icons;
 mod input;
 mod items;
 mod keys;
-mod scripts;
-mod settings;
 #[cfg(test)]
 mod testutil;
 mod ui;
+mod windows;
 
 /// A keyboard Leave that is not followed by an Enter within this long hides the panel.
 const FOCUS_GRACE: Duration = Duration::from_millis(250);
@@ -92,21 +89,14 @@ struct Out {
     scale: u32,
 }
 
-struct ScriptForm {
-    script: scripts::Script,
-    value: String,
-    option: usize,
-}
-
 struct App {
     cfg: Config,
     theme: config::Theme,
     icons: icons::Cache,
     font: Font<'static>,
+    bold_font: Option<Font<'static>>,
     apps: Vec<DesktopApp>,
-    files: items::FileIndex,
-    scripts: Vec<scripts::Script>,
-    scripts_sig: u64,
+    windows: Vec<windows::Window>,
     items: Vec<Item>,
     query: String,
     edit: input::Edit,
@@ -138,13 +128,8 @@ struct App {
     input_click: Option<(Instant, u8, f64, f64)>,
     settings_error: Option<String>,
     hist: hist::Hist,
-    panel: Option<(String, Vec<Item>, usize)>,
-    panel_filter: String,
-    detail: bool,
     /// A picker selection is previewing a theme that is not saved yet.
     previewing: bool,
-    script_form: Option<ScriptForm>,
-    script_run: Option<scripts::Run>,
     compositor: Option<WlCompositor>,
     subcompositor: Option<WlSubcompositor>,
     viewporter: Option<WpViewporter>,
@@ -187,32 +172,20 @@ impl App {
     }
 
     fn emoji_rows(&self) -> usize {
-        ui::emoji_rows(self.items.len(), self.cfg.width, self.cfg.max_rows)
+        ui::emoji_rows(self.items.len(), self.cfg.width)
     }
 
     fn vp(&self) -> f32 {
-        let vp = if self.query.starts_with(':') {
-            self.emoji_rows() as f32 * ui::EMOJI_CELL
-        } else {
-            ui::viewport(&self.items, self.cfg.max_rows)
-        };
-        if self.panel.is_some() {
-            vp.max(actions_ui::MIN_VIEWPORT)
-        } else if self.detail {
-            vp.max(300.0)
-        } else {
-            vp
-        }
+        // The fixed panel gives every view the same viewport; the emoji grid
+        // clips a partial row at its bottom like zlaunch's vlist does.
+        ui::LIST_VP
     }
 
+    /// zlaunch fixes every panel at `launcher_size` (default 600x400), so the
+    /// panel height never follows the content (zlaunch render.rs applies the
+    /// configured size unconditionally).
     fn panel_height(&self) -> u32 {
-        if self.panel.is_some() || self.detail {
-            (ui::HEAD + self.vp() + 2.0 * ui::LIST_PAD) as u32
-        } else if self.query.starts_with(':') {
-            ui::emoji_panel_height(self.emoji_rows())
-        } else {
-            ui::panel_height(&self.items, self.cfg.max_rows)
-        }
+        ui::PANEL_HEIGHT
     }
 
     fn refresh(&mut self) {
@@ -220,39 +193,14 @@ impl App {
         if self.origin.is_some() && !self.query.starts_with([':', ';', '#']) {
             self.origin = None;
         }
-        if self.query.starts_with('/') {
-            self.files
-                .load(&self.cfg.file_roots, &self.cfg.file_excludes);
-        }
         self.edit.sync(&self.query);
-        if let Some(form) = &self.script_form {
-            self.items = vec![Item {
-                title: form.script.arg.clone(),
-                sub: if form.script.arg_secret {
-                    "Password input".into()
-                } else {
-                    form.value.clone()
-                },
-                tag: "Script",
-                icon: None,
-                action: Action::ScriptSubmit,
-                best: false,
-            }];
-            return;
-        }
-        if let Some(run) = &self.script_run {
-            self.items = scripts::output_items(run);
-            return;
-        }
         let s = Search {
             cfg: &self.cfg,
             apps: &self.apps,
-            files: self.files.files(),
-            scripts: &self.scripts,
+            windows: &self.windows,
             history: &self.clip,
         };
         self.items = s.run(&self.query);
-        items::rank_history(&mut self.items, &self.query, &self.cfg, &self.hist);
         self.sel = 0;
         self.top = 0;
         if let Some(message) = self.settings_error.take() {
@@ -286,7 +234,9 @@ impl App {
             self.top =
                 top_row.min(self.items.len().div_ceil(columns).saturating_sub(rows)) * columns;
         } else {
-            self.top = ui::scroll_to(&self.items, self.sel, self.top, self.vp());
+            // zlaunch scrolls the selected row to the top of the list
+            // (gpui ScrollStrategy::Top), clamped to the last full page.
+            self.top = self.sel.min(ui::max_top(&self.items, self.vp()));
         }
         if self.top != before {
             self.last_scroll = Some(Instant::now());
@@ -307,19 +257,7 @@ impl App {
             return;
         }
         self.apps = items::scan_apps(&self.cfg);
-        let sig = scripts::scripts_sig(&self.cfg);
-        if sig != self.scripts_sig {
-            self.scripts = scripts::scan_scripts(&self.cfg);
-            self.scripts_sig = sig;
-        }
-        for script in &mut self.scripts {
-            if script.mode == scripts::ScriptMode::Inline {
-                if let Some(line) = scripts::inline_cached(&script.exec) {
-                    script.comment = line;
-                }
-            }
-        }
-        scripts::refresh_inline(&self.scripts);
+        self.windows = windows::scan();
         self.last_click = None;
         self.pointer = None;
         self.query.clear();
@@ -345,7 +283,11 @@ impl App {
             .max(1);
         let s = c.create_surface(qh, ());
         self.cur_h = self.panel_height();
-        let root = if let Some(sub) = &self.subcompositor {
+        let root = if let Some(sub) = self
+            .subcompositor
+            .as_ref()
+            .filter(|_| self.cfg.enable_backdrop)
+        {
             let root = c.create_surface(qh, ());
             let panel = sub.get_subsurface(&s, &root, qh, ());
             panel.set_desync();
@@ -365,7 +307,11 @@ impl App {
         } else {
             s.clone()
         };
-        let l = sh.get_layer_surface(&root, out, Layer::Overlay, "zl".into(), qh, ());
+        let layer = match self.cfg.layer_shell_layer {
+            config::SurfaceLayer::Top => Layer::Top,
+            config::SurfaceLayer::Overlay => Layer::Overlay,
+        };
+        let l = sh.get_layer_surface(&root, out, layer, "zl".into(), qh, ());
         if self.backdrop.is_some() {
             l.set_size(0, 0);
             l.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
@@ -385,12 +331,9 @@ impl App {
     }
 
     fn hide(&mut self) {
-        self.files.clear();
-        self.script_form = None;
-        self.script_run = None;
         self.repeating = None;
         self.left_at = None;
-        self.close_panel();
+
         self.pointer_on_backdrop = false;
         self.pointer = None;
         if let Some(b) = self.backdrop.as_ref() {
@@ -471,41 +414,10 @@ impl App {
         }
         let Some(surf) = &self.surface else { return };
         let mut cv = ui::Canvas::new(self.cfg.width * s, h * s);
-        let display_query = if let Some(form) = &self.script_form {
-            format!(
-                "{}: {}",
-                form.script.name,
-                if form.script.arg_secret {
-                    "*".repeat(form.value.chars().count())
-                } else {
-                    form.value.clone()
-                }
-            )
-        } else if let Some(run) = &self.script_run {
-            format!(
-                "{}{}",
-                run.name,
-                if run.done {
-                    " - Ctrl+C copy, Ctrl+R run again"
-                } else {
-                    " - running"
-                }
-            )
-        } else if self.query.starts_with("confirm script-run ") {
-            "Run script?".into()
-        } else if self.query.starts_with("confirm script-del ") {
-            "Delete script?".into()
-        } else {
-            self.query.clone()
-        };
         let v = ui::View {
             icons: &self.icons,
-            query: &display_query,
-            input: (self.script_form.is_none() && self.script_run.is_none()).then_some((
-                self.edit.caret,
-                self.edit.anchor,
-                self.caret_visible,
-            )),
+            query: &self.query,
+            input: Some((self.edit.caret, self.edit.anchor, self.caret_visible)),
             items: &self.items,
             sel: self.sel,
             top: self.top,
@@ -515,6 +427,7 @@ impl App {
             h,
             scale: s,
             font_size: self.cfg.font_size,
+            bold_font: self.bold_font.as_ref(),
             back: self.origin.is_some(),
             show_scrollbar: self
                 .last_scroll
@@ -525,28 +438,7 @@ impl App {
         } else {
             ui::draw(&mut cv, &self.font, &v);
         }
-        if self.detail {
-            if let Some(text) = self
-                .items
-                .get(self.sel)
-                .and_then(|it| details::text(it, &self.cfg, &self.apps, &self.hist))
-            {
-                details::draw(&mut cv, &self.font, &v, &text);
-            }
-        }
-        if let Some((title, actions, sel)) = &self.panel {
-            actions_ui::draw(
-                &mut cv,
-                &self.font,
-                &v,
-                &actions_ui::PanelView {
-                    title,
-                    actions,
-                    sel: *sel,
-                    filter: &self.panel_filter,
-                },
-            );
-        }
+
         let size = cv.buf.len();
         let fd = unsafe { libc::memfd_create(c"zl".as_ptr(), 0) };
         if fd < 0 {
@@ -579,35 +471,6 @@ impl App {
         if let Some(o) = self.buffer.replace(buf) {
             o.destroy();
         }
-    }
-
-    fn change_setting(&mut self, key: &str, dir: i32, qh: &QueueHandle<App>) {
-        if !settings::step(&mut self.cfg, key, dir) {
-            self.settings_error = Some("Could not save settings".into());
-        }
-        if key == "clipboard_persist" && !self.cfg.clipboard_persist {
-            if let Err(error) = std::fs::remove_dir_all(clip::dir()) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    self.settings_error = Some("Could not remove saved clipboard".into());
-                }
-            }
-        }
-        if !self.cfg.clipboard_history {
-            self.reads.clear();
-        }
-        self.theme = self.cfg.theme();
-        self.clip.max = self.cfg.clipboard_max;
-        self.clip.trim();
-        if self.cfg.clipboard_persist {
-            self.clip.save();
-        }
-        let error = self.settings_error.take();
-        self.hide();
-        self.show(qh);
-        self.settings_error = error;
-        self.query = "settings".into();
-        self.refresh();
-        self.redraw(qh);
     }
 
     fn configure_backdrop(&mut self, width: u32, height: u32, qh: &QueueHandle<App>) -> bool {
@@ -677,15 +540,8 @@ impl App {
     }
 
     fn activate(&mut self, qh: &QueueHandle<App>) {
-        let picked = if self.panel.is_some() {
-            let vis = self.panel_vis();
-            self.panel
-                .as_ref()
-                .and_then(|p| vis.get(p.2).map(|&i| p.1[i].clone()))
-        } else {
-            self.items.get(self.sel).cloned()
-        };
-        let Some(mut it) = picked else {
+        let picked = self.items.get(self.sel).cloned();
+        let Some(it) = picked else {
             if items::theme_view(&self.query) {
                 self.query.clear();
                 self.refresh();
@@ -693,94 +549,22 @@ impl App {
             }
             return;
         };
-        if it.tag == "Action" && matches!(it.action, Action::Web(_)) {
-            if let Some(source) = self.items.get(self.sel) {
-                it.title = source.title.clone();
-                it.tag = source.tag;
-            }
-        }
-        let record_usage = it.tag != "Action"
-            || self
-                .items
-                .get(self.sel)
-                .is_some_and(|source| source.action == it.action);
-        self.close_panel();
-        if record_usage
-            && matches!(
-                it.action,
-                Action::App(_)
-                    | Action::Clip(_)
-                    | Action::ClipImg(_)
-                    | Action::Script(_)
-                    | Action::AppArg(..)
-                    | Action::AppForce(..)
-            )
-        {
-            let key = if it.tag == "Action" {
-                self.items
-                    .get(self.sel)
-                    .map(items::key_of)
-                    .unwrap_or_default()
-            } else {
-                items::key_of(&it)
-            };
+        if matches!(
+            it.action,
+            Action::App(_) | Action::Clip(_) | Action::ClipImg(_)
+        ) {
+            let key = items::key_of(&it);
             self.hist.record(&key);
         }
         match it.action {
-            Action::Script(i) | Action::AppArg(i, _) | Action::AppForce(i, _) => {
-                let arg = match &it.action {
-                    Action::AppArg(_, v) => Some(v.clone()),
-                    Action::AppForce(_, v) => v.clone(),
-                    _ => None,
-                };
-                self.run_script(i, arg, matches!(it.action, Action::AppForce(..)), qh);
-            }
-            Action::ScriptToggle(name) => {
-                if scripts::toggle(&name).is_err() {
-                    self.settings_error = Some("Could not save script settings".into());
+            Action::Window(id) => match windows::focus(id) {
+                Ok(()) => self.hide(),
+                Err(error) => {
+                    self.settings_error = Some(format!("Could not focus window: {error}"));
+                    self.refresh();
+                    self.redraw(qh);
                 }
-                self.scripts = scripts::scan_scripts(&self.cfg);
-                self.refresh();
-                self.redraw(qh);
-            }
-            Action::ScriptSamples => {
-                if scripts::samples(&self.cfg).is_err() {
-                    self.settings_error = Some("Could not write sample scripts".into());
-                }
-                self.scripts = scripts::scan_scripts(&self.cfg);
-                self.refresh();
-                self.redraw(qh);
-            }
-            Action::ScriptEdit(path) => {
-                let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-                let command = format!(
-                    "{} {editor} '{}'",
-                    self.cfg.terminal,
-                    path.replace('\'', "'\\''")
-                );
-                launch_application(&command);
-                self.hide();
-            }
-            Action::ScriptDelete(path) => {
-                if std::fs::remove_file(&path).is_err() {
-                    self.settings_error = Some("Could not delete script".into());
-                }
-                self.scripts = scripts::scan_scripts(&self.cfg);
-                self.query = "scripts".into();
-                self.refresh();
-                self.redraw(qh);
-            }
-            Action::ScriptSubmit => {
-                if let Some(form) = self.script_form.take() {
-                    self.start_script(form.script, Some(form.value), qh);
-                }
-            }
-            Action::ScriptOutput => {
-                if let Some(run) = &self.script_run {
-                    let text = scripts::strip_ansi(&run.text);
-                    self.set_clipboard(text.as_bytes(), false, qh);
-                }
-            }
+            },
             Action::App(i) => {
                 self.hide();
                 let a = &self.apps[i];
@@ -804,41 +588,6 @@ impl App {
                     self.set_clipboard(&png, true, qh);
                 }
             }
-            Action::Open(p) if it.tag == "File" && std::path::Path::new(&p).is_dir() => {
-                // Enter on a folder drills into it.
-                let home = std::env::var("HOME").unwrap_or_default();
-                let rel = p.strip_prefix(&format!("{home}/")).unwrap_or(&p);
-                self.query = format!("/{rel}/");
-                self.sel = 0;
-                self.top = 0;
-                self.refresh();
-                self.redraw(qh);
-            }
-            Action::Open(p) => {
-                self.hide();
-                let _ = std::process::Command::new("xdg-open")
-                    .arg(p)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
-            }
-            Action::Trash(p) => {
-                if items::trash(&p) {
-                    let dir = format!("{p}/");
-                    self.files.retain(|f| f != &p && !f.starts_with(&dir));
-                } else {
-                    self.settings_error = Some("Could not move to the trash".into());
-                }
-                let error = self.settings_error.take();
-                self.query = "/".into();
-                self.sel = 0;
-                self.top = 0;
-                self.refresh();
-                self.settings_error = error;
-                self.redraw(qh);
-            }
-            Action::Nothing => {}
             Action::View(view) => {
                 // Entered through the main list: remember the combined query
                 // so the back arrow returns to it, as zlaunch's sub-views do.
@@ -849,9 +598,8 @@ impl App {
                 self.refresh();
                 self.redraw(qh);
             }
-            Action::Setting(key) => self.change_setting(&key, 1, qh),
             Action::Theme(name) => {
-                if settings::set_theme(&mut self.cfg, &name) {
+                if config::set_theme(&mut self.cfg, &name) {
                     // The saved theme stays on; back to the root list, like zlaunch.
                     self.previewing = false;
                     self.theme = self.cfg.theme();
@@ -862,404 +610,16 @@ impl App {
                 self.refresh();
                 self.redraw(qh);
             }
-            Action::Exclude(name) => {
-                if !settings::exclude(&mut self.cfg, &name) {
-                    self.settings_error = Some("Could not save exclusions".into());
-                }
-                let sel = self.sel;
-                self.refresh();
-                self.sel = sel.min(self.items.len().saturating_sub(1));
-                self.redraw(qh);
-            }
-            Action::Details => {
-                self.detail = !self.detail;
-                self.redraw(qh);
-            }
-            Action::Web(url) => {
-                if items::link_fill(&url, "").is_some() {
-                    if let Some(link) = self
-                        .cfg
-                        .link
-                        .iter()
-                        .find(|l| l.name == it.title && l.url == url && !l.alias.is_empty())
-                    {
-                        self.query = format!("{} ", link.alias);
-                        self.refresh();
-                        self.redraw(qh);
-                    }
-                    return;
-                }
-                self.hist.record(&format!("Link:{}", it.title));
-                self.hide();
-                let opener = self
-                    .cfg
-                    .link
-                    .iter()
-                    .find(|l| l.name == it.title && !l.app.is_empty())
-                    .and_then(|l| self.apps.iter().find(|a| a.name == l.app));
-                if let Some(a) = opener {
-                    let mut cmd = items::exec_open(&a.exec, &url);
-                    if a.terminal {
-                        cmd = format!("{} {cmd}", self.cfg.terminal);
-                    }
-                    launch_application(&cmd);
-                } else {
-                    let _ = std::process::Command::new("xdg-open")
-                        .arg(&url)
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn();
-                }
-            }
-            Action::PinToggle(key) => {
-                self.hist.toggle_pin(&key);
-                self.refresh();
-                self.redraw(qh);
-            }
-            Action::SetToneFor(name, tone) => {
-                if !hist::emoji_tone_set(&name, tone) {
-                    self.settings_error = Some("Could not save emoji skin tone".into());
-                }
-                let sel = self.sel;
-                self.refresh();
-                self.sel = sel.min(self.items.len().saturating_sub(1));
-                self.redraw(qh);
-            }
-            Action::EmojiReset(sequence) => {
-                if let Some(e) = emojis::get(&sequence) {
-                    self.hist
-                        .reset(&format!("Emoji:{}", items::emoji_base(e).name()));
-                }
-                hist::emoji_reset(&sequence);
-                self.refresh();
-                self.redraw(qh);
-            }
-            Action::ResetRank(key) => {
-                self.hist.reset(&key);
-                self.refresh();
-                self.redraw(qh);
-            }
-            Action::ClearClip => {
-                self.clip.clear();
-                if self.cfg.clipboard_persist {
-                    self.clip.save();
-                }
-                self.refresh();
-                self.redraw(qh);
-            }
-        }
-    }
-
-    /// The action row (index into the filtered list) under the surface point, if the point is on one.
-    fn panel_row_at(&self, x: f64, y: f64) -> Option<usize> {
-        let (_, _, selected) = self.panel.as_ref()?;
-        let g = actions_ui::panel_layout(
-            self.cfg.width as f32,
-            self.vp(),
-            self.panel_vis().len(),
-            *selected,
-            1.0,
-        );
-        let ry = y as f32 - g.y - actions_ui::PANEL_HEAD;
-        let row = (ry / ui::ROW) as usize;
-        let inside = x as f32 >= g.x && (x as f32) < g.x + g.w && ry >= 0.0 && row < g.cap;
-        inside.then_some(g.off + row)
-    }
-
-    fn close_panel(&mut self) {
-        self.panel = None;
-        self.panel_filter.clear();
-    }
-
-    fn panel_vis(&self) -> Vec<usize> {
-        let Some((_, acts, _)) = &self.panel else {
-            return Vec::new();
-        };
-        acts.iter()
-            .enumerate()
-            .filter(|(_, a)| a.title.to_lowercase().contains(&self.panel_filter))
-            .map(|(i, _)| i)
-            .collect()
-    }
-
-    fn open_panel(&mut self) {
-        let Some(it) = self.items.get(self.sel) else {
-            return;
-        };
-        let mut acts = items::actions_for(it, self.hist.is_pinned(&items::key_of(it)), &self.cfg);
-        let script = match &it.action {
-            Action::Script(i) | Action::AppArg(i, _) => self.scripts.get(*i),
-            Action::ScriptToggle(name) => self.scripts.iter().find(|s| &s.name == name),
-            _ => None,
-        };
-        if let Some(script) = script {
-            let path = script.exec.trim_matches('\'').replace("'\\''", "'");
-            for (title, action) in [
-                ("Edit script", Action::ScriptEdit(path.clone())),
-                (
-                    "Delete script",
-                    Action::View(format!("confirm script-del {path}")),
-                ),
-            ] {
-                acts.push(Item {
-                    title: title.into(),
-                    sub: script.name.clone(),
-                    tag: "Action",
-                    icon: None,
-                    action,
-                    best: false,
-                });
-            }
-        }
-        self.panel = Some((it.title.clone(), acts, 0));
-        self.panel_filter.clear();
-    }
-
-    fn run_script(&mut self, i: usize, arg: Option<String>, force: bool, qh: &QueueHandle<App>) {
-        let Some(script) = self.scripts.get(i).cloned() else {
-            return;
-        };
-        if scripts::disabled().contains(&format!("cmd:{}", script.name)) {
-            return;
-        }
-        if script.confirm && !force {
-            self.query = format!(
-                "confirm script-run {i}\t{}\t{}",
-                script.name,
-                arg.unwrap_or_default()
-            );
-            self.refresh();
-            self.redraw(qh);
-            return;
-        }
-        if arg.is_none() && !script.arg.is_empty() {
-            self.script_form = Some(ScriptForm {
-                value: script.arg_opts.first().cloned().unwrap_or_default(),
-                option: 0,
-                script,
-            });
-            self.refresh();
-            self.redraw(qh);
-            return;
-        }
-        self.start_script(script, arg, qh);
-    }
-
-    fn start_script(
-        &mut self,
-        script: scripts::Script,
-        arg: Option<String>,
-        qh: &QueueHandle<App>,
-    ) {
-        self.close_panel();
-        let cmd = scripts::command(&script, arg.as_deref());
-        self.script_form = None;
-        if matches!(
-            script.mode,
-            scripts::ScriptMode::Terminal
-                | scripts::ScriptMode::Silent
-                | scripts::ScriptMode::Inline
-        ) {
-            let cmd = if script.terminal {
-                format!(
-                    "{} sh -c '{}'",
-                    term_prefix(&self.cfg.terminal, true),
-                    cmd.replace('\'', "'\\''")
-                )
-            } else {
-                cmd
-            };
-            if script.terminal && self.cfg.terminal.is_empty() {
-                self.settings_error =
-                    Some("Set terminal in config before running terminal scripts".into());
-                self.refresh();
-                self.redraw(qh);
-                return;
-            }
-            launch_application(&cmd);
-            scripts::script_ran(&script.name);
-            self.hide();
-            return;
-        }
-        match scripts::Run::start(script.name, cmd, script.mode == scripts::ScriptMode::Hud) {
-            Ok(run) => self.script_run = Some(run),
-            Err(error) => self.settings_error = Some(format!("Could not start script: {error}")),
-        }
-        self.sel = 0;
-        self.top = 0;
-        self.refresh();
-        self.redraw(qh);
-    }
-
-    fn pump_script(&mut self, qh: &QueueHandle<App>) {
-        let changed = self.script_run.as_mut().is_some_and(|run| run.pump());
-        if self.script_run.as_ref().is_some_and(|run| {
-            run.toast
-                && run
-                    .finished
-                    .is_some_and(|at| at.elapsed() > Duration::from_secs(3))
-        }) {
-            self.hide();
-            return;
-        }
-        if changed {
-            self.refresh();
-            self.redraw(qh);
-        }
-    }
-
-    fn mv(&mut self, d: isize) {
-        let n = self.items.len() as isize;
-        if n > 0 {
-            self.sel = (self.sel as isize + d).clamp(0, n - 1) as usize;
         }
     }
 
     fn key(&mut self, key: u32, qh: &QueueHandle<App>) -> bool {
         self.pause_caret();
-        use xkbcommon::xkb::keysyms as k;
         let Some(st) = &self.xkb else { return false };
         let code = xkb::Keycode::new(key + 8);
         let sym = st.key_get_one_sym(code).raw();
         let mut utf8 = st.key_get_utf8(code);
         let ctrl = st.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE);
-        if self.script_form.is_some() {
-            if sym == k::KEY_Escape {
-                self.script_form = None;
-                self.query.clear();
-                self.refresh();
-                self.redraw(qh);
-                return false;
-            }
-            if sym == k::KEY_Return || sym == k::KEY_KP_Enter {
-                let form = self.script_form.take().unwrap();
-                self.start_script(form.script, Some(form.value), qh);
-                return false;
-            }
-            let form = self.script_form.as_mut().unwrap();
-            if !form.script.arg_opts.is_empty() {
-                if matches!(sym, k::KEY_Down | k::KEY_Tab | k::KEY_Up) {
-                    let n = form.script.arg_opts.len();
-                    form.option = if sym == k::KEY_Up {
-                        (form.option + n - 1) % n
-                    } else {
-                        (form.option + 1) % n
-                    };
-                    form.value = form.script.arg_opts[form.option].clone();
-                }
-            } else if sym == k::KEY_BackSpace {
-                form.value.pop();
-            } else if ctrl && utf8 == "\u{15}" {
-                form.value.clear();
-            } else if !ctrl && !utf8.chars().any(|c| c.is_control()) {
-                form.value.push_str(&utf8);
-            }
-            self.refresh();
-            self.redraw(qh);
-            return true;
-        }
-        if self.script_run.is_some() {
-            if sym == k::KEY_Escape {
-                self.script_run = None;
-                self.query.clear();
-                self.refresh();
-                self.redraw(qh);
-                return false;
-            }
-            if ctrl && utf8 == "\u{3}" {
-                let text = scripts::strip_ansi(&self.script_run.as_ref().unwrap().text);
-                self.set_clipboard(text.as_bytes(), false, qh);
-                return false;
-            }
-            if ctrl && utf8 == "\u{12}" {
-                let run = self.script_run.take().unwrap();
-                let (name, cmd, toast) = (run.name.clone(), run.cmd.clone(), run.toast);
-                drop(run);
-                match scripts::Run::start(name, cmd, toast) {
-                    Ok(run) => self.script_run = Some(run),
-                    Err(e) => self.settings_error = Some(format!("Could not start script: {e}")),
-                };
-                self.refresh();
-                self.redraw(qh);
-                return false;
-            }
-            if matches!(
-                sym,
-                k::KEY_Down | k::KEY_Page_Down | k::KEY_Up | k::KEY_Page_Up
-            ) {
-                self.mv(if matches!(sym, k::KEY_Up | k::KEY_Page_Up) {
-                    -1
-                } else {
-                    1
-                });
-                self.redraw(qh);
-            }
-            return false;
-        }
-        if ctrl && matches!(utf8.as_str(), "\u{5}" | "\u{4}") && self.query.starts_with("scripts") {
-            if let Some(Action::ScriptToggle(name)) = self.items.get(self.sel).map(|i| &i.action) {
-                if let Some(script) = self.scripts.iter().find(|s| &s.name == name) {
-                    let path = script.exec.trim_matches('\'').replace("'\\''", "'");
-                    if utf8 == "\u{5}" {
-                        self.items[self.sel].action = Action::ScriptEdit(path);
-                        self.activate(qh);
-                    } else {
-                        self.query = format!("confirm script-del {path}");
-                        self.refresh();
-                        self.redraw(qh);
-                    }
-                }
-            }
-            return false;
-        }
-        let mut repeatable = true;
-        if self.panel.is_some() {
-            let n = self.panel_vis().len();
-            match sym {
-                k::KEY_Escape => self.close_panel(),
-                k::KEY_Return | k::KEY_KP_Enter => {
-                    self.activate(qh);
-                    return false;
-                }
-                k::KEY_Down | k::KEY_Tab => {
-                    if let Some(p) = &mut self.panel {
-                        p.2 = (p.2 + 1).min(n.saturating_sub(1));
-                    }
-                }
-                k::KEY_Up | k::KEY_ISO_Left_Tab => {
-                    if let Some(p) = &mut self.panel {
-                        p.2 = p.2.saturating_sub(1);
-                    }
-                }
-                k::KEY_BackSpace => {
-                    self.panel_filter.pop();
-                    if let Some(p) = &mut self.panel {
-                        p.2 = 0;
-                    }
-                }
-                _ if ctrl && sym == k::KEY_b => self.close_panel(),
-                _ if !ctrl && !utf8.is_empty() && !utf8.chars().any(char::is_control) => {
-                    self.panel_filter.push_str(&utf8.to_lowercase());
-                    if let Some(p) = &mut self.panel {
-                        p.2 = 0;
-                    }
-                }
-                _ => repeatable = false,
-            }
-            self.redraw(qh);
-            return repeatable;
-        }
-        if ctrl && sym == k::KEY_o {
-            self.detail = !self.detail;
-            self.redraw(qh);
-            return false;
-        }
-        if ctrl && sym == k::KEY_b {
-            self.open_panel();
-            self.redraw(qh);
-            return false;
-        }
         if let Some(compose) = self.compose.as_mut() {
             if ctrl || sym == xkb::keysyms::KEY_Escape {
                 compose.reset();
@@ -1281,18 +641,20 @@ impl App {
         }
         let (columns, grid) = (self.columns(), self.query.starts_with(':'));
         let selected = self.items.get(self.sel).map(|i| i.action.clone());
+        // Only zlaunch's own sub-views hide when entered directly; quicklinks
+        // keep returning to the list.
+        let direct_view = self.origin.is_none() && self.query.starts_with([':', ';', '#']);
         let effect = keys::handle(
             &mut keys::KeyState {
                 query: &mut self.query,
                 edit: &mut self.edit,
                 sel: &mut self.sel,
                 len: self.items.len(),
-                rows: self.cfg.max_rows,
                 columns,
                 grid,
                 pop_on_backspace: self.cfg.pop_on_backspace,
                 close_on_escape: self.cfg.escape_key_behavior == "close_window",
-                selected: selected.as_ref(),
+                direct_view,
             },
             &keys::KeyIn {
                 sym,
@@ -1331,18 +693,11 @@ impl App {
                     .output()
                 {
                     if out.status.success() {
-                        let text: String = String::from_utf8_lossy(&out.stdout)
-                            .chars()
-                            .map(|c| if c.is_control() { ' ' } else { c })
-                            .collect();
+                        let text: String = input::paste_text(&String::from_utf8_lossy(&out.stdout));
                         self.edit.replace(&mut self.query, &text);
                         self.refresh();
                     }
                 }
-            }
-            keys::Effect::Step(name, dir) => {
-                self.change_setting(&name, dir, qh);
-                return true;
             }
             keys::Effect::DeleteClip => {
                 let position = self.sel;
@@ -1364,9 +719,14 @@ impl App {
             return None;
         }
         if self.query.starts_with(':') {
+            // Clicks below the visible grid (the padding under the viewport)
+            // hit nothing; the partially visible row stays clickable.
+            if y as f32 > ui::HEAD + ui::LIST_PAD + ui::LIST_VP {
+                return None;
+            }
             return ui::emoji_hit(
                 self.cfg.width,
-                self.emoji_rows(),
+                (ui::LIST_VP / ui::EMOJI_CELL).ceil() as usize,
                 self.top,
                 self.items.len(),
                 x as f32,
@@ -1469,15 +829,6 @@ impl App {
                 i += 1;
             }
         }
-    }
-}
-
-fn term_prefix(term: &str, hold: bool) -> String {
-    let known = ["foot", "kitty", "alacritty"];
-    if hold && known.iter().any(|k| term.starts_with(k)) {
-        format!("{term} --hold")
-    } else {
-        term.to_string()
     }
 }
 
@@ -1874,14 +1225,7 @@ impl Dispatch<WlPointer, ()> for App {
                     .as_ref()
                     .filter(|s| **s == surface)
                     .map(|_| (surface_x, surface_y));
-                if a.pointer.is_some() && a.panel.is_some() {
-                    if let Some(row) = a.panel_row_at(surface_x, surface_y) {
-                        if let Some(p) = &mut a.panel {
-                            p.2 = row;
-                        }
-                        a.redraw(qh);
-                    }
-                }
+
                 if a.pointer.is_some() && a.input_drag {
                     let at = ui::input_at(&a.font, &a.query, a.edit.caret, a.cfg.width, surface_x);
                     a.edit.move_to(&a.query, at, true);
@@ -1894,14 +1238,7 @@ impl Dispatch<WlPointer, ()> for App {
                 ..
             } => {
                 a.pointer = (!a.pointer_on_backdrop).then_some((surface_x, surface_y));
-                if a.pointer.is_some() && a.panel.is_some() {
-                    if let Some(row) = a.panel_row_at(surface_x, surface_y) {
-                        if let Some(p) = &mut a.panel {
-                            p.2 = row;
-                        }
-                        a.redraw(qh);
-                    }
-                }
+
                 if a.pointer.is_some() && a.input_drag {
                     let at = ui::input_at(&a.font, &a.query, a.edit.caret, a.cfg.width, surface_x);
                     a.edit.move_to(&a.query, at, true);
@@ -1922,22 +1259,6 @@ impl Dispatch<WlPointer, ()> for App {
                     a.hide();
                     return;
                 }
-                if a.shown && a.panel.is_some() {
-                    // A click on an action runs it; a click anywhere else only closes the panel.
-                    match a.pointer.and_then(|(x, y)| a.panel_row_at(x, y)) {
-                        Some(row) => {
-                            if let Some(p) = &mut a.panel {
-                                p.2 = row;
-                            }
-                            a.activate(qh);
-                        }
-                        None => {
-                            a.close_panel();
-                            a.redraw(qh);
-                        }
-                    }
-                    return;
-                }
 
                 // The back arrow returns to the combined view, restoring the
                 // query that was there when the sub-view was entered.
@@ -1955,7 +1276,8 @@ impl Dispatch<WlPointer, ()> for App {
                     && a.pointer
                         .is_some_and(|(x, y)| ui::clear_button_at(a.cfg.width, &a.query, x, y))
                 {
-                    a.query.truncate(usize::from(items::theme_view(&a.query)));
+                    a.query
+                        .truncate(usize::from(a.query.starts_with([':', ';', '#'])));
                     a.last_click = None;
                     a.refresh();
                     a.redraw(qh);
@@ -2020,16 +1342,7 @@ impl Dispatch<WlPointer, ()> for App {
                 if a.pointer_on_backdrop {
                     return;
                 }
-                if a.panel.is_some() {
-                    let n = a.panel_vis().len();
-                    if let Some(p) = &mut a.panel {
-                        p.2 = (p.2 as isize + if value > 0.0 { 1 } else { -1 })
-                            .clamp(0, n.saturating_sub(1) as isize)
-                            as usize;
-                    }
-                    a.redraw(qh);
-                    return;
-                }
+
                 a.last_scroll = Some(Instant::now());
                 if a.query.starts_with(':') {
                     let columns = a.columns();
@@ -2123,6 +1436,34 @@ fn load_font(cfg: &Config) -> Font<'static> {
     std::process::exit(1);
 }
 
+/// Bold face for section headers (zlaunch styles them EXTRA_BOLD). Resolved
+/// from the configured font's `-Bold` sibling when `font` is set, otherwise
+/// from fontconfig's bold sans match. None when no bold face exists.
+fn load_bold_font(cfg: &Config) -> Option<Font<'static>> {
+    let mut paths: Vec<String> = Vec::new();
+    if !cfg.font.is_empty() {
+        let p = std::path::Path::new(&cfg.font);
+        if let (Some(stem), Some(ext)) = (p.file_stem(), p.extension()) {
+            let bold = p.with_file_name(format!(
+                "{}-Bold.{}",
+                stem.to_string_lossy(),
+                ext.to_string_lossy()
+            ));
+            paths.push(bold.to_string_lossy().into_owned());
+        }
+    }
+    if let Ok(o) = std::process::Command::new("fc-match")
+        .args(["-f", "%{file}", "sans:weight=bold"])
+        .output()
+    {
+        paths.push(String::from_utf8_lossy(&o.stdout).into_owned());
+    }
+    paths.push("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf".into());
+    paths
+        .iter()
+        .find_map(|p| std::fs::read(p).ok().and_then(Font::try_from_vec))
+}
+
 fn main() {
     if let Some(cmd) = std::env::args().nth(1) {
         match cmd.as_str() {
@@ -2163,10 +1504,9 @@ fn main() {
         theme: cfg.theme(),
         icons: icons::Cache::new(&cfg.icon_theme, &cfg.emoji_font),
         font: load_font(&cfg),
+        bold_font: load_bold_font(&cfg),
         apps: items::scan_apps(&cfg),
-        files: items::FileIndex::default(),
-        scripts: scripts::scan_scripts(&cfg),
-        scripts_sig: scripts::scripts_sig(&cfg),
+        windows: vec![],
         items: vec![],
         query: String::new(),
         edit: input::Edit::default(),
@@ -2192,12 +1532,7 @@ fn main() {
         input_click: None,
         settings_error: None,
         hist: hist::Hist::load(),
-        panel: None,
-        panel_filter: String::new(),
-        detail: false,
         previewing: false,
-        script_form: None,
-        script_run: None,
         cfg,
         compositor: None,
         subcompositor: None,
@@ -2270,9 +1605,6 @@ fn main() {
                 + 1;
             timeout = if timeout < 0 { wait } else { timeout.min(wait) };
         }
-        if app.script_run.is_some() {
-            timeout = if timeout < 0 { 50 } else { timeout.min(50) };
-        }
         if !app.reads.is_empty() {
             timeout = if timeout < 0 { 500 } else { timeout.min(500) };
         }
@@ -2289,7 +1621,6 @@ fn main() {
             app.caret_next = Instant::now() + Duration::from_millis(500);
             app.redraw(&qh);
         }
-        app.pump_script(&qh);
         if fds[0].revents & libc::POLLIN != 0 {
             let _ = guard.read();
         } else {
@@ -2388,7 +1719,9 @@ mod picker_tests {
             theme: cfg.theme(),
             icons: icons::Cache::new(&cfg.icon_theme, &cfg.emoji_font),
             font: load_font(&cfg),
+            bold_font: load_bold_font(&cfg),
             apps: items::scan_apps(&cfg),
+            windows: vec![],
             items: vec![],
             query: String::new(),
             edit: input::Edit::default(),
@@ -2415,14 +1748,6 @@ mod picker_tests {
             settings_error: None,
             previewing: false,
             hist: hist::Hist::default(),
-            panel: None,
-            panel_filter: String::new(),
-            detail: false,
-            scripts: vec![],
-            scripts_sig: 0,
-            script_form: None,
-            script_run: None,
-            files: items::FileIndex::default(),
             cfg,
             compositor: None,
             subcompositor: None,
@@ -2448,7 +1773,61 @@ mod picker_tests {
         }
     }
     #[test]
+    fn refresh_keeps_search_order_despite_saved_pins_and_usage() {
+        let _env = crate::testutil::ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("zl-rank-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("zl")).unwrap();
+        let previous = std::env::var_os("XDG_STATE_HOME");
+        std::env::set_var("XDG_STATE_HOME", &dir);
+        std::fs::write(dir.join("zl/history"), "100\t1\tApplication:Alphi\n").unwrap();
+        std::fs::write(dir.join("zl/pins"), "Application:Alphi\n").unwrap();
+        let mut a = app(Config::default());
+        a.hist = hist::Hist::load();
+        assert!(a.hist.is_pinned("Application:Alphi"));
+        assert_eq!(a.hist.stats("Application:Alphi"), Some((100, 1)));
+        a.apps = ["Alpha", "Alphi"]
+            .into_iter()
+            .map(|name| items::App {
+                name: name.into(),
+                exec: "true".into(),
+                comment: String::new(),
+                icon: String::new(),
+                terminal: false,
+            })
+            .collect();
+        for query in ["", "al"] {
+            let expected: Vec<_> = Search {
+                cfg: &a.cfg,
+                apps: &a.apps,
+                windows: &[],
+                history: &a.clip,
+            }
+            .run(query)
+            .into_iter()
+            .map(|row| (row.title, row.best))
+            .collect();
+            a.query = query.into();
+            a.refresh();
+            assert_eq!(
+                a.items
+                    .iter()
+                    .map(|row| (row.title.clone(), row.best))
+                    .collect::<Vec<_>>(),
+                expected,
+                "query {query:?}"
+            );
+        }
+        if let Some(previous) = previous {
+            std::env::set_var("XDG_STATE_HOME", previous);
+        } else {
+            std::env::remove_var("XDG_STATE_HOME");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn preview_never_changes_config_and_leaving_restores_it() {
+        let _env = crate::testutil::ENV_LOCK.lock().unwrap();
         let cfg = Config {
             theme: "nord".into(),
             ..Config::default()

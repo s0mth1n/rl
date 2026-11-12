@@ -1,5 +1,4 @@
 //! Keyboard rules for the launcher, kept free of Wayland so they can be tested with plain key symbols.
-use crate::items::Action;
 use xkbcommon::xkb::keysyms as k;
 
 pub struct KeyIn<'a> {
@@ -15,14 +14,15 @@ pub struct KeyState<'a> {
     pub edit: &'a mut crate::input::Edit,
     pub sel: &'a mut usize,
     pub len: usize,
-    pub rows: usize,
     /// Cells per row, 1 for a plain list.
     pub columns: usize,
     /// The emoji grid: Left and Right move one cell, Up and Down one row.
     pub grid: bool,
     pub pop_on_backspace: bool,
     pub close_on_escape: bool,
-    pub selected: Option<&'a Action>,
+    /// The view was entered directly, not from the combined list: GoBack and
+    /// Esc hide instead of returning to the list, as zlaunch's direct modes do.
+    pub direct_view: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -35,8 +35,6 @@ pub enum Effect {
     Moved,
     Activate,
     Hide,
-    /// Left or Right on a settings row: step it by `dir`.
-    Step(String, i32),
     /// Delete the highlighted clipboard entry.
     DeleteClip,
     Copy(String),
@@ -53,8 +51,7 @@ impl Effect {
 /// Where Backspace goes from a view with nothing typed in it, `None` when the query is not a bare view root.
 pub fn view_root_parent(q: &str) -> Option<&'static str> {
     match q.trim_end() {
-        ":" | ";" | "#" | "settings" | "quicklinks" => Some(""),
-        "settings apps" => Some("settings"),
+        ":" | ";" | "#" => Some(""),
         _ => None,
     }
 }
@@ -79,7 +76,7 @@ pub fn pop_word(s: &mut String) {
 }
 
 fn pop_input_word(query: &mut String) {
-    if let Some(filter) = query.strip_prefix('#') {
+    if let Some(filter) = query.strip_prefix([':', ';', '#']) {
         let mut filter = filter.to_string();
         pop_word(&mut filter);
         query.truncate(1);
@@ -91,7 +88,7 @@ fn pop_input_word(query: &mut String) {
 
 pub fn handle(st: &mut KeyState, key: &KeyIn) -> Effect {
     st.edit.sync(st.query);
-    if st.query.starts_with('#') {
+    if st.query.starts_with([':', ';', '#']) {
         st.edit.caret = st.edit.caret.max(1);
         st.edit.anchor = st.edit.anchor.map(|at| at.max(1));
     }
@@ -129,20 +126,19 @@ pub fn handle(st: &mut KeyState, key: &KeyIn) -> Effect {
             );
             Some(Effect::Moved)
         }
-        k::KEY_Left | k::KEY_Right if !matches!(st.selected, Some(Action::Setting(_))) => {
+        k::KEY_Left | k::KEY_Right => {
             st.edit
                 .step(st.query, key.sym == k::KEY_Right, key.ctrl, key.shift);
             Some(Effect::Moved)
         }
         k::KEY_BackSpace
-            if !st.query.starts_with("confirm trash ")
-                && !(key.shift && st.query.starts_with(';'))
+            if !(key.shift && st.query.starts_with(';'))
                 && (view_root_parent(st.query).is_none() || st.edit.range().is_some()) =>
         {
             st.edit.delete(st.query, false, key.ctrl);
             Some(Effect::Edited)
         }
-        k::KEY_Delete if !key.shift => {
+        k::KEY_Delete if !(key.shift && st.query.starts_with(';')) => {
             st.edit.delete(st.query, true, key.ctrl);
             Some(Effect::Edited)
         }
@@ -151,13 +147,6 @@ pub fn handle(st: &mut KeyState, key: &KeyIn) -> Effect {
     if let Some(effect) = editing {
         return effect;
     }
-    let last = st.len.saturating_sub(1);
-    let go = |sel: &mut usize, d: isize| {
-        if st.len > 0 {
-            *sel = (*sel as isize + d).clamp(0, last as isize) as usize;
-        }
-        Effect::Moved
-    };
     // One step that wraps round at the ends, like zlaunch's Up, Down and Tab.
     let wrap = |sel: &mut usize, d: isize| {
         if st.len > 0 {
@@ -167,15 +156,9 @@ pub fn handle(st: &mut KeyState, key: &KeyIn) -> Effect {
     };
     match key.sym {
         k::KEY_Escape => {
-            // A view (emoji, clipboard, settings) steps back to the main list; the main list hides at once.
-            if st.query.starts_with("confirm trash ") {
-                *st.query = "/".into();
-                return Effect::Edited;
-            }
-            let in_view = st.query.starts_with([':', ';', '#'])
-                || st.query.starts_with("settings")
-                || st.query.starts_with("quicklinks");
-            if in_view && !st.close_on_escape {
+            // A view (emoji, clipboard) steps back to the main list; the main list hides at once.
+            let in_view = st.query.starts_with([':', ';', '#']);
+            if in_view && !st.close_on_escape && !st.direct_view {
                 st.query.clear();
                 Effect::Edited
             } else {
@@ -190,11 +173,10 @@ pub fn handle(st: &mut KeyState, key: &KeyIn) -> Effect {
             if key.ctrl {
                 pop_input_word(st.query);
                 Effect::Edited
-            } else if st.query.starts_with("confirm trash ") {
-                *st.query = "/".into();
-                Effect::Edited
             } else if let Some(back) = view_root_parent(st.query) {
-                if st.pop_on_backspace {
+                if st.direct_view {
+                    Effect::Hide
+                } else if st.pop_on_backspace {
                     *st.query = back.into();
                     Effect::Edited
                 } else {
@@ -205,48 +187,15 @@ pub fn handle(st: &mut KeyState, key: &KeyIn) -> Effect {
                 Effect::Edited
             }
         }
-        k::KEY_comma if key.ctrl => {
-            *st.query = "settings".into();
-            Effect::Edited
-        }
         k::KEY_Down | k::KEY_Up if st.grid => {
             *st.sel =
                 crate::ui::emoji_vertical(*st.sel, st.len, st.columns, key.sym == k::KEY_Down);
             Effect::Moved
         }
-        k::KEY_Left | k::KEY_Right => match st.selected {
-            Some(Action::Setting(name)) => {
-                Effect::Step(name.clone(), if key.sym == k::KEY_Left { -1 } else { 1 })
-            }
-            _ => Effect::Ignore,
-        },
         k::KEY_Down | k::KEY_Tab => wrap(st.sel, 1),
         k::KEY_Up | k::KEY_ISO_Left_Tab => wrap(st.sel, -1),
-        k::KEY_Page_Down => go(st.sel, (st.rows * st.columns) as isize),
-        k::KEY_Page_Up => go(st.sel, -((st.rows * st.columns) as isize)),
-        k::KEY_Home => {
-            *st.sel = 0;
-            Effect::Moved
-        }
-        k::KEY_End => {
-            *st.sel = last;
-            Effect::Moved
-        }
-        _ if key.ctrl => match key.utf8 {
-            "\u{15}" => {
-                st.query.truncate(usize::from(st.query.starts_with('#')));
-                Effect::Edited
-            }
-            "\u{17}" => {
-                pop_input_word(st.query);
-                Effect::Edited
-            }
-            "\u{e}" | "\u{a}" => wrap(st.sel, 1),
-            "\u{10}" | "\u{b}" => wrap(st.sel, -1),
-            "\u{7}" => Effect::Hide,
-            "\u{18}" if st.query.starts_with(';') => Effect::DeleteClip,
-            _ => Effect::Ignore,
-        },
+        k::KEY_Page_Down | k::KEY_Page_Up => Effect::Ignore,
+        _ if key.ctrl => Effect::Ignore,
         _ => {
             if !key.utf8.is_empty() && !key.utf8.chars().any(|c| c.is_control()) {
                 st.edit.replace(st.query, key.utf8);
@@ -268,9 +217,9 @@ mod tests {
         len: usize,
         pop: bool,
         close: bool,
+        direct: bool,
         columns: usize,
         grid: bool,
-        selected: Option<Action>,
         shift: bool,
         edit: crate::input::Edit,
     }
@@ -282,9 +231,9 @@ mod tests {
                 len,
                 pop: true,
                 close: false,
+                direct: false,
                 columns: 1,
                 grid: false,
-                selected: None,
                 shift: false,
                 edit: crate::input::Edit::default(),
             }
@@ -295,12 +244,11 @@ mod tests {
                 edit: &mut self.edit,
                 sel: &mut self.sel,
                 len: self.len,
-                rows: 8,
                 columns: self.columns,
                 grid: self.grid,
                 pop_on_backspace: self.pop,
                 close_on_escape: self.close,
-                selected: self.selected.as_ref(),
+                direct_view: self.direct,
             };
             handle(
                 &mut st,
@@ -317,6 +265,33 @@ mod tests {
                 assert_eq!(self.press(c as u32, &c.to_string(), false), Effect::Edited);
             }
         }
+    }
+
+    #[test]
+    fn non_zlaunch_shortcuts_do_not_change_query_or_selection() {
+        let mut r = Rig::new("one two", 20);
+        r.sel = 7;
+        for (sym, utf8) in [
+            (k::KEY_u, "\u{15}"),
+            (k::KEY_w, "\u{17}"),
+            (k::KEY_n, "\u{e}"),
+            (k::KEY_p, "\u{10}"),
+            (k::KEY_g, "\u{7}"),
+            (k::KEY_comma, ","),
+        ] {
+            assert_eq!(r.press(sym, utf8, true), Effect::Ignore);
+            assert_eq!(r.query, "one two");
+            assert_eq!(r.sel, 7);
+        }
+        for sym in [k::KEY_Page_Up, k::KEY_Page_Down] {
+            assert_eq!(r.press(sym, "", false), Effect::Ignore);
+            assert_eq!(r.sel, 7);
+        }
+        assert_eq!(r.press(k::KEY_Left, "", false), Effect::Moved);
+        assert_eq!(r.edit.caret, 6);
+        assert_eq!(r.sel, 7);
+        r.press(k::KEY_BackSpace, "", true);
+        assert_eq!(r.query, "one o");
     }
 
     #[test]
@@ -360,31 +335,6 @@ mod tests {
         assert_eq!(r.query, "a");
     }
     #[test]
-    fn ctrl_backspace_and_ctrl_w_delete_a_word() {
-        let mut r = Rig::new("one two ", 1);
-        r.press(k::KEY_BackSpace, "", true);
-        assert_eq!(r.query, "one ");
-        r.press(k::KEY_w, "\u{17}", true);
-        assert_eq!(r.query, "");
-        let mut r = Rig::new("abc", 1);
-        r.press(k::KEY_u, "\u{15}", true);
-        assert_eq!(r.query, "");
-    }
-    #[test]
-    fn clearing_theme_filter_keeps_the_picker_mode() {
-        for (sym, utf8, ctrl) in [
-            (k::KEY_u, "\u{15}", true),
-            (k::KEY_w, "\u{17}", true),
-            (k::KEY_BackSpace, "", true),
-        ] {
-            let mut r = Rig::new("#nord", 1);
-            r.press(sym, utf8, ctrl);
-            assert_eq!(r.query, "#");
-            r.press(sym, utf8, ctrl);
-            assert_eq!(r.query, "#");
-        }
-    }
-    #[test]
     fn backspace_removes_a_whole_emoji() {
         let mut s = "a👍🏽".to_string();
         pop_cluster(&mut s);
@@ -398,33 +348,6 @@ mod tests {
         let mut s = String::new();
         pop_cluster(&mut s);
         assert_eq!(s, "");
-    }
-    #[test]
-    fn arrows_paging_and_home_end_clamp() {
-        let mut r = Rig::new("", 20);
-        r.press(k::KEY_Up, "", false);
-        assert_eq!(r.sel, 19);
-        r.press(k::KEY_Down, "", false);
-        assert_eq!(r.sel, 0);
-        r.press(k::KEY_ISO_Left_Tab, "", false);
-        assert_eq!(r.sel, 19);
-        r.press(k::KEY_Tab, "\t", false);
-        assert_eq!(r.sel, 0);
-        r.press(k::KEY_Page_Down, "", false);
-        assert_eq!(r.sel, 8);
-        r.press(k::KEY_End, "", false);
-        assert_eq!(r.sel, 8);
-        r.press(k::KEY_Page_Down, "", false);
-        assert_eq!(r.sel, 16);
-        r.press(k::KEY_Home, "", false);
-        assert_eq!(r.edit.caret, 0);
-        r.press(k::KEY_n, "\u{e}", true);
-        assert_eq!(r.sel, 17);
-        r.press(k::KEY_p, "\u{10}", true);
-        assert_eq!(r.sel, 16);
-        let mut empty = Rig::new("", 0);
-        assert_eq!(empty.press(k::KEY_End, "", false), Effect::Moved);
-        assert_eq!(empty.sel, 0);
     }
     #[test]
     fn escape_steps_out_of_a_view_and_hides_from_the_main_list() {
@@ -443,11 +366,6 @@ mod tests {
     }
     #[test]
     fn backspace_on_a_view_root_follows_the_setting() {
-        let mut r = Rig::new("settings apps ", 1);
-        assert_eq!(r.press(k::KEY_BackSpace, "", false), Effect::Edited);
-        assert_eq!(r.query, "settings");
-        r.press(k::KEY_BackSpace, "", false);
-        assert_eq!(r.query, "");
         let mut r = Rig::new(":", 1);
         r.pop = false;
         assert_eq!(r.press(k::KEY_BackSpace, "", false), Effect::Moved);
@@ -471,36 +389,24 @@ mod tests {
         r.press(k::KEY_ISO_Left_Tab, "", false);
         assert_eq!(r.sel, 0);
         r.press(k::KEY_Page_Down, "", false);
-        assert_eq!(r.sel, 64);
+        assert_eq!(r.sel, 0);
     }
     #[test]
-    fn escape_and_backspace_leave_the_trash_confirm_for_the_file_list() {
+    fn escape_and_backspace_hide_a_directly_entered_view() {
         for key in [k::KEY_Escape, k::KEY_BackSpace] {
-            let mut r = Rig::new("confirm trash \"/h/a\"", 2);
+            let mut r = Rig::new(":", 2);
+            r.direct = true;
+            assert_eq!(r.press(key, "", false), Effect::Hide);
+            assert_eq!(r.query, ":");
+        }
+        // Entered from the list: both keys return to the combined view.
+        for key in [k::KEY_Escape, k::KEY_BackSpace] {
+            let mut r = Rig::new(":", 2);
             assert_eq!(r.press(key, "", false), Effect::Edited);
-            assert_eq!(r.query, "/");
+            assert!(r.query.is_empty());
         }
     }
-    #[test]
-    fn ctrl_comma_opens_settings() {
-        let mut r = Rig::new("fire", 1);
-        assert_eq!(r.press(k::KEY_comma, ",", true), Effect::Edited);
-        assert_eq!(r.query, "settings");
-    }
-    #[test]
-    fn left_right_step_only_settings_rows() {
-        let mut r = Rig::new("settings", 2);
-        assert_eq!(r.press(k::KEY_Left, "", false), Effect::Moved);
-        r.selected = Some(Action::Setting("width".into()));
-        assert_eq!(
-            r.press(k::KEY_Left, "", false),
-            Effect::Step("width".into(), -1)
-        );
-        assert_eq!(
-            r.press(k::KEY_Right, "", false),
-            Effect::Step("width".into(), 1)
-        );
-    }
+
     #[test]
     fn delete_removes_clipboard_entries_only_in_history() {
         let mut r = Rig::new(";", 2);

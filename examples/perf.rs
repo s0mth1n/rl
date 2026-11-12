@@ -1,11 +1,7 @@
 #![allow(dead_code)]
-#[path = "../src/actions_ui.rs"]
-mod actions_ui;
 #[allow(dead_code)]
 #[path = "../src/dates.rs"]
 mod dates;
-#[path = "../src/details.rs"]
-mod details;
 #[allow(dead_code)]
 #[path = "../src/hist.rs"]
 mod hist;
@@ -20,15 +16,14 @@ mod icons;
 mod input;
 #[path = "../src/items.rs"]
 mod items;
-#[path = "../src/scripts.rs"]
-mod scripts;
-#[path = "../src/settings.rs"]
-mod settings;
 #[cfg(test)]
 #[path = "../src/testutil.rs"]
 mod testutil;
 #[path = "../src/ui.rs"]
 mod ui;
+#[path = "../src/windows.rs"]
+#[allow(dead_code)]
+mod windows;
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -90,8 +85,7 @@ fn main() {
     let search = items::Search {
         cfg: &cfg,
         apps: &apps,
-        files: &[],
-        scripts: &[],
+        windows: &[],
         history: &history,
     };
     let queries = [
@@ -110,21 +104,31 @@ fn main() {
         }
         report(&format!("search {query:?}"), samples);
     }
+    let all_rows = search.run("");
+    let viewport = ui::LIST_VP;
+    let mut samples = Vec::new();
+    for _ in 0..100 {
+        let t = Instant::now();
+        black_box(ui::max_top(black_box(&all_rows), black_box(viewport)));
+        samples.push(t.elapsed().as_secs_f64() * 1e6);
+    }
+    report("max_top_600_apps", samples);
     let rows = search.run("firefox");
-    let h = ui::panel_height(&rows, 8);
+    let h = ui::PANEL_HEIGHT;
     let view = ui::View {
         query: "firefox",
         input: None,
         items: &rows,
         sel: 0,
         top: 0,
-        vp: ui::viewport(&rows, 8),
+        vp: ui::LIST_VP,
         theme: cfg.theme(),
         w: 640,
         h,
         scale: 1,
         font_size: 15.0,
         icons: &cache,
+        bold_font: None,
         back: false,
         show_scrollbar: true,
     };

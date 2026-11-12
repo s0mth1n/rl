@@ -10,9 +10,10 @@ printf 'k compose\nk apostrophe\nt e\nk ctrl-a\nk ctrl-c\n' >&3
 sleep .8
 [ "$(timeout 2 wl-paste -n)" = 'é' ]
 echo 'PASS compose commit'
+sleep 1.1
 printf 't changed\nk ctrl-z\nk ctrl-a\nk ctrl-c\n' >&3
 sleep .8
-[ "$(timeout 2 wl-paste -n)" = 'change' ]
+[ "$(timeout 2 wl-paste -n)" = 'é' ]
 echo 'PASS undo'
 printf 'k ctrl-y\nk ctrl-a\nk ctrl-c\n' >&3
 sleep .5

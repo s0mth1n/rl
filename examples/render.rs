@@ -4,8 +4,6 @@
 //! backdrop, close to how it looks over a dark desktop. `--backdrop none`
 //! writes the raw transparent PNG and `--backdrop '#rrggbb'` picks the colour.
 #![allow(dead_code)]
-#[path = "../src/actions_ui.rs"]
-mod actions_ui;
 #[path = "../src/clip.rs"]
 mod clip;
 #[path = "../src/clipboard_ui.rs"]
@@ -15,8 +13,6 @@ mod config;
 #[allow(dead_code)]
 #[path = "../src/dates.rs"]
 mod dates;
-#[path = "../src/details.rs"]
-mod details;
 #[allow(dead_code)]
 #[path = "../src/hist.rs"]
 mod hist;
@@ -26,15 +22,14 @@ mod icons;
 mod input;
 #[path = "../src/items.rs"]
 mod items;
-#[path = "../src/scripts.rs"]
-mod scripts;
-#[path = "../src/settings.rs"]
-mod settings;
 #[cfg(test)]
 #[path = "../src/testutil.rs"]
 mod testutil;
 #[path = "../src/ui.rs"]
 mod ui;
+#[path = "../src/windows.rs"]
+#[allow(dead_code)]
+mod windows;
 
 use std::{error::Error, fs::File, io::BufWriter};
 
@@ -46,9 +41,12 @@ struct Options {
     scale: u32,
     selected: usize,
     top: usize,
-    actions: bool,
     backdrop: Option<config::Rgb>,
-    detail: bool,
+    back: bool,
+    scrollbar: bool,
+    caret: Option<usize>,
+    anchor: Option<usize>,
+    caret_visible: bool,
 }
 
 impl Options {
@@ -66,9 +64,12 @@ impl Options {
             scale: 1,
             selected: 0,
             top: 0,
-            actions: false,
             backdrop: Some([17, 17, 17]),
-            detail: false,
+            back: false,
+            scrollbar: false,
+            caret: None,
+            anchor: None,
+            caret_visible: true,
         };
         let mut args = args;
         while let Some(arg) = args.next() {
@@ -77,8 +78,6 @@ impl Options {
                 .ok_or_else(|| format!("missing value for {arg}"))?;
             match arg.as_str() {
                 "--output" => o.output = value,
-                "--actions" => o.actions = value.parse()?,
-                "--details" => o.detail = value.parse()?,
                 "--view" => o.view = value,
                 "--query" => o.query = value,
                 "--theme" => {
@@ -94,6 +93,11 @@ impl Options {
                 "--rows" => o.cfg.max_rows = value.parse()?,
                 "--selected" => o.selected = value.parse()?,
                 "--top" => o.top = value.parse()?,
+                "--back" => o.back = value.parse()?,
+                "--scrollbar" => o.scrollbar = value.parse()?,
+                "--caret" => o.caret = Some(value.parse()?),
+                "--anchor" => o.anchor = Some(value.parse()?),
+                "--caret-visible" => o.caret_visible = value.parse()?,
                 "--backdrop" => {
                     o.backdrop = if value == "none" {
                         None
@@ -112,21 +116,38 @@ impl Options {
         }
         o.query = match o.view.as_str() {
             "launcher" => o.query,
-            "quicklinks" => format!("quicklinks {}", o.query),
             "themes" => format!("#{}", o.query),
-            "scripts" => "scripts".into(),
-            "script-output" => "Script output - Ctrl+C copy, Ctrl+R run again".into(),
             "emoji" => format!(":{}", o.query),
             "clipboard" => format!(";{}", o.query),
-            "settings" if o.query.is_empty() => "settings".into(),
-            "settings-apps" => format!("settings apps {}", o.query),
-            _ => {
-                return Err(
-                    "view must be launcher, emoji, clipboard, settings or settings-apps".into(),
-                )
-            }
+            _ => return Err("view must be launcher, themes, emoji or clipboard".into()),
         };
+        o.input()?;
+        if o.back && !o.query.starts_with([':', ';', '#']) {
+            return Err("back requires an emoji, clipboard or theme sub-view".into());
+        }
         Ok(o)
+    }
+
+    fn input(&self) -> Result<(usize, Option<usize>, bool), Box<dyn Error>> {
+        let visible = self
+            .query
+            .strip_prefix([':', ';', '#'])
+            .map(str::trim_start)
+            .unwrap_or(&self.query);
+        let prefix = self.query.len() - visible.len();
+        let offset = |value: usize| -> Result<usize, Box<dyn Error>> {
+            if value > visible.len() || !visible.is_char_boundary(value) {
+                return Err(
+                    "caret and anchor must be UTF-8 byte boundaries in visible query".into(),
+                );
+            }
+            Ok(prefix + value)
+        };
+        Ok((
+            offset(self.caret.unwrap_or(visible.len()))?,
+            self.anchor.map(offset).transpose()?,
+            self.caret_visible,
+        ))
     }
 }
 
@@ -199,24 +220,22 @@ fn composite(canvas: &ui::Canvas, backdrop: config::Rgb) -> Vec<u8> {
         .collect()
 }
 
-fn run() -> Result<(), Box<dyn Error>> {
-    let mut o = Options::parse(std::env::args().skip(1))?;
+fn render(o: &Options) -> Result<(ui::Canvas, usize), Box<dyn Error>> {
     let font = rusttype::Font::try_from_vec(std::fs::read(&o.cfg.font)?)
         .ok_or("could not load font; use --font /path/to/font.ttf")?;
-    if o.view == "quicklinks" {
-        o.cfg.link.push(config::Link {
-            name: "Documentation".into(),
-            url: "https://example.invalid/docs".into(),
-            created: 1_700_000_000,
-            ..Default::default()
-        });
-        o.cfg.link.push(config::Link {
-            name: "Search documentation".into(),
-            url: "https://example.invalid/?q={query}".into(),
-            alias: "docs".into(),
-            ..Default::default()
-        });
-    }
+    // Section headers are EXTRA_BOLD in zlaunch: use the font's -Bold sibling.
+    let bold_font = std::path::Path::new(&o.cfg.font)
+        .file_stem()
+        .zip(std::path::Path::new(&o.cfg.font).extension())
+        .map(|(stem, ext)| {
+            std::path::Path::new(&o.cfg.font).with_file_name(format!(
+                "{}-Bold.{}",
+                stem.to_string_lossy(),
+                ext.to_string_lossy()
+            ))
+        })
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(rusttype::Font::try_from_vec);
     let apps = fixture();
     let mut history = clip::History::new(100);
     let now = clip::now();
@@ -246,117 +265,33 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     history.push_image(&image);
     history.images[0].at = now - 30;
-    let scripts: Vec<scripts::Script> = [
-        (
-            "Hello World",
-            "Full output with ANSI colors",
-            scripts::ScriptMode::Output,
-        ),
-        (
-            "Count To",
-            "Script, asks for: How far",
-            scripts::ScriptMode::Output,
-        ),
-        ("Current Time", "18:35:12", scripts::ScriptMode::Inline),
-    ]
-    .into_iter()
-    .map(|(name, comment, mode)| scripts::Script {
-        name: name.into(),
-        comment: comment.into(),
-        exec: format!("'/fixture/scripts/{}.sh'", name.replace(' ', "-")),
-        icon: String::new(),
-        keywords: String::new(),
-        terminal: false,
-        mode,
-        arg: if name == "Count To" {
-            "How far".into()
-        } else {
-            String::new()
-        },
-        arg_opts: vec![],
-        arg_secret: false,
-        refresh_secs: 30,
-        cwd: "/fixture/scripts".into(),
-        confirm: false,
-    })
-    .collect();
-    let items = if o.view == "script-output" {
-        [
-            "\x1b[32mHello from zl!\x1b[0m This is a fullOutput script.",
-            "line 1",
-            "line 2",
-            "line 3",
-        ]
-        .into_iter()
-        .map(|line| items::Item {
-            title: line.into(),
-            sub: String::new(),
-            tag: "Output",
-            icon: None,
-            action: items::Action::ScriptOutput,
-            best: false,
-        })
-        .collect()
-    } else if o.view == "scripts" {
-        scripts
-            .iter()
-            .enumerate()
-            .map(|(i, script)| items::Item {
-                title: script.name.clone(),
-                sub: script.comment.clone(),
-                tag: "Script",
-                icon: None,
-                action: items::Action::Script(i),
-                best: false,
-            })
-            .collect()
-    } else {
-        items::Search {
-            cfg: &o.cfg,
-            apps: &apps,
-            scripts: &[],
-            files: &[],
-            history: &history,
-        }
-        .run(&o.query)
-    };
+    let items = items::Search {
+        cfg: &o.cfg,
+        apps: &apps,
+        windows: &[],
+        history: &history,
+    }
+    .run(&o.query);
     let emoji = o.view == "emoji";
     let columns = if emoji {
         ui::emoji_columns(o.cfg.width)
     } else {
         1
     };
-    let rows = ui::emoji_rows(items.len(), o.cfg.width, o.cfg.max_rows);
-    let mut vp = if emoji {
+    let rows = ui::emoji_rows(items.len(), o.cfg.width);
+    let vp = if emoji {
         rows as f32 * ui::EMOJI_CELL
     } else {
-        let vp = ui::viewport(&items, o.cfg.max_rows);
-        if o.detail {
-            vp.max(300.0)
-        } else {
-            vp
-        }
+        ui::LIST_VP
     };
-    if o.actions {
-        vp = vp.max(actions_ui::MIN_VIEWPORT);
-    }
     let top = if emoji {
         (o.top / columns).min(items.len().div_ceil(columns).saturating_sub(rows)) * columns
     } else {
         o.top.min(ui::max_top(&items, vp))
     };
     let sel = o.selected.min(items.len().saturating_sub(1));
-    let h = if o.actions || o.detail {
-        (ui::HEAD + vp + 2.0 * ui::LIST_PAD) as u32
-    } else if emoji {
-        ui::emoji_panel_height(rows)
-    } else {
-        if o.detail {
-            (ui::HEAD + vp + 2.0 * ui::LIST_PAD) as u32
-        } else {
-            ui::panel_height(&items, o.cfg.max_rows)
-        }
-    };
+    // zlaunch fixes every panel at launcher_size (default 600x400).
+    let h = ui::PANEL_HEIGHT;
     let mut icons = icons::Cache::new("", &o.cfg.emoji_font);
     for item in items
         .iter()
@@ -387,7 +322,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
     let view = ui::View {
         query: &o.query,
-        input: None,
+        input: Some(o.input()?),
         items: &items,
         sel,
         top,
@@ -398,38 +333,22 @@ fn run() -> Result<(), Box<dyn Error>> {
         scale: o.scale,
         font_size: o.cfg.font_size,
         icons: &icons,
-        back: false,
-        show_scrollbar: true,
+        bold_font: bold_font.as_ref(),
+        back: o.back,
+        show_scrollbar: o.scrollbar,
     };
     if o.view == "clipboard" {
         clipboard_ui::draw(&mut canvas, &font, &view, &history);
     } else {
         ui::draw(&mut canvas, &font, &view);
     }
-    if o.detail {
-        if let Some(text) = items
-            .get(sel)
-            .and_then(|it| details::text(it, &o.cfg, &apps, &hist::Hist::default()))
-        {
-            details::draw(&mut canvas, &font, &view, &text);
-        }
-    }
-    if o.actions {
-        if let Some(it) = items.get(sel) {
-            let actions = items::actions_for(it, false, &o.cfg);
-            actions_ui::draw(
-                &mut canvas,
-                &font,
-                &view,
-                &actions_ui::PanelView {
-                    title: &it.title,
-                    actions: &actions,
-                    sel: 0,
-                    filter: "",
-                },
-            );
-        }
-    }
+
+    Ok((canvas, items.len()))
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
+    let o = Options::parse(std::env::args().skip(1))?;
+    let (canvas, result_count) = render(&o)?;
     let pixels = match o.backdrop {
         Some(bg) => composite(&canvas, bg),
         None => rgba(&canvas),
@@ -441,10 +360,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     encoder.write_header()?.write_image_data(&pixels)?;
     println!(
         "{}: {}x{}, 600 fixture apps, {} results, no compositor",
-        o.output,
-        canvas.w,
-        canvas.h,
-        items.len()
+        o.output, canvas.w, canvas.h, result_count
     );
     Ok(())
 }
@@ -459,6 +375,82 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_state_matches_visible_query_and_mode_origin() {
+        let parse = |args: &[&str]| Options::parse(args.iter().map(|arg| (*arg).into()));
+        let idle = parse(&[]).unwrap();
+        assert!(!idle.back && !idle.scrollbar);
+        assert_eq!(idle.input().unwrap(), (0, None, true));
+        let editing = parse(&[
+            "--view",
+            "themes",
+            "--query",
+            "éclair",
+            "--caret",
+            "2",
+            "--anchor",
+            "7",
+            "--back",
+            "true",
+            "--scrollbar",
+            "true",
+            "--caret-visible",
+            "false",
+        ])
+        .unwrap();
+        assert!(editing.back && editing.scrollbar);
+        assert_eq!(editing.input().unwrap(), (3, Some(8), false));
+        let emoji = parse(&["--view", "emoji", "--query", "  smile"]).unwrap();
+        assert_eq!(emoji.input().unwrap(), (8, None, true));
+        for args in [
+            vec!["--query", "é", "--caret", "1"],
+            vec!["--query", "x", "--anchor", "2"],
+            vec!["--back", "true"],
+            vec!["--scrollbar", "maybe"],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn state_options_reach_the_real_canvas() {
+        let parse = |args: &[&str]| Options::parse(args.iter().map(|arg| (*arg).into())).unwrap();
+        let render = |o: &Options| super::render(o).map(|(canvas, _)| canvas);
+        let changed = |a: &ui::Canvas, b: &ui::Canvas, region: (u32, u32, u32, u32)| {
+            assert_eq!((a.w, a.h), (b.w, b.h));
+            let mut count = 0;
+            for y in 0..a.h {
+                for x in 0..a.w {
+                    let p = ((y * a.w + x) * 4) as usize;
+                    if a.buf[p..p + 4] != b.buf[p..p + 4] {
+                        assert!(
+                            x >= region.0 && y >= region.1 && x < region.2 && y < region.3,
+                            "unexpected pixel change at {x},{y}"
+                        );
+                        count += 1;
+                    }
+                }
+            }
+            assert!(count > 0);
+        };
+        let direct = render(&parse(&["--view", "themes", "--query", "nord"])).unwrap();
+        let back = render(&parse(&[
+            "--view", "themes", "--query", "nord", "--back", "true",
+        ]))
+        .unwrap();
+        changed(&direct, &back, (22, 20, 39, 37));
+        let idle = render(&parse(&["--query", "fire"])).unwrap();
+        let scrolling = render(&parse(&["--query", "fire", "--scrollbar", "true"])).unwrap();
+        changed(&idle, &scrolling, (594, 57, 600, idle.h));
+        let hidden = render(&parse(&["--query", "fire", "--caret-visible", "false"])).unwrap();
+        changed(&idle, &hidden, (49, 20, 140, 40));
+        let selection = render(&parse(&[
+            "--query", "fire", "--caret", "1", "--anchor", "3",
+        ]))
+        .unwrap();
+        changed(&idle, &selection, (49, 20, 140, 40));
+    }
 
     #[test]
     fn fixture_is_six_hundred_unique_apps() {

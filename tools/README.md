@@ -14,11 +14,26 @@ cargo run --release --example render -- --output settings.png --view settings
 cargo run --release --example render -- --output exclusions.png --view settings-apps
 ```
 
-Options: `--view launcher|emoji|clipboard|settings|settings-apps|scripts|script-output`, `--query`,
+Options: `--view launcher|emoji|clipboard|settings|settings-apps`, `--query`,
 `--theme` (a name from `zl themes`), `--scale 1..4`, `--width 400..1200`,
 `--rows 1..20`, `--selected`, `--top`, `--font`, `--emoji-font`, `--output`.
 The default font is `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf`.
-Geometry defaults follow `Config::default()` and `ui::panel_height`.
+Geometry follows `Config::default()`; the panel is fixed at zlaunch's default
+`launcher_size` of 600x400 (`ui::PANEL_HEIGHT`).
+
+Render state: `--back true` shows the submenu back arrow (emoji, clipboard or
+themes only). `--scrollbar true` captures the transient scrolling state;
+the default is idle, with no scrollbar. `--caret` and `--anchor` are UTF-8
+byte offsets into the visible query, excluding a mode prefix and its leading
+spaces. Omit the anchor for no selection; the caret defaults to the end.
+Invalid byte boundaries are rejected. `--caret-visible false` captures the
+off phase of the caret blink. All boolean options require `true` or `false`.
+
+```sh
+cargo run --release --example render -- --output submenu.png --view themes --back true
+cargo run --release --example render -- --output selection.png --query Firefox --caret 1 --anchor 5
+cargo run --release --example render -- --output scrolling.png --query fire --top 10 --scrollbar true
+```
 
 # Pixel comparisons
 
@@ -49,11 +64,4 @@ that has different text and icons measures those differences too, not just
 layout. A low error is not proof of functional parity.
 
 `--actions true` renders the selected row's action panel. `--details true`
-renders its details. `--view quicklinks` supplies two local fixture links,
-including a fixed creation timestamp. The launcher's config supports `[[link]]`
-with `name`, `url`, optional `alias`, `icon`, `app`, and `created` (epoch seconds).
-Static links open through the configured app name or `xdg-open`. Keyword links
-support `{}`, `{query}`, and `{argument}` with URL-encoded input. Dynamic/named
-placeholders and create/edit forms are not restored by this foundation port.
-The scripts and script-output views are fixed synthetic fixtures. They neither
-scan nor run scripts from the host.
+renders its details.

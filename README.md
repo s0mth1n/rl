@@ -5,8 +5,6 @@ A small CPU-rendered Wayland launcher. This branch contains only:
 - Application search and launch from XDG desktop entries.
 - An emoji picker with name and shortcode search.
 - Text and PNG clipboard history.
-- Basic settings, including application exclusions.
-- Local script commands with arguments, confirmation and output.
 
 There are no quicklinks, notes, window controls, process browser,
 file search, calculator, currency conversion or other utility views.
@@ -29,23 +27,17 @@ The daemon stays alive while the panel is hidden.
 
 ## Controls
 
-Type to search applications. Select Emoji Picker, Clipboard History, Themes or
-Settings from the launcher, or type `:`, `;`, `#` or `settings` directly.
+Type to search applications. Select Emoji Picker, Clipboard History or Themes
+from the launcher, or type `:`, `;` or `#` directly.
 Use Up/Down or Tab/Shift-Tab to select and Enter to activate. Escape clears
-the current view, then closes the panel. Ctrl+U clears the query. Page Up,
-Page Down, Home and End move through results. By default a double click
-activates a row; single-click activation is a setting. In the emoji grid,
+the current view, then closes the panel. Ctrl+A selects the query; Backspace then clears it. Home and End move the
+text caret, and Shift extends the text selection. By default a double click
+activates a row; single-click activation is a config key. In the emoji grid,
 Left/Right moves one cell and Up/Down moves one grid row, wrapping in the
 same column. Search covers the full emoji list.
 
 In Themes, moving selection previews the palette. Enter saves it and returns
 to the launcher; Escape restores the saved palette. Theme names filter the list.
-
-In Settings, Theme opens the same picker. Enter cycles font size, visible rows, panel width,
-clipboard collection/persistence/limit and click behavior. Open Excluded
-applications and Enter on an application to hide or restore it. Excluded
-applications remain visible in that settings list. You can filter it by
-typing `settings apps <name>`. Exclusions use the desktop entry's name.
 
 ## Config and privacy
 
@@ -117,9 +109,7 @@ this development script, never in the launcher. `RL_HEADLESS_CACHE` overrides th
 tool cache location. This is a headless compositor check, not a physical display
 or GPU test.
 Emoji picks are remembered locally: the most recent copies appear first in the
-empty emoji grid. Ctrl+B on an emoji opens its actions. Skin tone choices apply
-only to that emoji, and Reset ranking clears its recent copies, usage counts and
-skin tone choice. Emoji that have no skin tone variants do not show tone actions.
+empty emoji grid.
 
 Clicking outside the panel closes it on the output where it is shown. The panel
 uses a fullscreen transparent input surface and a small panel subsurface. With
@@ -133,34 +123,15 @@ The outside-click compositor check is:
 ```sh
 OUT=/tmp/rl-outside tools/headless-sway.sh bash tests/headless.sh bash tests/outside-click.sh
 ```
-## Script commands
 
-Scripts are ported from zl `wip-script7` (c03753b). Put executable files in
-`~/.config/zl/scripts`, or add `script_dirs = ["~/my-scripts"]` to the config.
-One subfolder level is scanned; first directory wins for duplicate titles.
-Headers in the first 15 lines accept `@title`, `@description`, `@icon`,
-`@keywords`, `@packageName`, `@mode`, `@argument1`, `@needsConfirmation`,
-`@currentDirectoryPath` and `@refreshInterval`. The `@vicinae.` and
-`@raycast.` prefixes work too. A script's directory is its default working
-directory. These are local programs you choose to run, not sandboxed plugins.
+## Niri windows
 
-Modes: `fullOutput` streams output in the launcher; `compact`, `silent` and
-`noView` show output briefly; `inline` caches the first line as a subtitle;
-`terminal` uses the configured terminal. An absent mode runs without a view.
-Inline refresh runs on show when stale, with a 15-second timeout. Disabled,
-confirmation-required and argument-taking scripts are not auto-refreshed.
+On Niri, the launcher reads open windows from `NIRI_SOCKET` each time it opens.
+Window rows show the title and application/workspace, with a Switch action that
+focuses the selected window ID. Launcher windows are excluded. A missing socket
+leaves application search available; failed reads are logged. IPC reads have a
+250 ms deadline and a 1 MiB reply limit. Other compositor window backends are
+not implemented.
 
-Arguments support text, password and dropdown metadata. Enter on a script
-opens its argument form, Up/Down cycles dropdown values, and Escape cancels.
-A text argument can also follow the full script title in the root search.
-Password arguments are masked in the form; do not type secrets into search.
-`@needsConfirmation true` asks before the argument form or run.
-
-In output, Ctrl+C copies plain text, Ctrl+R runs again and Escape stops the
-run and closes the output. Each output stream is capped at 1 MiB in memory.
-Manage Scripts (`scripts`) lists paths and last-run status. Enter toggles,
-Ctrl+E edits with `$EDITOR` and the configured terminal, Ctrl+D asks before
-deleting. An empty list offers three sample scripts, without replacing files.
-Scripts are rescanned on show after files change. No network requests or
-telemetry are made by the launcher; scripts themselves can do what their code
-and your account allow.
+`tests/niri-windows.sh` runs the real launcher against a synthetic Niri socket
+under the headless compositor. It does not test a running Niri desktop.
