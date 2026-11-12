@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=zl
+Comment=Applications, emoji and clipboard history
+Exec=env @BINARY@ show
+Icon=zl
+Terminal=false
+Categories=Utility;
+Keywords=launcher;emoji;clipboard;
+StartupNotify=false

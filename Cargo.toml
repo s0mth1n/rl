@@ -1,0 +1,31 @@
+[package]
+name = "zl"
+version = "0.1.0"
+edition = "2021"
+description = "A basic Wayland app launcher, emoji picker and clipboard history"
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+xkbcommon = "0.8"
+memmap2 = "0.9"
+rusttype = "0.9"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+png = "0.17"
+emojis = "0.7"
+ttf-parser = { version = "0.25", default-features = false, features = ["std", "opentype-layout", "glyph-names"] }
+resvg = { version = "0.45", default-features = false }
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "abort"
+
+[dev-dependencies]
+tempfile = "3"
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
