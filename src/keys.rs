@@ -88,13 +88,37 @@ fn pop_input_word(query: &mut String) {
 
 pub fn handle(st: &mut KeyState, key: &KeyIn) -> Effect {
     st.edit.sync(st.query);
-    if st.query.starts_with([':', ';', '#']) {
+    if !st.edit.literal_prefix && st.query.starts_with([':', ';', '#']) {
         st.edit.caret = st.edit.caret.max(1);
         st.edit.anchor = st.edit.anchor.map(|at| at.max(1));
     }
+    if (key.ctrl && key.shift && !matches!(key.sym, k::KEY_Left | k::KEY_Right))
+        || (key.ctrl
+            && matches!(
+                key.sym,
+                k::KEY_Home
+                    | k::KEY_End
+                    | k::KEY_Up
+                    | k::KEY_Down
+                    | k::KEY_Tab
+                    | k::KEY_ISO_Left_Tab
+                    | k::KEY_Return
+                    | k::KEY_KP_Enter
+            ))
+        || (key.shift && matches!(key.sym, k::KEY_Up | k::KEY_Down))
+    {
+        return Effect::Ignore;
+    }
+    if !st.edit.literal_prefix
+        && key.sym == k::KEY_BackSpace
+        && matches!(st.query.as_str(), ":" | ";" | "#")
+        && !key.shift
+    {
+        return Effect::Moved;
+    }
     let editing = match key.sym {
         k::KEY_z | k::KEY_y if key.ctrl => {
-            st.edit.history(st.query, key.sym == k::KEY_y || key.shift);
+            st.edit.history(st.query, key.sym == k::KEY_y);
             Some(Effect::Edited)
         }
         k::KEY_a if key.ctrl => {
@@ -132,13 +156,14 @@ pub fn handle(st: &mut KeyState, key: &KeyIn) -> Effect {
             Some(Effect::Moved)
         }
         k::KEY_BackSpace
-            if !(key.shift && st.query.starts_with(';'))
-                && (view_root_parent(st.query).is_none() || st.edit.range().is_some()) =>
+            if !(key.shift && !st.edit.literal_prefix && st.query.starts_with(';'))
+                && ((st.edit.literal_prefix || view_root_parent(st.query).is_none())
+                    || st.edit.range().is_some()) =>
         {
             st.edit.delete(st.query, false, key.ctrl);
             Some(Effect::Edited)
         }
-        k::KEY_Delete if !(key.shift && st.query.starts_with(';')) => {
+        k::KEY_Delete if !(key.shift && !st.edit.literal_prefix && st.query.starts_with(';')) => {
             st.edit.delete(st.query, true, key.ctrl);
             Some(Effect::Edited)
         }
@@ -157,7 +182,7 @@ pub fn handle(st: &mut KeyState, key: &KeyIn) -> Effect {
     match key.sym {
         k::KEY_Escape => {
             // A view (emoji, clipboard) steps back to the main list; the main list hides at once.
-            let in_view = st.query.starts_with([':', ';', '#']);
+            let in_view = !st.edit.literal_prefix && st.query.starts_with([':', ';', '#']);
             if in_view && !st.close_on_escape && !st.direct_view {
                 st.query.clear();
                 Effect::Edited
@@ -166,14 +191,24 @@ pub fn handle(st: &mut KeyState, key: &KeyIn) -> Effect {
             }
         }
         k::KEY_Return | k::KEY_KP_Enter => Effect::Activate,
-        k::KEY_Delete | k::KEY_BackSpace if key.shift && st.query.starts_with(';') => {
+        // Shift+Delete comes from pinned zlaunch ee71f96 only; the 0.5.1 release
+        // has no clipboard delete binding.
+        k::KEY_Delete | k::KEY_BackSpace
+            if key.shift && !st.edit.literal_prefix && st.query.starts_with(';') =>
+        {
             Effect::DeleteClip
         }
         k::KEY_BackSpace => {
             if key.ctrl {
-                pop_input_word(st.query);
+                if st.edit.literal_prefix {
+                    pop_word(st.query);
+                } else {
+                    pop_input_word(st.query);
+                }
                 Effect::Edited
-            } else if let Some(back) = view_root_parent(st.query) {
+            } else if let Some(back) =
+                view_root_parent(st.query).filter(|_| !st.edit.literal_prefix)
+            {
                 if st.direct_view {
                     Effect::Hide
                 } else if st.pop_on_backspace {
@@ -268,6 +303,46 @@ mod tests {
     }
 
     #[test]
+    fn literal_prefix_is_selectable_and_backspace_never_routes_to_a_picker() {
+        for query in [":", ";", "#"] {
+            let mut r = Rig::new(query, 0);
+            r.edit.literal_prefix = true;
+            r.direct = true;
+            assert_eq!(r.press(k::KEY_BackSpace, "", false), Effect::Edited);
+            assert_eq!(r.query, "");
+            r.query = query.into();
+            r.press(k::KEY_a, "", true);
+            assert_eq!(r.edit.range(), Some(0..1));
+            assert_eq!(r.press(k::KEY_c, "", true), Effect::Copy(query.into()));
+        }
+    }
+
+    #[test]
+    fn empty_backspace_is_an_input_edit_even_in_direct_mode() {
+        let mut r = Rig::new("", 0);
+        r.direct = true;
+        assert_eq!(r.press(k::KEY_BackSpace, "", false), Effect::Edited);
+        assert_eq!(r.query, "");
+    }
+
+    #[test]
+    fn unmatched_modifiers_do_not_navigate_the_launcher() {
+        let mut r = Rig::new("hello", 4);
+        for sym in [k::KEY_Home, k::KEY_End, k::KEY_Up, k::KEY_Down, k::KEY_Tab] {
+            assert_eq!(r.press(sym, "", true), Effect::Ignore);
+            assert_eq!(r.sel, 0);
+            assert_eq!(r.edit.caret, 5);
+        }
+        r.shift = true;
+        for sym in [k::KEY_Up, k::KEY_Down] {
+            assert_eq!(r.press(sym, "", false), Effect::Ignore);
+            assert_eq!(r.sel, 0);
+        }
+        assert_eq!(r.press(k::KEY_z, "", true), Effect::Ignore);
+        assert_eq!(r.query, "hello");
+    }
+
+    #[test]
     fn non_zlaunch_shortcuts_do_not_change_query_or_selection() {
         let mut r = Rig::new("one two", 20);
         r.sel = 7;
@@ -302,6 +377,7 @@ mod tests {
         r.shift = true;
         r.press(k::KEY_Right, "", true);
         assert_eq!(&r.query[r.edit.range().unwrap()], "afé");
+        r.shift = false;
         assert_eq!(r.press(k::KEY_c, "\u{3}", true), Effect::Copy("afé".into()));
         assert_eq!(r.press(k::KEY_x, "\u{18}", true), Effect::Cut("afé".into()));
         assert_eq!(r.query, "café test");
@@ -392,17 +468,24 @@ mod tests {
         assert_eq!(r.sel, 0);
     }
     #[test]
-    fn escape_and_backspace_hide_a_directly_entered_view() {
-        for key in [k::KEY_Escape, k::KEY_BackSpace] {
-            let mut r = Rig::new(":", 2);
-            r.direct = true;
-            assert_eq!(r.press(key, "", false), Effect::Hide);
-            assert_eq!(r.query, ":");
-        }
-        // Entered from the list: both keys return to the combined view.
-        for key in [k::KEY_Escape, k::KEY_BackSpace] {
-            let mut r = Rig::new(":", 2);
-            assert_eq!(r.press(key, "", false), Effect::Edited);
+    fn empty_subview_backspace_stays_and_escape_clears_combined_search() {
+        for root in [":", ";", "#"] {
+            for direct in [false, true] {
+                let mut r = Rig::new(root, 2);
+                r.direct = direct;
+                assert_eq!(r.press(k::KEY_BackSpace, "", false), Effect::Moved);
+                assert_eq!(r.query, root);
+                assert_eq!(r.press(k::KEY_BackSpace, "", true), Effect::Moved);
+                assert_eq!(r.query, root);
+                if direct {
+                    assert_eq!(r.press(k::KEY_Escape, "", false), Effect::Hide);
+                } else {
+                    assert_eq!(r.press(k::KEY_Escape, "", false), Effect::Edited);
+                    assert!(r.query.is_empty());
+                }
+            }
+            let mut r = Rig::new(&format!("{root}sample"), 2);
+            assert_eq!(r.press(k::KEY_Escape, "", false), Effect::Edited);
             assert!(r.query.is_empty());
         }
     }
@@ -412,6 +495,7 @@ mod tests {
         let mut r = Rig::new(";", 2);
         r.shift = true;
         assert_eq!(r.press(k::KEY_Delete, "", false), Effect::DeleteClip);
+        r.shift = false;
         assert_eq!(
             r.press(k::KEY_x, "\u{18}", true),
             Effect::Cut(String::new())

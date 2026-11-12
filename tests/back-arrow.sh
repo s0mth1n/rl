@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Mode origin: entering a sub-view from the main list shows a back arrow in the
-# input prefix; clicking it restores the combined query. A sub-view entered by
-# typing its prefix shows no arrow, and clicking the prefix zone does nothing.
+# input prefix; clicking it exits the sub-view and CLEARS the query, like
+# zlaunch's mode exit (reset_search). A sub-view entered by typing its prefix
+# shows no arrow, and clicking the prefix zone does nothing.
 P="$here/target/release/examples/vptr"
 set -euo pipefail
 source "$here/tests/session.bash"
@@ -41,8 +42,8 @@ PY
 printf 'm %s %s\np\nr\ns 0.4\n' "$BACK_X" "$(( CLIP_TOP + 28 ))" | "$P"
 shot backroot
 check_text backroot 'Clipboard History'   # back at the root view
-check_text backroot 'clip'            # the combined query was restored
-echo 'PASS back arrow restores the combined view'
+check_text backroot 'earch anything' # the query was cleared, not restored
+echo 'PASS back arrow exits the sub-view with a cleared query'
 
 # Direct prefix entry shows no arrow; clicking the prefix zone keeps the view.
 type_query ';'

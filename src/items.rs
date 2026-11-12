@@ -1,7 +1,7 @@
 //! Applications, emoji and clipboard rows for the basic launcher.
 use crate::{clip, config, config::Config};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct App {
     pub name: String,
     pub comment: String,
@@ -12,8 +12,12 @@ pub struct App {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     App(usize),
-    Window(u64),
+    WebSearch(String),
+    System(crate::system_actions::SystemAction),
+    Calculate(crate::calculator::CalculatorItem),
+    Window(String),
     Clip(String),
+    ClipFiles(String),
     ClipImg(u64),
     View(String),
     Theme(String),
@@ -29,7 +33,7 @@ pub struct Item {
     pub best: bool,
 }
 
-pub fn scan_apps(cfg: &Config) -> Vec<App> {
+pub fn scan_apps(_cfg: &Config) -> Vec<App> {
     let home = std::env::var("XDG_DATA_HOME")
         .unwrap_or_else(|_| format!("{}/.local/share", std::env::var("HOME").unwrap_or_default()));
     let mut bases = vec![home];
@@ -41,7 +45,6 @@ pub fn scan_apps(cfg: &Config) -> Vec<App> {
             .map(str::to_owned),
     );
     let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
     let mut desktop_ids = std::collections::HashSet::new();
     for base in bases {
         let root = std::path::Path::new(&base).join("applications");
@@ -65,20 +68,18 @@ pub fn scan_apps(cfg: &Config) -> Vec<App> {
         paths.sort();
         for path in paths {
             let id = path
-                .strip_prefix(&root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('/', "-");
-            if !desktop_ids.insert(id) {
+                .file_stem()
+                .map(|s| s.to_os_string())
+                .unwrap_or_default();
+            if desktop_ids.contains(&id) {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(path) else {
+            let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            if let Some(app) = parse_desktop(&text) {
-                if (!app.terminal || !cfg.terminal.is_empty()) && seen.insert(app.name.clone()) {
-                    out.push(app);
-                }
+            if let Some(app) = parse_desktop_path(&path, &text) {
+                desktop_ids.insert(id);
+                out.push(app);
             }
         }
     }
@@ -94,14 +95,18 @@ pub struct Search<'a> {
 }
 impl Search<'_> {
     pub fn run(&self, query: &str) -> Vec<Item> {
+        self.run_mode(query, true)
+    }
+
+    pub fn run_mode(&self, query: &str, route_prefixes: bool) -> Vec<Item> {
+        if let Some(filter) = query.strip_prefix('#').filter(|_| route_prefixes) {
+            return theme_items(self.cfg, filter);
+        }
         let q = query.trim();
-        if let Some(filter) = q.strip_prefix(':') {
+        if let Some(filter) = q.strip_prefix(':').filter(|_| route_prefixes) {
             return emoji_items(filter.trim());
         }
-        if let Some(filter) = q.strip_prefix('#') {
-            return theme_items(self.cfg, filter.trim());
-        }
-        if let Some(filter) = q.strip_prefix(';') {
+        if let Some(filter) = q.strip_prefix(';').filter(|_| route_prefixes) {
             let needle = filter.trim().to_lowercase();
             let now = clip::now();
             let mut dated: Vec<_> = self
@@ -114,14 +119,45 @@ impl Search<'_> {
                         || clip::preview(&c.text).to_lowercase().contains(&needle)
                 })
                 .map(|c| {
+                    let paths: Vec<String> = if c.files {
+                        c.text.lines().map(str::to_string).collect()
+                    } else {
+                        Vec::new()
+                    };
                     (
                         c.at,
                         Item {
-                            title: clip::preview(&c.text),
+                            title: if c.files {
+                                clip::file_title(&paths)
+                            } else {
+                                clip::preview(&c.text)
+                            },
                             sub: clip::timestamp(c.at, now),
                             tag: "Clipboard",
-                            icon: None,
-                            action: Action::Clip(c.text.clone()),
+                            icon: if c.files {
+                                Some(
+                                    if paths.len() == 1 {
+                                        clip::clip_file_icon(&paths[0])
+                                    } else {
+                                        "phosphor:file"
+                                    }
+                                    .to_string(),
+                                )
+                            } else if clip::parse_color(&c.text).is_some() {
+                                None
+                            } else {
+                                Some(
+                                    clip::file_url_path(&c.text)
+                                        .map(|p| clip::clip_file_icon(&p))
+                                        .unwrap_or("phosphor:clipboard-text")
+                                        .to_string(),
+                                )
+                            },
+                            action: if c.files {
+                                Action::ClipFiles(c.text.clone())
+                            } else {
+                                Action::Clip(c.text.clone())
+                            },
                             best: false,
                         },
                     )
@@ -135,7 +171,7 @@ impl Search<'_> {
                             title: format!("Image {} x {}", i.w, i.h),
                             sub: clip::timestamp(i.at, now),
                             tag: "Clipboard",
-                            icon: None,
+                            icon: Some("phosphor:image".into()),
                             action: Action::ClipImg(i.id),
                             best: false,
                         },
@@ -146,16 +182,15 @@ impl Search<'_> {
             let rows: Vec<_> = dated.into_iter().map(|(_, item)| item).collect();
             return rows;
         }
+        let scorer = crate::scorer::Scorer::new(&self.cfg.fuzzy_match);
         let mut scored = Vec::new();
         for window in self.windows {
-            let score = if q.is_empty() {
-                Some(0)
-            } else {
-                fuzzy(q, window.title())
-                    .into_iter()
-                    .chain(fuzzy(q, window.app_id.as_deref().unwrap_or("")))
-                    .max()
-            };
+            let score = scorer.score(
+                window.title(),
+                &window.description(),
+                q,
+                crate::scorer::Kind::Regular,
+            );
             if let Some(score) = score {
                 scored.push((
                     score,
@@ -163,8 +198,14 @@ impl Search<'_> {
                         title: window.title().into(),
                         sub: window.description(),
                         tag: "Window",
-                        icon: window.app_id.clone(),
-                        action: Action::Window(window.id),
+                        // Compositor-provided pixels (KWin) win over the
+                        // icon-theme lookup, like zlaunch's fetch_windows.
+                        icon: Some(if window.icon_data.is_some() {
+                            format!("window-data:{}", window.address)
+                        } else {
+                            format!("window:{}", window.app_id)
+                        }),
+                        action: Action::Window(window.address.clone()),
                         best: false,
                     },
                 ));
@@ -176,11 +217,8 @@ impl Search<'_> {
             .enumerate()
             .filter(|(_, a)| !self.cfg.disabled_apps.contains(&a.name))
         {
-            if let Some(score) = if q.is_empty() {
-                Some(0)
-            } else {
-                fuzzy(q, &a.name)
-            } {
+            if let Some(score) = scorer.score(&a.name, &a.comment, q, crate::scorer::Kind::Regular)
+            {
                 scored.push((
                     score,
                     Item {
@@ -195,8 +233,7 @@ impl Search<'_> {
             }
         }
         for (title, sub, view, icon) in [
-            // Icon names follow zlaunch's submenu items; icons.rs falls back
-            // to embedded strokes when no icon theme provides them.
+            // Submenu icons come from zlaunch's embedded Phosphor assets.
             ("Emoji Picker", "Search emoji by name", ":", "smiley"),
             (
                 "Clipboard History",
@@ -207,19 +244,77 @@ impl Search<'_> {
             ("Themes", "Browse and apply themes", "#", "palette"),
         ] {
             let (title, sub, view, icon) = (title, sub, view, icon);
-            if let Some(score) = if q.is_empty() {
-                Some(0)
-            } else {
-                fuzzy(q, title)
-            } {
+            if let Some(score) = scorer.score(title, sub, q, crate::scorer::Kind::Submenu) {
                 scored.push((
                     score,
                     Item {
                         title: title.into(),
                         sub: sub.into(),
                         tag: "Basic",
-                        icon: Some(icon.into()),
+                        icon: Some(format!("phosphor:{icon}")),
                         action: Action::View(view.into()),
+                        best: false,
+                    },
+                ));
+            }
+        }
+        for action in crate::system_actions::SystemAction::ALL {
+            let (title, sub, icon) = action.details();
+            if let Some(score) = scorer.score(title, sub, q, crate::scorer::Kind::Action) {
+                scored.push((
+                    score,
+                    Item {
+                        title: title.into(),
+                        sub: sub.into(),
+                        tag: "System",
+                        icon: Some(icon.into()),
+                        action: Action::System(action),
+                        best: false,
+                    },
+                ));
+            }
+        }
+        if self
+            .cfg
+            .combined_modules()
+            .contains(&config::ConfigModule::Calculator)
+            && q.chars().any(|c| c.is_numeric())
+        {
+            if let Ok(result) = crate::calculator::evaluate_expression(q) {
+                scored.push((
+                    0,
+                    Item {
+                        title: result.display_result.clone(),
+                        sub: String::new(),
+                        tag: "Calculator",
+                        icon: None,
+                        action: Action::Calculate(result),
+                        best: false,
+                    },
+                ));
+            }
+        }
+        let modules = self.cfg.combined_modules();
+        let search_enabled = modules.contains(&config::ConfigModule::Search);
+        let providers = self.cfg.search_providers.as_deref().unwrap_or_default();
+        let detection = crate::web_search::detect(q, providers);
+        if search_enabled {
+            let searches: Vec<_> = match detection {
+                crate::web_search::Detection::Triggered(provider, query) => vec![(provider, query)],
+                crate::web_search::Detection::Fallback(query) => {
+                    providers.iter().map(|provider| (provider, query)).collect()
+                }
+                crate::web_search::Detection::None => Vec::new(),
+            };
+            for (provider, query) in searches {
+                scored.push((
+                    0,
+                    Item {
+                        title: format!("Search on {}", provider.name),
+                        sub: String::new(),
+                        tag: "Search",
+                        icon: Some(provider.icon_name()),
+                        action: Action::WebSearch(provider.build_url(query)),
                         best: false,
                     },
                 ));
@@ -233,6 +328,8 @@ fn item_module(item: &Item) -> config::ConfigModule {
     use config::ConfigModule::*;
     match (&item.action, item.tag) {
         (_, "Application") => Applications,
+        (_, "Calculator") => Calculator,
+        (_, "Search") => Search,
         (_, "Window") => Windows,
         (Action::View(view), _) if view == ":" => Emojis,
         (Action::View(view), _) if view == ";" => Clipboard,
@@ -247,13 +344,13 @@ fn module_section(module: config::ConfigModule) -> &'static str {
         Applications => "Applications",
         Windows => "Windows",
         Calculator => "Calculator",
-        Ai | Search => "Search and AI",
+        Search => "Search and AI",
         _ => "Commands",
     }
 }
 
 /// Combined sections follow module order; a best match only moves out of a later section.
-fn group_sections(mut scored: Vec<(i32, Item)>, cfg: &Config) -> Vec<Item> {
+fn group_sections(mut scored: Vec<(i64, Item)>, cfg: &Config) -> Vec<Item> {
     let modules = cfg.combined_modules();
     scored.retain(|(_, item)| modules.contains(&item_module(item)));
     scored.sort_by_key(|(_, item)| {
@@ -277,6 +374,7 @@ fn group_sections(mut scored: Vec<(i32, Item)>, cfg: &Config) -> Vec<Item> {
         scored
             .iter()
             .enumerate()
+            .filter(|(_, (_, item))| !matches!(item.tag, "Calculator" | "AI" | "Search"))
             .max_by_key(|(_, (score, _))| *score)
             .filter(|(_, (score, item))| {
                 *score > 0
@@ -294,10 +392,13 @@ fn group_sections(mut scored: Vec<(i32, Item)>, cfg: &Config) -> Vec<Item> {
         item
     });
     scored.sort_by_key(|(_, item)| {
-        sections
-            .iter()
-            .position(|section| *section == module_section(item_module(item)))
-            .unwrap_or(usize::MAX)
+        (
+            sections
+                .iter()
+                .position(|section| *section == module_section(item_module(item)))
+                .unwrap_or(usize::MAX),
+            item.tag == "Search",
+        )
     });
     promoted
         .into_iter()
@@ -305,55 +406,41 @@ fn group_sections(mut scored: Vec<(i32, Item)>, cfg: &Config) -> Vec<Item> {
         .collect()
 }
 
+#[cfg(test)]
 pub fn parse_desktop(txt: &str) -> Option<App> {
-    let (mut name, mut comment, mut exec, mut icon) =
-        (String::new(), String::new(), String::new(), String::new());
-    let (mut hidden, mut app, mut term, mut in_main) = (false, false, false, false);
-    for l in txt.lines() {
-        if l.starts_with('[') {
-            in_main = l == "[Desktop Entry]";
-            continue;
-        }
-        if !in_main {
-            continue;
-        }
-        if let Some(v) = l.strip_prefix("Name=") {
-            name = v.into();
-        } else if let Some(v) = l.strip_prefix("Comment=") {
-            comment = v.into();
-        } else if let Some(v) = l.strip_prefix("Exec=") {
-            exec = v.into();
-        } else if let Some(v) = l.strip_prefix("Icon=") {
-            icon = v.into();
-        } else if l == "NoDisplay=true" || l == "Hidden=true" {
-            hidden = true;
-        } else if l == "Terminal=true" {
-            term = true;
-        } else if l == "Type=Application" {
-            app = true;
-        }
-    }
-    if app && !hidden && !name.is_empty() && !exec.is_empty() {
-        Some(App {
-            name,
-            comment,
-            exec,
-            icon,
-            terminal: term,
-        })
-    } else {
-        None
-    }
+    parse_desktop_path(std::path::Path::new("fixture.desktop"), txt)
 }
 
-/// Exec line with the %f %u style field codes removed.
+fn parse_desktop_path(path: &std::path::Path, txt: &str) -> Option<App> {
+    let entry =
+        freedesktop_desktop_entry::DesktopEntry::from_str(path, txt, None::<&[&str]>).ok()?;
+    let locales: &[&str] = &[];
+    let name = entry.name(locales)?.to_string();
+    let exec = entry.exec()?.to_string();
+    if entry.no_display() {
+        return None;
+    }
+    Some(App {
+        name,
+        exec,
+        comment: entry.comment(locales).unwrap_or_default().into(),
+        icon: entry.icon().unwrap_or_default().into(),
+        terminal: entry.terminal(),
+    })
+}
+
+/// Desktop field codes removed by zlaunch before splitting the command into arguments.
 pub fn exec_line(exec: &str) -> String {
-    exec.split_whitespace()
-        .filter(|a| !(a.starts_with('%') && a.len() == 2))
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut result = exec.to_string();
+    for code in [
+        "%f", "%F", "%u", "%U", "%d", "%D", "%n", "%N", "%i", "%c", "%k",
+    ] {
+        result = result.replace(code, "");
+    }
+    result.trim().into()
 }
 
+#[allow(dead_code)]
 pub fn fuzzy(q: &str, s: &str) -> Option<i32> {
     if q.is_ascii() && s.is_ascii() {
         let s = s.as_bytes();
@@ -395,33 +482,6 @@ pub fn fuzzy(q: &str, s: &str) -> Option<i32> {
     Some(score - (s.len() as i32 / 8))
 }
 
-#[cfg(test)]
-pub const TONES: [&str; 6] = [
-    "Default",
-    "Light",
-    "Medium-light",
-    "Medium",
-    "Medium-dark",
-    "Dark",
-];
-
-pub fn emoji_base(e: &'static emojis::Emoji) -> &'static emojis::Emoji {
-    e.with_skin_tone(emojis::SkinTone::Default).unwrap_or(e)
-}
-
-pub fn emoji_with_tone(e: &'static emojis::Emoji, pick: usize) -> &'static emojis::Emoji {
-    let e = emoji_base(e);
-    let tone = match pick {
-        1 => emojis::SkinTone::Light,
-        2 => emojis::SkinTone::MediumLight,
-        3 => emojis::SkinTone::Medium,
-        4 => emojis::SkinTone::MediumDark,
-        5 => emojis::SkinTone::Dark,
-        _ => emojis::SkinTone::Default,
-    };
-    e.with_skin_tone(tone).unwrap_or(e)
-}
-
 /// The theme picker is a `#` query, optionally followed by a name filter.
 pub fn theme_view(query: &str) -> bool {
     query.trim_start().starts_with('#')
@@ -430,8 +490,13 @@ pub fn theme_view(query: &str) -> bool {
 /// Picker rows for bundled and user themes: the configured one first, then alphabetical,
 /// like zlaunch's theme mode. `Action::Theme` previews the row's theme while selected.
 pub fn theme_items(cfg: &Config, q: &str) -> Vec<Item> {
-    let current = &cfg.theme;
+    let current = if config::load_theme(&cfg.theme).is_some() {
+        cfg.theme.as_str()
+    } else {
+        "default"
+    };
     let mut names = config::available_themes();
+    names.retain(|(name, _)| config::load_theme(name).is_some());
     names.sort_by_key(|(name, _)| name != current);
     let q = q.to_lowercase();
     names
@@ -451,63 +516,21 @@ pub fn theme_items(cfg: &Config, q: &str) -> Vec<Item> {
 }
 
 pub fn emoji_items(q: &str) -> Vec<Item> {
-    let tones = crate::hist::emoji_tones();
-    let frequencies = crate::hist::emoji_freq();
-    let mut v: Vec<(i32, &'static emojis::Emoji)> = Vec::new();
-    for e in emojis::iter().filter(|e| e.skin_tone().is_none_or(|t| t == emojis::SkinTone::Default))
-    {
-        let score = if q.is_empty() {
-            Some(0)
-        } else {
-            std::iter::once(e.name())
-                .chain(e.shortcodes())
-                .filter_map(|n| fuzzy(q, n))
-                .max()
-                .or_else(|| {
-                    emojis::get(q)
-                        .filter(|found| emoji_base(found) == e)
-                        .map(|_| 1000)
-                })
-        };
-        if let Some(score) = score {
-            let used = frequencies
-                .iter()
-                .filter(|(sequence, _)| emojis::get(sequence).is_some_and(|f| emoji_base(f) == e))
-                .fold(0u32, |sum, (_, n)| sum.saturating_add(*n));
-            v.push((
-                score + if q.is_empty() { 0 } else { used.min(10) as i32 },
-                e,
-            ));
-        }
-    }
-    if q.is_empty() {
-        let mut preferred: Vec<_> = crate::hist::emoji_recent()
-            .iter()
-            .filter_map(|sequence| emojis::get(sequence))
-            .map(emoji_base)
-            .collect();
-        preferred.extend(
-            frequencies
-                .iter()
-                .take(8)
-                .filter_map(|(sequence, _)| emojis::get(sequence))
-                .map(emoji_base),
-        );
-        v.sort_by_key(|(_, e)| preferred.iter().position(|p| p == e).unwrap_or(usize::MAX));
-    } else {
-        v.sort_by_key(|a| std::cmp::Reverse(a.0));
-    }
-    v.into_iter()
-        .map(|(_, base)| {
-            let e = emoji_with_tone(base, tones.get(base.name()).copied().unwrap_or(0));
-            Item {
-                title: base.name().to_string(),
-                sub: format!(":{}:", base.shortcode().unwrap_or("")),
-                tag: "Emoji",
-                icon: Some(format!("emoji:{}", e.as_str())),
-                action: Action::Clip(e.as_str().to_string()),
-                best: false,
-            }
+    // zlaunch's emoji_delegate filter: case-insensitive name substring or a
+    // literal emoji match, every skin-tone variant as its own item, original
+    // crate order, no scoring, recents or tone filtering.
+    let ql = q.to_lowercase();
+    emojis::iter()
+        .filter(|e| {
+            ql.is_empty() || e.name().to_lowercase().contains(&ql) || e.as_str().contains(q)
+        })
+        .map(|e| Item {
+            title: e.name().to_string(),
+            sub: format!(":{}:", e.shortcode().unwrap_or("")),
+            tag: "Emoji",
+            icon: Some(format!("emoji:{}", e.as_str())),
+            action: Action::Clip(e.as_str().to_string()),
+            best: false,
         })
         .collect()
 }
@@ -516,78 +539,15 @@ pub fn emoji_items(q: &str) -> Vec<Item> {
 mod tests {
     use super::*;
     #[test]
-    fn emoji_tones_recents_and_reset_round_trip() {
-        let _env = crate::testutil::ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let previous = std::env::var_os("XDG_STATE_HOME");
-        std::env::set_var("XDG_STATE_HOME", dir.path());
-        assert_eq!(crate::hist::emoji_tone("waving hand"), None);
-        assert!(crate::hist::emoji_tone_set("waving hand", 5));
-        assert!(crate::hist::emoji_tone_set("waving hand", 2));
-        assert_eq!(
-            std::fs::read_to_string(crate::hist::emoji_tone_path()).unwrap(),
-            "waving hand\t2\n"
-        );
-        assert!(!crate::hist::emoji_tone_set("bad\nname", 2));
-        assert!(!crate::hist::emoji_tone_set("waving hand", 6));
-        let hand = emoji_items("waving hand").remove(0);
-        assert_eq!(hand.title, "waving hand");
-        assert_eq!(hand.action, Action::Clip("👋🏼".into()));
-        assert_eq!(hand.icon.as_deref(), Some("emoji:👋🏼"));
-        assert_eq!(emoji_items("😀")[0].action, Action::Clip("😀".into()));
-        crate::hist::emoji_add("👋🏿");
-        crate::hist::emoji_add("😀");
-        crate::hist::emoji_add("👋🏼");
-        assert_eq!(crate::hist::emoji_recent(), vec!["👋🏼", "😀", "👋🏿"]);
-        let browse = emoji_items("");
-        assert_eq!(browse[0].title, "waving hand");
-        assert_eq!(browse[1].action, Action::Clip("😀".into()));
-        assert_eq!(
-            browse.iter().filter(|it| it.title == "waving hand").count(),
-            1
-        );
-        crate::hist::emoji_reset("👋🏼");
-        assert_eq!(crate::hist::emoji_tone("waving hand"), None);
-        assert_eq!(crate::hist::emoji_recent(), vec!["😀"]);
-        assert_eq!(crate::hist::emoji_freq(), vec![("😀".into(), 1)]);
-        assert_eq!(
-            emoji_items("waving hand")[0].action,
-            Action::Clip("👋".into())
-        );
-        match previous {
-            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-            None => std::env::remove_var("XDG_STATE_HOME"),
-        }
-    }
-
-    #[test]
-    fn emoji_tone_changes_only_supported_sequences() {
-        let wave = emojis::get("👋").unwrap();
-        let variants = ["👋", "👋🏻", "👋🏼", "👋🏽", "👋🏾", "👋🏿"];
-        assert_eq!(TONES.len(), variants.len());
-        for (pick, sequence) in variants.iter().enumerate() {
-            let e = emoji_with_tone(wave, pick);
-            assert_eq!(e.as_str(), *sequence);
-            assert_eq!(emoji_base(e).name(), "waving hand");
-        }
-        assert_eq!(
-            emoji_with_tone(emojis::get("👋🏿").unwrap(), 0).as_str(),
-            "👋"
-        );
-        assert_eq!(emoji_with_tone(wave, 99).as_str(), "👋");
-        let family = emojis::get("👨‍👩‍👧").unwrap();
-        assert_eq!(emoji_with_tone(family, 5).as_str(), "👨‍👩‍👧");
-        let flag = emojis::get("🇮🇳").unwrap();
-        assert_eq!(emoji_with_tone(flag, 3).as_str(), "🇮🇳");
-    }
-
-    #[test]
     fn emoji_picker_is_not_limited_to_eighty_results() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();
         let all = emoji_items("");
-        let expected = emojis::iter()
-            .filter(|e| e.skin_tone().is_none_or(|t| t == emojis::SkinTone::Default))
-            .count();
+        // zlaunch lists the emojis crate's iter() output as-is (base emoji
+        // only: the crate's iterator excludes non-default skin tones, and
+        // zlaunch does not expand them either).
+        let expected = emojis::iter().count();
+        // No skin-tone expansion, like zlaunch: one waving hand, not six.
+        assert_eq!(emoji_items("waving hand").len(), 1);
         assert_eq!(all.len(), expected);
         assert!(all.len() > 80);
         let matches = emoji_items("face");
@@ -668,8 +628,61 @@ mod tests {
         }
     }
     #[test]
+    fn calculator_and_actions_follow_module_gates_and_section_order() {
+        let mut cfg = Config {
+            search_providers: None,
+            ..Config::default()
+        };
+        let history = clip::History::new(0);
+        let run = |cfg: &Config, q: &str| {
+            Search {
+                cfg,
+                apps: &[],
+                windows: &[],
+                history: &history,
+            }
+            .run(q)
+        };
+        let rows = run(&cfg, "1000 * 1000");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "1,000,000");
+        assert_eq!(crate::ui::section_of(&rows[0]), Some("Calculator"));
+        let Action::Calculate(result) = &rows[0].action else {
+            panic!("not calculator")
+        };
+        assert_eq!(result.text_for_clipboard(), "1000000");
+        let rows = run(&cfg, "1/0");
+        let Action::Calculate(result) = &rows[0].action else {
+            panic!("not calculator")
+        };
+        assert!(result.is_error);
+        assert_eq!(result.text_for_clipboard(), "Infinity");
+        assert!(run(&cfg, "2 +* 2").is_empty());
+        assert!(run(&cfg, "sin(pi)").is_empty());
+        assert_eq!(run(&cfg, "Shutdown")[0].sub, "Power off the system");
+        cfg.disabled_modules = Some(vec![
+            config::ConfigModule::Actions,
+            config::ConfigModule::Calculator,
+        ]);
+        assert!(run(&cfg, "Shutdown").is_empty());
+        assert!(run(&cfg, "2+2").is_empty());
+        cfg.disabled_modules = None;
+        cfg.combined_modules = Some(vec![config::ConfigModule::Actions]);
+        assert_eq!(
+            run(&cfg, "")
+                .iter()
+                .map(|r| r.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Shutdown", "Reboot", "Suspend", "Lock Screen", "Log Out"]
+        );
+    }
+
+    #[test]
     fn root_has_apps_and_basic_views() {
-        let cfg = Config::default();
+        let cfg = Config {
+            search_providers: None,
+            ..Config::default()
+        };
         let apps = vec![app("Browser")];
         let history = clip::History::new(10);
         let search = Search {
@@ -681,7 +694,17 @@ mod tests {
         let rows = search.run("");
         assert_eq!(
             rows.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(),
-            vec!["Emoji Picker", "Clipboard History", "Themes", "Browser"]
+            vec![
+                "Emoji Picker",
+                "Clipboard History",
+                "Shutdown",
+                "Reboot",
+                "Suspend",
+                "Lock Screen",
+                "Log Out",
+                "Themes",
+                "Browser"
+            ]
         );
         assert_eq!(rows.last().unwrap().action, Action::App(0));
         for query in [
@@ -718,7 +741,10 @@ mod tests {
     }
     #[test]
     fn search_orders_matches_by_score_and_keeps_app_indices() {
-        let cfg = Config::default();
+        let cfg = Config {
+            search_providers: None,
+            ..Config::default()
+        };
         let apps = vec![app("Draw Board"), app("Broad"), app("Browser")];
         let history = clip::History::new(0);
         let search = Search {
@@ -736,15 +762,19 @@ mod tests {
             vec![
                 Action::App(2),
                 Action::View(";".into()),
+                Action::View("#".into()),
                 Action::App(1),
                 Action::App(0)
             ]
         );
-        assert_eq!(search.run("  BROWSER  ")[0].action, Action::App(2));
+        assert!(search.run("  BROWSER  ").is_empty());
     }
     #[test]
     fn equal_scores_preserve_application_order() {
-        let cfg = Config::default();
+        let cfg = Config {
+            search_providers: None,
+            ..Config::default()
+        };
         let apps = vec![app("Code B"), app("Code A")];
         let history = clip::History::new(0);
         let search = Search {
@@ -777,6 +807,7 @@ mod tests {
     fn exclusions_match_full_names_and_preserve_launch_indices() {
         let cfg = Config {
             disabled_apps: vec!["Code".into(), "Code".into(), "Missing".into()],
+            search_providers: None,
             ..Config::default()
         };
         let apps = vec![app("Code"), app("Code - Insiders"), app("code")];
@@ -828,7 +859,8 @@ mod tests {
         history.push("image notes");
         history.images.push(clip::Img {
             id: 42,
-            png: Vec::new(),
+            png: Some(Vec::new()),
+            path: std::path::PathBuf::new(),
             w: 1,
             h: 1,
             at: u64::MAX,
@@ -877,27 +909,32 @@ mod tests {
             clip::Clip {
                 text: "new text".into(),
                 at: 30,
+                files: false,
             },
             clip::Clip {
                 text: "tied text".into(),
                 at: 20,
+                files: false,
             },
             clip::Clip {
                 text: "old text".into(),
                 at: 10,
+                files: false,
             },
         ];
         history.images = vec![
             clip::Img {
                 id: 1,
-                png: Vec::new(),
+                png: Some(Vec::new()),
+                path: std::path::PathBuf::new(),
                 w: 1,
                 h: 1,
                 at: 40,
             },
             clip::Img {
                 id: 2,
-                png: Vec::new(),
+                png: Some(Vec::new()),
+                path: std::path::PathBuf::new(),
                 w: 1,
                 h: 1,
                 at: 20,
@@ -968,6 +1005,11 @@ mod tests {
             windows: &[],
             history: &history,
         };
+        let missing = Config {
+            theme: "no-such-theme".into(),
+            ..Config::default()
+        };
+        assert_eq!(theme_items(&missing, "")[0].title, "default");
         let rows = search.run("#");
         assert_eq!(rows.len(), config::THEMES.len());
         assert_eq!(rows[0].title, "nord");
@@ -984,6 +1026,9 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].title, "catppuccin-latte");
         assert!(search.run("#zzzz").is_empty());
+        assert!(search.run("#nord ").is_empty());
+        assert!(search.run("# nord").is_empty());
+        assert_eq!(search.run("#NORD")[0].title, "nord");
         assert!(theme_view("#nord"));
         assert!(theme_view(" #"));
         assert!(!theme_view(""));
@@ -994,8 +1039,8 @@ mod tests {
         let app = parse_desktop(entry).unwrap();
         assert_eq!(app.name, "Editor");
         assert_eq!(exec_line(&app.exec), "editor");
-        assert!(parse_desktop(&format!("{entry}\n[Desktop Entry]\nHidden=true")).is_none());
-        assert!(parse_desktop("[Desktop Entry]\nType=Link\nName=Link\nExec=wrong").is_none());
+        assert!(parse_desktop(&format!("{entry}\n[Desktop Entry]\nHidden=true")).is_some());
+        assert!(parse_desktop("[Desktop Entry]\nType=Link\nName=Link\nExec=wrong").is_some());
         assert_eq!(fuzzy("br", "Browser"), Some(13));
         assert_eq!(fuzzy("zzz", "Browser"), None);
     }
@@ -1005,7 +1050,55 @@ mod tests {
 mod scan_tests {
     use super::*;
     #[test]
-    fn user_desktop_entries_override_system_entries_even_when_hidden() {
+    fn scanner_preserves_same_name_and_terminal_entries_and_collapses_basename_ids() {
+        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("user");
+        let system = root.path().join("system");
+        std::fs::create_dir_all(user.join("applications")).unwrap();
+        std::fs::create_dir_all(system.join("applications/nested")).unwrap();
+        let entry = "[Desktop Entry]\nType=Application\nName=Same\nExec=true\n";
+        std::fs::write(
+            user.join("applications/first.desktop"),
+            format!("{entry}Terminal=true\n"),
+        )
+        .unwrap();
+        std::fs::write(system.join("applications/second.desktop"), entry).unwrap();
+        std::fs::write(
+            system.join("applications/nested/first.desktop"),
+            entry.replace("Same", "Overridden"),
+        )
+        .unwrap();
+        std::fs::write(
+            user.join("applications/hidden.desktop"),
+            format!("{entry}NoDisplay=true\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            system.join("applications/hidden.desktop"),
+            entry.replace("Same", "Visible fallback"),
+        )
+        .unwrap();
+        let old_home = std::env::var_os("XDG_DATA_HOME");
+        let old_dirs = std::env::var_os("XDG_DATA_DIRS");
+        std::env::set_var("XDG_DATA_HOME", &user);
+        std::env::set_var("XDG_DATA_DIRS", &system);
+        let apps = scan_apps(&Config::default());
+        for (key, value) in [("XDG_DATA_HOME", old_home), ("XDG_DATA_DIRS", old_dirs)] {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        assert_eq!(
+            apps.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            ["Same", "Same", "Visible fallback"]
+        );
+        assert_eq!(apps.iter().filter(|app| app.terminal).count(), 1);
+    }
+
+    #[test]
+    fn reference_parser_keeps_hidden_entries_and_basename_ids_win() {
         let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
         let root = tempfile::tempdir().unwrap();
         let user = root.path().join("user");
@@ -1031,7 +1124,7 @@ mod scan_tests {
         let apps = scan_apps(&Config::default());
         assert_eq!(
             apps.iter().map(|app| app.name.as_str()).collect::<Vec<_>>(),
-            vec!["Nested Editor"]
+            vec!["Nested Editor", "System Browser"]
         );
         for (key, value) in [("XDG_DATA_HOME", old_home), ("XDG_DATA_DIRS", old_dirs)] {
             match value {
@@ -1056,7 +1149,8 @@ mod strict_script_tests {
 
     #[test]
     fn script_commands_are_not_available() {
-        let cfg: Config = toml::from_str("script_dirs = ['/tmp/not-scanned']").unwrap();
+        let cfg: Config =
+            toml::from_str("search_providers = []\nscript_dirs = ['/tmp/not-scanned']").unwrap();
         let history = clip::History::new(0);
         let search = Search {
             cfg: &cfg,
@@ -1090,7 +1184,7 @@ mod combined_section_tests {
             best: false,
         }
     }
-    fn fixture() -> Vec<(i32, Item)> {
+    fn fixture() -> Vec<(i64, Item)> {
         vec![
             (100, row("App", "Application", Action::App(0))),
             (40, row("Window", "Window", Action::App(1))),
@@ -1152,5 +1246,121 @@ mod combined_section_tests {
             ["Emoji", "Clipboard"]
         );
         assert!(!rows.iter().any(|it| it.best));
+    }
+}
+
+#[cfg(test)]
+mod web_search_tests {
+    use super::*;
+
+    fn rows(cfg: &Config, query: &str) -> Vec<Item> {
+        let history = clip::History::new(0);
+        Search {
+            cfg,
+            apps: &[],
+            windows: &[],
+            history: &history,
+        }
+        .run(query)
+    }
+
+    #[test]
+    fn defaults_custom_empty_and_invalid_config_match_reference() {
+        let cfg: Config = toml::from_str("").unwrap();
+        let providers = cfg.search_providers.as_ref().unwrap();
+        assert_eq!(
+            providers
+                .iter()
+                .map(|p| (p.name.as_str(), p.trigger.as_str(), p.icon.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("Google", "!g", "magnifying-glass"),
+                ("DuckDuckGo", "!d", "globe"),
+                ("Wikipedia", "!wiki", "book-open"),
+                ("YouTube", "!yt", "youtube-logo")
+            ]
+        );
+        let encoded = toml::to_string(&cfg).unwrap();
+        assert_eq!(
+            toml::from_str::<Config>(&encoded).unwrap().search_providers,
+            cfg.search_providers
+        );
+        let custom: Config = toml::from_str("[[search_providers]]\nname='Docs'\ntrigger='!doc'\nurl='https://example.invalid/?q={query}'\n").unwrap();
+        assert_eq!(custom.search_providers.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            rows(&custom, "!doc hello")[0].icon.as_deref(),
+            Some("phosphor:magnifying-glass")
+        );
+        assert!(rows(
+            &toml::from_str::<Config>("search_providers=[]").unwrap(),
+            "unmatched words"
+        )
+        .is_empty());
+        assert!(toml::from_str::<Config>("[[search_providers]]\nname='Incomplete'").is_err());
+        let cfg = Config {
+            search_providers: None,
+            ..cfg
+        };
+        assert!(rows(&cfg, "unmatched words").is_empty());
+    }
+
+    #[test]
+    fn fallback_rows_coexist_with_apps_but_are_never_best_match() {
+        let cfg = Config::default();
+        let apps = [App {
+            name: "Needle".into(),
+            comment: String::new(),
+            exec: "true".into(),
+            icon: String::new(),
+            terminal: false,
+        }];
+        let history = clip::History::new(0);
+        let result = Search {
+            cfg: &cfg,
+            apps: &apps,
+            windows: &[],
+            history: &history,
+        }
+        .run("Needle");
+        assert_eq!(
+            result.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(),
+            [
+                "Needle",
+                "Search on Google",
+                "Search on DuckDuckGo",
+                "Search on Wikipedia",
+                "Search on YouTube"
+            ]
+        );
+        assert!(result.iter().filter(|i| i.tag == "Search").all(|i| !i.best
+            && i.sub.is_empty()
+            && crate::ui::section_of(i) == Some("Search and AI")));
+        assert_eq!(
+            rows(&cfg, "!wiki Rust & C")[0].action,
+            Action::WebSearch(
+                "https://en.wikipedia.org/wiki/Special:Search?search=Rust%20%26%20C".into()
+            )
+        );
+        assert!(rows(&cfg, "!g").is_empty());
+    }
+
+    #[test]
+    fn search_has_no_ai_trigger_or_rows() {
+        let mut cfg = Config::default();
+        for query in ["!ai rust", "!ai", "ordinary query"] {
+            let result = rows(&cfg, query);
+            assert_eq!(
+                result.iter().map(|r| r.tag).collect::<Vec<_>>(),
+                ["Search"; 4]
+            );
+        }
+        cfg.combined_modules = Some(vec![config::ConfigModule::Search]);
+        assert!(rows(&cfg, "").is_empty());
+        assert_eq!(
+            rows(&cfg, "!d rust")[0].action,
+            Action::WebSearch("https://duckduckgo.com/?q=rust".into())
+        );
+        cfg.combined_modules = Some(vec![config::ConfigModule::Applications]);
+        assert!(rows(&cfg, "!g rust").is_empty());
     }
 }

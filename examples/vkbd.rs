@@ -54,6 +54,7 @@ fn code(c: char) -> Option<(u32, bool)> {
     }
     Some(match c {
         ' ' => (57, false),
+        '!' => (2, true),
         '.' => (52, false),
         ',' => (51, false),
         '-' => (12, false),
@@ -68,6 +69,7 @@ fn code(c: char) -> Option<(u32, bool)> {
         '^' => (7, true),
         '=' => (13, false),
         '+' => (13, true),
+        '&' => (8, true),
         '(' => (10, true),
         ')' => (11, true),
         '{' => (26, true),
@@ -142,6 +144,8 @@ fn main() {
                 "enter" => key(&kb, 28, false, false),
                 "shift-enter" => key(&kb, 28, true, false),
                 "tab" => key(&kb, 15, false, false),
+                "ctrl-tab" => key(&kb, 15, false, true),
+                "ctrl-shift-tab" => key(&kb, 15, true, true),
                 "shift-tab" => key(&kb, 15, true, false),
                 "bs" => key(&kb, 14, false, false),
                 "ctrl-bs" => key(&kb, 14, false, true),

@@ -2,16 +2,19 @@
 
 pub const MAX_ENTRY: usize = 16 * 1024;
 pub const MAX_IMAGE: usize = 4 * 1024 * 1024;
-pub const MAX_IMAGES: usize = 8;
 pub const SENSITIVE_MIME: &str = "x-kde-passwordManagerHint";
 
-/// Which text mime type to ask for, if any. Offers with password-manager or concealed hints are refused.
-pub fn pick_mime(mimes: &[String]) -> Option<String> {
-    if mimes
-        .iter()
-        .any(|m| m == SENSITIVE_MIME || m == "vicinae/concealed")
+/// Which text mime type to ask for, if any. Sensitive offers require store_passwords.
+pub fn pick_mime(mimes: &[String], store_passwords: bool) -> Option<String> {
+    if !store_passwords
+        && mimes
+            .iter()
+            .any(|m| m == SENSITIVE_MIME || m == "vicinae/concealed")
     {
         return None;
+    }
+    if mimes.iter().any(|m| m == "text/uri-list") {
+        return Some("text/uri-list".to_string());
     }
     for want in [
         "text/plain;charset=utf-8",
@@ -85,12 +88,12 @@ pub fn strip_html(h: &str) -> String {
         .join("\n")
 }
 
-/// Which image mime type to ask for. Text wins when an offer has both, and sensitive copies are refused.
-pub fn pick_image(mimes: &[String]) -> Option<String> {
-    if mimes
-        .iter()
-        .any(|m| m == SENSITIVE_MIME || m == "vicinae/concealed")
-        || pick_mime(mimes).is_some()
+/// Which image mime type to ask for. An offered image wins over text.
+pub fn pick_image(mimes: &[String], store_passwords: bool) -> Option<String> {
+    if !store_passwords
+        && mimes
+            .iter()
+            .any(|m| m == SENSITIVE_MIME || m == "vicinae/concealed")
     {
         return None;
     }
@@ -141,25 +144,188 @@ pub fn preview(text: &str) -> String {
 
 pub struct Img {
     pub id: u64,
-    pub png: Vec<u8>,
+    /// PNG bytes while held in memory (fresh copies); `None` once the image
+    /// is stored, in which case `path` provides the bytes on demand, like
+    /// zlaunch's ImageData::Stored.
+    pub png: Option<Vec<u8>>,
+    pub path: std::path::PathBuf,
     pub w: u32,
     pub h: u32,
     /// When it was copied, epoch seconds.
     pub at: u64,
 }
 
-/// A text copy and when it was taken (epoch seconds).
+impl Img {
+    /// PNG bytes, loading them from disk on demand. A missing or damaged
+    /// store reads as unavailable, like a dropped database row in zlaunch.
+    pub fn bytes(&self) -> Option<Vec<u8>> {
+        if let Some(png) = &self.png {
+            return Some(png.clone());
+        }
+        let png = std::fs::read(&self.path).ok()?;
+        if png.len() > MAX_IMAGE || png_size(&png) != Some((self.w, self.h)) || fnv(&png) != self.id
+        {
+            return None;
+        }
+        Some(png)
+    }
+}
+
+/// A text copy and when it was taken (epoch seconds). `files` marks a
+/// text/uri-list capture: `text` then holds one decoded path per line.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Clip {
     pub text: String,
     pub at: u64,
+    pub files: bool,
 }
 
+/// Decode a `file://` URI to a filesystem path (percent-decoded), like zlaunch.
+pub fn file_url_path(text: &str) -> Option<String> {
+    let rest = text.trim().strip_prefix("file://")?;
+    Some(percent_decode(rest))
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Paths from a text/uri-list copy: one URI per line, `#` comments skipped.
+pub fn uri_list_paths(text: &str) -> Option<Vec<String>> {
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        paths.push(file_url_path(line)?);
+    }
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// List title for file paths: the file name, or "[N files]".
+pub fn file_title(paths: &[String]) -> String {
+    if paths.len() == 1 {
+        std::path::Path::new(&paths[0])
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("[File]")
+            .to_string()
+    } else {
+        format!("[{} files]", paths.len())
+    }
+}
+
+/// Extensions zlaunch previews as images in the clipboard pane.
+pub fn is_image_path(path: &str) -> bool {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase());
+    matches!(
+        ext.as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "svg")
+    )
+}
+
+/// zlaunch's colour text parsing: #rgb/#rrggbb/#rrggbbaa or rgb()/rgba().
+pub fn parse_color(text: &str) -> Option<[u8; 4]> {
+    let text = text.trim();
+    if let Some(hex) = text.strip_prefix('#') {
+        let c = |i: usize| u8::from_str_radix(&hex[i..i + 1].repeat(2), 16).ok();
+        let p = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+        return match hex.len() {
+            3 => Some([c(0)?, c(1)?, c(2)?, 255]),
+            6 => Some([p(0)?, p(2)?, p(4)?, 255]),
+            8 => Some([p(0)?, p(2)?, p(4)?, p(6)?]),
+            _ => None,
+        };
+    }
+    let inner = text
+        .strip_prefix("rgb(")
+        .or_else(|| text.strip_prefix("rgba("))?;
+    let inner = inner.strip_suffix(')')?;
+    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let v = |i: usize| parts[i].parse::<u8>().ok();
+    let a = if parts.len() >= 4 {
+        (parts[3].parse::<f32>().ok()? * 255.0) as u8
+    } else {
+        255
+    };
+    Some([v(0)?, v(1)?, v(2)?, a])
+}
+
+/// zlaunch's per-extension phosphor icon for a file path.
+pub fn clip_file_icon(path: &str) -> &'static str {
+    if is_image_path(path) {
+        "phosphor:file-image"
+    } else if is_text_path(path) {
+        "phosphor:file-text"
+    } else {
+        "phosphor:file"
+    }
+}
+
+/// Extensions zlaunch previews as text in the clipboard pane.
+pub fn is_text_path(path: &str) -> bool {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase());
+    matches!(
+        ext.as_deref(),
+        Some(
+            "txt"
+                | "md"
+                | "rs"
+                | "py"
+                | "js"
+                | "ts"
+                | "json"
+                | "yaml"
+                | "yml"
+                | "toml"
+                | "html"
+                | "css"
+                | "sh"
+        )
+    )
+}
+
+/// Epoch seconds, strictly increasing within the process so the newest copy
+/// always sorts ahead of older ones, like zlaunch's single history deque.
 pub fn now() -> u64 {
-    std::time::SystemTime::now()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let real = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let mut prev = LAST.load(Ordering::Relaxed);
+    loop {
+        let next = real.max(prev.saturating_add(1));
+        match LAST.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(p) => prev = p,
+        }
+    }
 }
 
 fn fnv(d: &[u8]) -> u64 {
@@ -219,28 +385,70 @@ impl History {
         }
     }
 
-    /// Add a copy at the front. Blank and oversized text is dropped, repeats move to the front and count as copied again.
+    /// Add a copy at the front. Blank and oversized text is dropped, and a repeat of the latest copy is not added again (zlaunch data.rs).
     pub fn push(&mut self, text: &str) -> bool {
+        self.push_kind(text, false)
+    }
+
+    /// Add a text/uri-list capture: decoded paths, one per line.
+    pub fn push_files(&mut self, text: &str) -> bool {
+        self.push_kind(text, true)
+    }
+
+    /// True when the newest copy overall is an image: zlaunch dedups against
+    /// the front of one shared deque, not per content kind.
+    fn front_is_image(&self) -> bool {
+        match (self.entries.first(), self.images.first()) {
+            (Some(e), Some(i)) => i.at > e.at,
+            (None, Some(_)) => true,
+            _ => false,
+        }
+    }
+
+    fn push_kind(&mut self, text: &str, files: bool) -> bool {
         if text.trim().is_empty() || text.len() > MAX_ENTRY || self.max == 0 {
             return false;
         }
-        self.entries.retain(|e| e.text != text);
+        // zlaunch skips consecutive duplicates only; older equal entries stay.
+        if !self.front_is_image()
+            && self
+                .entries
+                .first()
+                .is_some_and(|e| e.text == text && e.files == files)
+        {
+            return false;
+        }
         self.entries.insert(
             0,
             Clip {
                 text: text.to_string(),
                 at: now(),
+                files,
             },
         );
         self.trim();
         true
     }
 
-    /// Drop the oldest entries past the configured limits.
+    /// Drop the oldest copies past the configured limit. One bound spans
+    /// text and images like zlaunch's single deque, not a cap per kind.
     pub fn trim(&mut self) {
-        self.entries.truncate(self.max);
-        self.images
-            .truncate(if self.max == 0 { 0 } else { MAX_IMAGES });
+        while self.entries.len() + self.images.len() > self.max {
+            let oldest_text = self.entries.last().map(|e| e.at);
+            let oldest_image = self.images.last().map(|i| i.at);
+            match (oldest_text, oldest_image) {
+                (Some(t), Some(i)) if i < t => {
+                    self.images.pop();
+                }
+                (Some(_), Some(_)) | (Some(_), None) => {
+                    self.entries.pop();
+                }
+                (None, Some(_)) => {
+                    self.images.pop();
+                }
+                (None, None) => break,
+            }
+        }
     }
 
     /// Add a PNG copy at the front. Anything that is not a sane PNG, or is too big, is dropped.
@@ -252,12 +460,16 @@ impl History {
             return false;
         };
         let id = fnv(png);
-        self.images.retain(|i| i.id != id);
+        // zlaunch skips consecutive duplicates only; older equal images stay.
+        if self.front_is_image() && self.images.first().is_some_and(|i| i.id == id) {
+            return false;
+        }
         self.images.insert(
             0,
             Img {
                 id,
-                png: png.to_vec(),
+                png: Some(png.to_vec()),
+                path: dir().join(format!("{id}.png")),
                 w,
                 h,
                 at: now(),
@@ -284,23 +496,31 @@ impl History {
         }
         let mut s = String::from("v1\n");
         for e in &self.entries {
-            s.push_str(&format!("t\t{}\t{}\n", e.at, esc(&e.text)));
+            let kind = if e.files { 'f' } else { 't' };
+            s.push_str(&format!("{kind}\t{}\t{}\n", e.at, esc(&e.text)));
         }
         for i in &self.images {
             s.push_str(&format!("i\t{}\t{}\t{}\t{}\n", i.at, i.id, i.w, i.h));
             let p = d.join(format!("{}.png", i.id));
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&p)
-            {
-                if file
-                    .set_permissions(std::fs::Permissions::from_mode(0o600))
-                    .is_ok()
+            if let Some(png) = &i.png {
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&p)
                 {
-                    let _ = file.write_all(&i.png);
+                    if file
+                        .set_permissions(std::fs::Permissions::from_mode(0o600))
+                        .is_ok()
+                    {
+                        let _ = file.write_all(png);
+                    }
+                }
+            } else if !p.exists() && i.path.is_file() {
+                // Stored image saved under another directory: carry the file.
+                if std::fs::copy(&i.path, &p).is_ok() {
+                    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
                 }
             }
         }
@@ -349,11 +569,15 @@ impl History {
         for l in s.lines().skip(1) {
             let f: Vec<&str> = l.split('\t').collect();
             match f.as_slice() {
-                ["t", at, t] => {
+                [kind @ ("t" | "f"), at, t] => {
                     if let Ok(at) = at.parse() {
                         let text = unesc(t);
                         if !text.trim().is_empty() && text.len() <= MAX_ENTRY {
-                            h.entries.push(Clip { text, at });
+                            h.entries.push(Clip {
+                                text,
+                                at,
+                                files: *kind == "f",
+                            });
                         }
                     }
                 }
@@ -361,14 +585,15 @@ impl History {
                     if let (Ok(at), Ok(id), Ok(w), Ok(hh)) =
                         (at.parse(), id.parse(), w.parse(), hh.parse())
                     {
-                        if let Ok(png) = std::fs::read(d.join(format!("{id}.png"))) {
-                            if png.len() <= MAX_IMAGE
-                                && png_size(&png) == Some((w, hh))
-                                && fnv(&png) == id
-                            {
+                        // Bytes load on demand like zlaunch's stored images;
+                        // only the file's presence and size are checked here.
+                        let path = d.join(format!("{id}.png"));
+                        if let Ok(meta) = std::fs::metadata(&path) {
+                            if (24..=MAX_IMAGE as u64).contains(&meta.len()) {
                                 h.images.push(Img {
                                     id,
-                                    png,
+                                    png: None,
+                                    path,
                                     w,
                                     h: hh,
                                     at,
@@ -396,6 +621,7 @@ impl History {
         a != self.entries.len() || b != self.images.len()
     }
 
+    #[cfg(test)]
     pub fn clear(&mut self) {
         self.entries.clear();
         self.images.clear();
@@ -449,14 +675,16 @@ mod tests {
         assert_eq!(texts(&history), v(&["second"]));
         history.images.push(Img {
             id: 1,
-            png: vec![],
+            png: Some(vec![]),
+            path: std::path::PathBuf::new(),
             w: 1,
             h: 1,
             at: 0,
         });
         history.images.push(Img {
             id: 2,
-            png: vec![],
+            png: Some(vec![]),
+            path: std::path::PathBuf::new(),
             w: 1,
             h: 1,
             at: 0,
@@ -471,19 +699,43 @@ mod tests {
     fn mime_choice() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();
         assert_eq!(
-            pick_mime(&v(&["image/png", "text/plain", "text/plain;charset=utf-8"])).as_deref(),
+            pick_mime(
+                &v(&["image/png", "text/plain", "text/plain;charset=utf-8"]),
+                false
+            )
+            .as_deref(),
             Some("text/plain;charset=utf-8")
         );
-        assert_eq!(pick_mime(&v(&["STRING"])).as_deref(), Some("STRING"));
-        assert!(pick_mime(&v(&["image/png"])).is_none());
+        assert_eq!(pick_mime(&v(&["STRING"]), false).as_deref(), Some("STRING"));
+        assert!(pick_mime(&v(&["image/png"]), false).is_none());
     }
     #[test]
     fn password_manager_copies_are_skipped() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();
-        assert!(pick_mime(&v(&["text/plain", "x-kde-passwordManagerHint"])).is_none());
-        assert!(pick_mime(&v(&["text/plain", "vicinae/concealed"])).is_none());
-        assert!(pick_image(&v(&["image/png", "vicinae/concealed"])).is_none());
+        assert!(pick_mime(&v(&["text/plain", "x-kde-passwordManagerHint"]), false).is_none());
+        assert!(pick_mime(&v(&["text/plain", "vicinae/concealed"]), false).is_none());
+        assert!(pick_image(&v(&["image/png", "vicinae/concealed"]), false).is_none());
     }
+    #[test]
+    fn password_storage_requires_explicit_opt_in_for_text_html_and_images() {
+        for hint in [SENSITIVE_MIME, "vicinae/concealed"] {
+            for mime in ["text/plain", "text/html"] {
+                let offer = v(&[mime, hint]);
+                assert_eq!(pick_mime(&offer, false), None);
+                assert_eq!(pick_mime(&offer, true).as_deref(), Some(mime));
+                assert_eq!(pick_image(&offer, true), None);
+            }
+            let mixed = v(&["image/png", "text/plain", hint]);
+            assert_eq!(pick_image(&mixed, false), None);
+            assert_eq!(pick_mime(&mixed, false), None);
+            assert_eq!(pick_image(&mixed, true).as_deref(), Some("image/png"));
+            let offer = v(&["image/png", hint]);
+            assert_eq!(pick_image(&offer, false), None);
+            assert_eq!(pick_image(&offer, true).as_deref(), Some("image/png"));
+            assert_eq!(pick_mime(&offer, true), None);
+        }
+    }
+
     #[test]
     fn images_are_checked_and_bounded() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();
@@ -495,10 +747,16 @@ mod tests {
         let mut h = History::new(5);
         assert!(h.push_image(&png));
         assert!(!h.push_image(b"not a png at all, just some bytes here"));
-        assert!(h.push_image(&png) && h.images.len() == 1);
-        assert_eq!(pick_image(&v(&["image/png"])).as_deref(), Some("image/png"));
-        assert!(pick_image(&v(&["image/png", "text/plain"])).is_none());
-        assert!(pick_image(&v(&["image/png", "x-kde-passwordManagerHint"])).is_none());
+        assert!(!h.push_image(&png) && h.images.len() == 1);
+        assert_eq!(
+            pick_image(&v(&["image/png"]), false).as_deref(),
+            Some("image/png")
+        );
+        assert_eq!(
+            pick_image(&v(&["image/png", "text/plain"]), false).as_deref(),
+            Some("image/png")
+        );
+        assert!(pick_image(&v(&["image/png", "x-kde-passwordManagerHint"]), false).is_none());
         h.clear();
         assert!(h.images.is_empty());
     }
@@ -542,20 +800,23 @@ mod tests {
         let l = History::load_from(&d, 9);
         assert_eq!(texts(&l), texts(&h));
         assert_eq!(l.images.len(), 1);
-        assert_eq!(l.images[0].png, h.images[0].png);
+        assert_eq!(l.images[0].bytes(), h.images[0].bytes());
         assert_eq!(l.images[0].id, h.images[0].id);
         let _ = std::fs::remove_dir_all(&d);
     }
     #[test]
     fn html_copies_become_plain_text() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();
-        assert_eq!(pick_mime(&v(&["text/html"])).as_deref(), Some("text/html"));
         assert_eq!(
-            pick_mime(&v(&["text/html", "x-kde-passwordManagerHint"])).as_deref(),
+            pick_mime(&v(&["text/html"]), false).as_deref(),
+            Some("text/html")
+        );
+        assert_eq!(
+            pick_mime(&v(&["text/html", "x-kde-passwordManagerHint"]), false).as_deref(),
             None
         );
         assert_eq!(
-            pick_mime(&v(&["text/html", "text/plain"])).as_deref(),
+            pick_mime(&v(&["text/html", "text/plain"]), false).as_deref(),
             Some("text/plain")
         );
         assert_eq!(
@@ -608,26 +869,83 @@ mod tests {
         assert!(!h.push_image(&image));
     }
     #[test]
-    fn image_limit_and_dedup_keep_newest_copies_first() {
-        let mut h = History::new(1);
-        for width in 1..=(MAX_IMAGES as u32 + 1) {
+    fn image_cap_matches_the_history_limit() {
+        // zlaunch bounds images by the same max as text, not a smaller cap.
+        let mut h = History::new(3);
+        for width in 1..=5 {
             assert!(h.push_image(&png(width, 1)));
         }
         assert_eq!(
             h.images.iter().map(|i| i.w).collect::<Vec<_>>(),
-            (2..=(MAX_IMAGES as u32 + 1)).rev().collect::<Vec<_>>()
+            vec![5, 4, 3]
         );
-        assert!(h.push_image(&png(3, 1)));
-        assert_eq!(
-            h.images.iter().map(|i| i.w).collect::<Vec<_>>(),
-            std::iter::once(3)
-                .chain((2..=(MAX_IMAGES as u32 + 1)).rev().filter(|w| *w != 3))
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(h.images.len(), MAX_IMAGES);
         let before = h.images.iter().map(|i| i.id).collect::<Vec<_>>();
         assert!(!h.push_image(&vec![0; MAX_IMAGE + 1]));
         assert_eq!(h.images.iter().map(|i| i.id).collect::<Vec<_>>(), before);
+    }
+    #[test]
+    fn history_bound_spans_text_and_images() {
+        // zlaunch's single deque drops the globally oldest copy past the
+        // limit, whatever its content kind.
+        let mut h = History::new(3);
+        assert!(h.push("one"));
+        assert!(h.push_image(&png(1, 1)));
+        assert!(h.push("two"));
+        assert!(h.push_image(&png(2, 1)));
+        assert_eq!(texts(&h), vec!["two"]);
+        assert_eq!(h.images.iter().map(|i| i.w).collect::<Vec<_>>(), vec![2, 1]);
+        assert!(!h.push_image(&png(2, 1)));
+        assert!(h.push("three"));
+        assert_eq!(texts(&h), vec!["three", "two"]);
+        assert_eq!(h.images.iter().map(|i| i.w).collect::<Vec<_>>(), vec![2]);
+    }
+    #[test]
+    fn dedup_compares_only_the_latest_copy_across_kinds() {
+        let mut h = History::new(9);
+        assert!(h.push_image(&png(1, 1)));
+        assert!(h.push("break"));
+        // The same image again is no longer consecutive, so it is kept.
+        assert!(h.push_image(&png(1, 1)));
+        assert_eq!(h.images.len(), 2);
+        assert!(!h.push_image(&png(1, 1)));
+        assert!(h.push_files("/tmp/a"));
+        assert!(!h.push_files("/tmp/a"));
+        // A file-path copy and plain text are different content kinds.
+        assert!(h.push("/tmp/a"));
+        assert!(!h.push("/tmp/a"));
+        assert_eq!(texts(&h), vec!["/tmp/a", "/tmp/a", "break"]);
+    }
+    #[test]
+    fn stored_images_load_their_bytes_on_demand() {
+        let d = tempfile::tempdir().unwrap();
+        let mut h = History::new(3);
+        assert!(h.push_image(&png(1, 1)));
+        h.save_to(d.path());
+        let l = History::load_from(d.path(), 3);
+        assert_eq!(l.images.len(), 1);
+        assert!(l.images[0].png.is_none());
+        assert_eq!(l.images[0].bytes(), h.images[0].bytes());
+        // A damaged store reads as unavailable instead of loading garbage.
+        std::fs::write(d.path().join(format!("{}.png", l.images[0].id)), b"corrupt").unwrap();
+        assert_eq!(l.images[0].bytes(), None);
+    }
+    #[test]
+    fn only_consecutive_duplicates_are_dropped() {
+        let mut h = History::new(9);
+        assert!(h.push("same"));
+        assert!(!h.push("same"));
+        assert!(h.push("other"));
+        assert!(h.push("same"));
+        assert_eq!(texts(&h), vec!["same", "other", "same"]);
+        let mut h = History::new(9);
+        assert!(h.push_image(&png(1, 1)));
+        assert!(!h.push_image(&png(1, 1)));
+        assert!(h.push_image(&png(2, 1)));
+        assert!(h.push_image(&png(1, 1)));
+        assert_eq!(
+            h.images.iter().map(|i| i.w).collect::<Vec<_>>(),
+            vec![1, 2, 1]
+        );
     }
     #[test]
     fn concealed_hints_override_every_supported_mime_order() {
@@ -643,13 +961,13 @@ mod tests {
         for hint in [SENSITIVE_MIME, "vicinae/concealed"] {
             for format in formats {
                 for mimes in [v(&[hint, format]), v(&[format, hint])] {
-                    assert_eq!(pick_mime(&mimes), None, "{mimes:?}");
-                    assert_eq!(pick_image(&mimes), None, "{mimes:?}");
+                    assert_eq!(pick_mime(&mimes, false), None, "{mimes:?}");
+                    assert_eq!(pick_image(&mimes, false), None, "{mimes:?}");
                 }
             }
         }
-        assert_eq!(pick_mime(&[]), None);
-        assert_eq!(pick_image(&[]), None);
+        assert_eq!(pick_mime(&[], false), None);
+        assert_eq!(pick_image(&[], false), None);
     }
     #[test]
     fn malformed_text_records_are_skipped_and_load_obeys_limit() {
@@ -661,7 +979,8 @@ mod tests {
             h.entries,
             vec![Clip {
                 text: "new\nline".into(),
-                at: 3
+                at: 3,
+                files: false,
             }]
         );
         assert!(h.images.is_empty());
@@ -691,7 +1010,7 @@ mod tests {
     fn deleting_one_entry_keeps_other_entries_and_persists_the_change() {
         use crate::items::Action;
         let d = tempfile::tempdir().unwrap();
-        let mut h = History::new(3);
+        let mut h = History::new(4);
         assert!(h.push("first"));
         assert!(h.push("second"));
         assert!(h.push_image(&png(1, 1)));
@@ -717,7 +1036,7 @@ mod tests {
             loaded.images.iter().map(|i| i.id).collect::<Vec<_>>(),
             vec![image_ids[1]]
         );
-        assert_eq!(loaded.images[0].png, h.images[0].png);
+        assert_eq!(loaded.images[0].bytes(), h.images[0].bytes());
     }
     #[test]
     fn non_clipboard_actions_cannot_remove_history() {

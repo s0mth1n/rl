@@ -6,6 +6,10 @@ mod dates;
 #[path = "../src/hist.rs"]
 mod hist;
 
+#[path = "../src/app_cache.rs"]
+mod app_cache;
+#[path = "../src/calculator.rs"]
+mod calculator;
 #[path = "../src/clip.rs"]
 mod clip;
 #[path = "../src/config.rs"]
@@ -16,11 +20,20 @@ mod icons;
 mod input;
 #[path = "../src/items.rs"]
 mod items;
+#[path = "../src/scorer.rs"]
+#[allow(dead_code)]
+mod scorer;
+#[path = "../src/scroll.rs"]
+mod scroll;
+#[path = "../src/system_actions.rs"]
+mod system_actions;
 #[cfg(test)]
 #[path = "../src/testutil.rs"]
 mod testutil;
 #[path = "../src/ui.rs"]
 mod ui;
+#[path = "../src/web_search.rs"]
+mod web_search;
 #[path = "../src/windows.rs"]
 #[allow(dead_code)]
 mod windows;
@@ -116,21 +129,28 @@ fn main() {
     let rows = search.run("firefox");
     let h = ui::PANEL_HEIGHT;
     let view = ui::View {
+        theme_palettes: None,
+        placeholder: None,
+        literal_prefix: false,
         query: "firefox",
+        input_text: None,
+        marked: None,
         input: None,
         items: &rows,
         sel: 0,
         top: 0,
+        scroll_remainder: 0.0,
         vp: ui::LIST_VP,
         theme: cfg.theme(),
         w: 640,
         h,
         scale: 1,
         font_size: 15.0,
+        mono_font_family: None,
         icons: &cache,
         bold_font: None,
         back: false,
-        show_scrollbar: true,
+        scrollbar: crate::scroll::Style::visible(),
     };
     let mut samples = Vec::new();
     let mut last = ui::Canvas::new(640, h);

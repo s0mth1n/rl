@@ -1,4 +1,8 @@
 //! zl: a small Wayland launcher. One daemon, a unix socket, a layer-shell panel drawn on the CPU.
+mod app_cache;
+mod app_watch;
+mod calculator;
+mod cli;
 mod clip;
 mod clipboard_ui;
 mod config;
@@ -6,17 +10,23 @@ mod config;
 mod dates;
 #[allow(dead_code)]
 mod hist;
+mod hyprland_blur;
 mod icons;
+mod ime;
 mod input;
+mod input_menu;
 mod items;
 mod keys;
+mod launch;
+mod modes;
+mod scorer;
+mod scroll;
+mod system_actions;
 #[cfg(test)]
 mod testutil;
 mod ui;
+mod web_search;
 mod windows;
-
-/// A keyboard Leave that is not followed by an Enter within this long hides the panel.
-const FOCUS_GRACE: Duration = Duration::from_millis(250);
 
 use config::Config;
 use items::{Action, App as DesktopApp, Item, Search};
@@ -43,6 +53,10 @@ use wayland_client::protocol::{
 };
 use wayland_client::Proxy;
 use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle, WEnum};
+use wayland_protocols::wp::text_input::zv3::client::{
+    zwp_text_input_manager_v3::ZwpTextInputManagerV3,
+    zwp_text_input_v3::{self, ZwpTextInputV3},
+};
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
@@ -76,6 +90,41 @@ fn backdrop_buffer_size(width: u32, height: u32, viewport: bool) -> Option<(u32,
     (bytes <= 256 * 1024 * 1024).then_some((w, h, bytes))
 }
 
+fn explicit_window_size(cfg: &Config, panel_height: u32) -> Option<(u32, u32)> {
+    let (w, h) = cfg.window_size?;
+    if !cfg.enable_backdrop || !w.is_finite() || !h.is_finite() {
+        return None;
+    }
+    Some((
+        w.max(cfg.width as f32).ceil().min(i32::MAX as f32) as u32,
+        h.max(panel_height as f32).ceil().min(i32::MAX as f32) as u32,
+    ))
+}
+
+fn default_backdrop_size() -> (u32, u32) {
+    let kwin = std::env::var_os("KDE_SESSION_VERSION").is_some()
+        && std::process::Command::new("timeout")
+            .args([
+                "1",
+                "gdbus",
+                "call",
+                "--session",
+                "--dest",
+                "org.kde.KWin",
+                "--object-path",
+                "/KWin",
+                "--method",
+                "org.kde.KWin.supportInformation",
+            ])
+            .output()
+            .is_ok_and(|out| out.status.success());
+    if kwin {
+        (1920, 1080)
+    } else {
+        (5680, 4320)
+    }
+}
+
 fn panel_position(width: u32, height: u32, panel_width: u32, panel_height: u32) -> (i32, i32) {
     (
         ((width as i64 - panel_width as i64) / 2) as i32,
@@ -91,22 +140,32 @@ struct Out {
 
 struct App {
     cfg: Config,
+    modes: modes::State,
     theme: config::Theme,
+    saved_theme_name: String,
     icons: icons::Cache,
     font: Font<'static>,
+    font_size: f32,
+    mono_font_family: Option<String>,
     bold_font: Option<Font<'static>>,
     apps: Vec<DesktopApp>,
     windows: Vec<windows::Window>,
     items: Vec<Item>,
     query: String,
     edit: input::Edit,
+    ime: ime::State,
+    text_manager: Option<ZwpTextInputManagerV3>,
+    text_input: Option<ZwpTextInputV3>,
+    text_focus: Option<WlSurface>,
+    text_commits: u32,
+    text_waiting: bool,
+    text_snapshot: Option<ime::Snapshot>,
     caret_visible: bool,
     caret_next: Instant,
     sel: usize,
     top: usize,
-    /// Last wheel or keyboard scroll; the scrollbar thumb shows for a second
-    /// after it, as zlaunch's auto-hiding scrollbar does.
-    last_scroll: Option<Instant>,
+    scroll_remainder: f32,
+    scrollbar: scroll::State,
     shown: bool,
     configured: bool,
     cur_h: u32,
@@ -115,21 +174,23 @@ struct App {
     repeat_rate: i32,
     repeat_delay: i32,
     repeating: Option<(u32, Instant)>,
-    /// When the keyboard left the panel. It hides if focus has not come back shortly after.
-    left_at: Option<Instant>,
     /// Last pointer position on the panel, in surface pixels. Hover never moves the selection.
     pointer: Option<(f64, f64)>,
     pointer_on_backdrop: bool,
     last_click: Option<(usize, Instant)>,
-    /// The combined-view query to restore on the back arrow, saved when a
-    /// sub-view (emoji, clipboard) is entered from the main list.
+    /// A discrete wheel step arrived in this frame; the release scrolls 1.3x for those.
+    wheel_discrete: bool,
+    /// A sub-view was entered from the combined list, so show a back arrow.
     origin: Option<String>,
     input_drag: bool,
+    input_menu: Option<input_menu::Menu>,
     input_click: Option<(Instant, u8, f64, f64)>,
     settings_error: Option<String>,
     hist: hist::Hist,
     /// A picker selection is previewing a theme that is not saved yet.
     previewing: bool,
+    theme_catalog: Option<Vec<Item>>,
+    theme_palettes: std::collections::HashMap<String, config::Theme>,
     compositor: Option<WlCompositor>,
     subcompositor: Option<WlSubcompositor>,
     viewporter: Option<WpViewporter>,
@@ -160,49 +221,107 @@ struct PipeRead {
     started: Instant,
     image: bool,
     html: bool,
+    files: bool,
 }
 
 impl App {
+    fn view_query(&self) -> &str {
+        if self.modes.current().routes_prefixes() {
+            &self.query
+        } else {
+            ""
+        }
+    }
+
+    fn layout(&self) -> ui::Layout {
+        let mut layout = ui::Layout::new(&self.theme.metrics);
+        if self.view_query().starts_with(';') {
+            layout = ui::Layout::clipboard(&self.theme.metrics);
+        }
+        layout
+    }
+
     fn columns(&self) -> usize {
-        if self.query.starts_with(':') {
-            ui::emoji_columns(self.cfg.width)
+        if self.view_query().starts_with(':') {
+            self.layout().emoji_columns(self.cfg.width)
         } else {
             1
         }
     }
 
-    fn emoji_rows(&self) -> usize {
-        ui::emoji_rows(self.items.len(), self.cfg.width)
-    }
-
     fn vp(&self) -> f32 {
-        // The fixed panel gives every view the same viewport; the emoji grid
-        // clips a partial row at its bottom like zlaunch's vlist does.
-        ui::LIST_VP
+        if self.cfg.launcher_size.is_none() {
+            return ui::LIST_VP;
+        }
+        (self.panel_height() as f32 - ui::HEAD - ui::LIST_PAD * 2.0).max(0.0)
     }
 
     /// zlaunch fixes every panel at `launcher_size` (default 600x400), so the
     /// panel height never follows the content (zlaunch render.rs applies the
     /// configured size unconditionally).
     fn panel_height(&self) -> u32 {
-        ui::PANEL_HEIGHT
+        self.cfg
+            .launcher_size
+            .map(|_| self.cfg.panel_size().1)
+            .unwrap_or(ui::PANEL_HEIGHT)
     }
 
     fn refresh(&mut self) {
         // Typing away the sub-view prefix also leaves the sub-view.
-        if self.origin.is_some() && !self.query.starts_with([':', ';', '#']) {
+        if self.origin.is_some() && !self.view_query().starts_with([':', ';', '#']) {
             self.origin = None;
         }
+        self.edit.literal_prefix = !self.modes.current().routes_prefixes();
         self.edit.sync(&self.query);
+        let mut cfg = self.cfg.clone();
+        if let modes::Mode::Module(module) = self.modes.current() {
+            cfg.combined_modules = Some(vec![module]);
+            cfg.disabled_modules = None;
+        }
         let s = Search {
-            cfg: &self.cfg,
+            cfg: &cfg,
             apps: &self.apps,
             windows: &self.windows,
             history: &self.clip,
         };
-        self.items = s.run(&self.query);
+        if let Some(filter) = self
+            .query
+            .strip_prefix('#')
+            .filter(|_| self.modes.current().routes_prefixes())
+        {
+            let catalog = self
+                .theme_catalog
+                .get_or_insert_with(|| items::theme_items(&self.cfg, ""));
+            if self.theme_palettes.is_empty() {
+                self.theme_palettes = catalog
+                    .iter()
+                    .filter_map(|item| {
+                        config::load_theme(&item.title).map(|theme| (item.title.clone(), theme))
+                    })
+                    .collect();
+            }
+            let filter = filter.to_lowercase();
+            self.items = catalog
+                .iter()
+                .filter(|item| {
+                    item.title.to_lowercase().contains(&filter)
+                        || item.sub.to_lowercase().contains(&filter)
+                })
+                .cloned()
+                .collect();
+        } else {
+            self.theme_catalog = None;
+            self.theme_palettes.clear();
+            self.items = if self.modes.current().routes_prefixes() {
+                s.run(&self.query)
+            } else {
+                s.run_mode(&self.query, false)
+            };
+        }
         self.sel = 0;
         self.top = 0;
+        self.scroll_remainder = 0.0;
+        self.scrollbar = scroll::State::default();
         if let Some(message) = self.settings_error.take() {
             self.items.insert(
                 0,
@@ -219,33 +338,127 @@ impl App {
     }
 
     fn ensure_visible(&mut self) {
-        let before = self.top;
-        if self.query.starts_with(':') {
-            let columns = self.columns();
-            let rows = self.emoji_rows();
-            let selected_row = self.sel / columns;
-            let mut top_row = self.top / columns;
-            if selected_row < top_row {
-                top_row = selected_row;
-            }
-            if selected_row >= top_row + rows {
-                top_row = selected_row + 1 - rows;
-            }
-            self.top =
-                top_row.min(self.items.len().div_ceil(columns).saturating_sub(rows)) * columns;
+        let (start, height) = if self.view_query().starts_with(':') {
+            (
+                (self.sel / self.columns()) as f32 * self.layout().cell,
+                self.layout().cell,
+            )
         } else {
-            // zlaunch scrolls the selected row to the top of the list
-            // (gpui ScrollStrategy::Top), clamped to the last full page.
-            self.top = self.sel.min(ui::max_top(&self.items, self.vp()));
-        }
-        if self.top != before {
-            self.last_scroll = Some(Instant::now());
+            (
+                self.layout().scroll_item_y(
+                    &self.items,
+                    self.sel,
+                    self.view_query().starts_with(';'),
+                ),
+                self.layout().row,
+            )
+        };
+        let current = self.scrollbar_geometry().map_or(0.0, |g| {
+            if self.view_query().starts_with(':') {
+                (self.top / self.columns()) as f32 * self.layout().cell + self.scroll_remainder
+            } else {
+                self.layout().scroll_offset(
+                    &self.items,
+                    self.top,
+                    self.view_query().starts_with(';'),
+                ) + self.scroll_remainder
+            }
+            .min(g.content - g.viewport)
+        });
+        if self.sel == 0 || start < current {
+            self.scroll_to_offset(start);
+        } else if start + height > current + self.vp() {
+            self.scroll_to_offset(start + height - self.vp());
         }
     }
 
     fn pause_caret(&mut self) {
         self.caret_visible = true;
         self.caret_next = Instant::now() + Duration::from_millis(300);
+    }
+
+    /// Open a view by its query prefix after `show`, as `show -m emojis` does.
+    /// Mode names from `show -m`; empty goes back to the configured default modes.
+    fn set_modes(&mut self, names: &str) {
+        let names: Vec<String> = names
+            .split(',')
+            .filter(|n| !n.is_empty())
+            .map(String::from)
+            .collect();
+        self.modes = if names.is_empty() {
+            modes::State::new(self.cfg.default_modes.as_deref())
+        } else {
+            modes::State::new(Some(&names))
+        };
+    }
+
+    fn setup_text_input(&mut self, qh: &QueueHandle<App>) {
+        if self.text_input.is_none() {
+            if let (Some(manager), Some(seat)) = (&self.text_manager, &self.seat) {
+                self.text_input = Some(manager.get_text_input(seat, qh, ()));
+            }
+        }
+    }
+
+    fn update_text_input(&mut self, from_ime: bool) {
+        if !self.shown || self.text_focus.is_none() || self.text_waiting {
+            return;
+        }
+        let Some(input) = &self.text_input else {
+            return;
+        };
+        let surrounding = ime::surrounding_with_prefix(
+            &self.query,
+            self.edit.caret,
+            self.edit.anchor.unwrap_or(self.edit.caret),
+            self.edit.prefix_len(&self.query),
+        );
+        let display = self.ime.display(&self.query, &self.edit);
+        let (shown, caret) = display
+            .as_ref()
+            .map_or((self.query.as_str(), self.edit.caret), |d| {
+                (d.text.as_str(), d.caret)
+            });
+        let (mut x, mut y, width, height) =
+            ui::input_cursor_rectangle(&self.font, self.view_query(), shown, caret, self.cfg.width);
+        if self
+            .backdrop
+            .as_ref()
+            .is_some_and(|b| self.text_focus.as_ref() == Some(&b.surface))
+        {
+            let b = self.backdrop.as_ref().unwrap();
+            let (px, py) = panel_position(b.width, b.height, self.cfg.width, self.cur_h);
+            x += px;
+            y += py;
+        }
+        let rect = (x, y, width, height);
+        let snapshot = ime::Snapshot { surrounding, rect };
+        if self.text_snapshot.as_ref() == Some(&snapshot) {
+            return;
+        }
+        if self
+            .text_snapshot
+            .as_ref()
+            .is_some_and(|old| old.surrounding.is_some() != snapshot.surrounding.is_some())
+        {
+            input.enable();
+        }
+        if let Some((text, cursor, anchor)) = &snapshot.surrounding {
+            input.set_surrounding_text(text.clone(), *cursor, *anchor);
+        }
+        input.set_text_change_cause(if from_ime {
+            zwp_text_input_v3::ChangeCause::InputMethod
+        } else {
+            zwp_text_input_v3::ChangeCause::Other
+        });
+        input.set_content_type(
+            zwp_text_input_v3::ContentHint::None,
+            zwp_text_input_v3::ContentPurpose::Normal,
+        );
+        input.set_cursor_rectangle(x, y, width, height);
+        input.commit();
+        self.text_commits = self.text_commits.wrapping_add(1);
+        self.text_snapshot = Some(snapshot);
     }
 
     fn show(&mut self, qh: &QueueHandle<App>) {
@@ -256,11 +469,26 @@ impl App {
         if self.compositor.is_none() || self.shell.is_none() {
             return;
         }
-        self.apps = items::scan_apps(&self.cfg);
-        self.windows = windows::scan();
+        self.apps = app_cache::load(&self.cfg);
+        self.windows = if self
+            .cfg
+            .combined_modules()
+            .contains(&config::ConfigModule::Windows)
+        {
+            windows::scan()
+        } else {
+            vec![]
+        };
+        // zlaunch uses compositor-provided icon pixels when they exist.
+        for window in &self.windows {
+            if let Some(png) = &window.icon_data {
+                self.icons.set_window_icon(&window.address, png.clone());
+            }
+        }
         self.last_click = None;
         self.pointer = None;
-        self.query.clear();
+        self.query = self.modes.current().prefix().into();
+        self.origin = None;
         self.refresh();
         let (Some(c), Some(sh)) = (&self.compositor, &self.shell) else {
             return;
@@ -313,7 +541,15 @@ impl App {
         };
         let l = sh.get_layer_surface(&root, out, layer, "zl".into(), qh, ());
         if self.backdrop.is_some() {
-            l.set_size(0, 0);
+            let (width, height) =
+                explicit_window_size(&self.cfg, self.cur_h).unwrap_or_else(|| {
+                    if self.backdrop.as_ref().is_some_and(|b| b.viewport.is_some()) {
+                        default_backdrop_size()
+                    } else {
+                        (0, 0)
+                    }
+                });
+            l.set_size(width, height);
             l.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
             l.set_exclusive_zone(-1);
         } else {
@@ -331,11 +567,24 @@ impl App {
     }
 
     fn hide(&mut self) {
+        self.theme_catalog = None;
+        self.theme_palettes.clear();
+        self.input_menu = None;
+        self.ime.clear();
+        self.text_snapshot = None;
+        if self.text_focus.take().is_some() {
+            if let Some(input) = &self.text_input {
+                input.disable();
+                input.commit();
+                self.text_commits = self.text_commits.wrapping_add(1);
+            }
+        }
         self.repeating = None;
-        self.left_at = None;
 
         self.pointer_on_backdrop = false;
         self.pointer = None;
+        self.scrollbar = scroll::State::default();
+        self.input_drag = false;
         if let Some(b) = self.backdrop.as_ref() {
             b.panel.destroy();
         }
@@ -371,7 +620,6 @@ impl App {
             return;
         }
         self.sync_theme_preview();
-        self.ensure_visible();
         let h = self.panel_height();
         if h != self.cur_h {
             self.cur_h = h;
@@ -386,19 +634,27 @@ impl App {
         }
         let s = self.scale;
         let vp = self.vp();
-        let (visible, icon_size): (Vec<usize>, u32) = if self.query.starts_with(':') {
+        let (visible, icon_size): (Vec<usize>, u32) = if self.view_query().starts_with(':') {
             (
-                (self.top..(self.top + self.emoji_rows() * self.columns()).min(self.items.len()))
+                (self.top
+                    ..(self.top
+                        + ((self.vp() + self.scroll_remainder) / self.layout().cell).ceil()
+                            as usize
+                            * self.columns())
+                    .min(self.items.len()))
                     .collect(),
-                ui::emoji_icon_px(s),
+                (self.theme.metrics.emoji_font_size * s as f32)
+                    .round()
+                    .max(1.0) as u32,
             )
         } else {
             (
-                ui::slots(&self.items, self.top, vp)
+                self.layout()
+                    .slots(&self.items, self.top, vp + self.scroll_remainder)
                     .iter()
                     .filter_map(|x| x.item)
                     .collect(),
-                ui::icon_px(s),
+                ui::icon_px(&self.theme, s),
             )
         };
         for i in visible {
@@ -407,38 +663,66 @@ impl App {
             }
         }
         self.icons.ensure_input(s);
+        if self.view_query().starts_with(';') && self.origin.is_none() {
+            self.icons.ensure("phosphor:copy", 16 * s);
+        }
         if let Some(b) = &self.backdrop {
             let (x, y) = panel_position(b.width, b.height, self.cfg.width, h);
             b.panel.set_position(x, y);
             b.surface.commit();
         }
+        let Some((physical_w, physical_h, _)) = self
+            .cfg
+            .width
+            .checked_mul(s)
+            .zip(h.checked_mul(s))
+            .and_then(|(w, h)| backdrop_buffer_size(w, h, false))
+        else {
+            eprintln!("zl: panel buffer exceeds 256 MiB or has invalid dimensions");
+            self.hide();
+            return;
+        };
+        self.update_text_input(false);
         let Some(surf) = &self.surface else { return };
-        let mut cv = ui::Canvas::new(self.cfg.width * s, h * s);
+        let mut cv = ui::Canvas::new(physical_w, physical_h);
+        let composition = self.ime.display(&self.query, &self.edit);
+        let (caret, anchor, visible) = composition.as_ref().map_or(
+            (self.edit.caret, self.edit.anchor, self.caret_visible),
+            |d| (d.caret, d.anchor, !d.hidden),
+        );
         let v = ui::View {
+            theme_palettes: Some(&self.theme_palettes),
             icons: &self.icons,
             query: &self.query,
-            input: Some((self.edit.caret, self.edit.anchor, self.caret_visible)),
+            literal_prefix: !self.modes.current().routes_prefixes(),
+            placeholder: Some(self.modes.current().placeholder()),
+            input_text: composition.as_ref().map(|d| d.text.as_str()),
+            marked: composition.as_ref().map(|d| d.marked.clone()),
+            input: Some((caret, anchor, visible)),
             items: &self.items,
             sel: self.sel,
             top: self.top,
+            scroll_remainder: self.scroll_remainder,
             vp,
             theme: self.theme,
             w: self.cfg.width,
             h,
             scale: s,
-            font_size: self.cfg.font_size,
+            font_size: self.font_size,
+            mono_font_family: self.mono_font_family.as_deref(),
             bold_font: self.bold_font.as_ref(),
             back: self.origin.is_some(),
-            show_scrollbar: self
-                .last_scroll
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(1)),
+            scrollbar: self.scrollbar.style(),
         };
-        if self.query.starts_with(';') {
+        if self.view_query().starts_with(';') {
             clipboard_ui::draw(&mut cv, &self.font, &v, &self.clip);
         } else {
             ui::draw(&mut cv, &self.font, &v);
         }
 
+        if let Some(menu) = &self.input_menu {
+            menu.draw(&mut cv, &self.font, self.scale);
+        }
         let size = cv.buf.len();
         let fd = unsafe { libc::memfd_create(c"zl".as_ptr(), 0) };
         if fd < 0 {
@@ -516,7 +800,7 @@ impl App {
     /// Live theme preview: in the picker the selected row recolours the panel, like
     /// zlaunch's theme mode. Leaving the picker without Enter restores the saved theme.
     fn sync_theme_preview(&mut self) {
-        let picked = if items::theme_view(&self.query) {
+        let picked = if items::theme_view(self.view_query()) {
             self.items.get(self.sel).and_then(|it| match &it.action {
                 Action::Theme(name) => Some(name.clone()),
                 _ => None,
@@ -526,12 +810,17 @@ impl App {
         };
         match picked {
             Some(name) => {
-                let mut cfg = self.cfg.clone();
-                cfg.theme = name;
-                self.theme = cfg.theme();
+                self.theme = self
+                    .theme_palettes
+                    .get(&name)
+                    .copied()
+                    .unwrap_or_else(|| config::theme(&name));
+                if !self.cfg.enable_transparency {
+                    self.theme.bg_alpha = 1.0;
+                }
                 self.previewing = true;
             }
-            None if self.previewing && !items::theme_view(&self.query) => {
+            None if self.previewing && !items::theme_view(self.view_query()) => {
                 self.theme = self.cfg.theme();
                 self.previewing = false;
             }
@@ -542,7 +831,7 @@ impl App {
     fn activate(&mut self, qh: &QueueHandle<App>) {
         let picked = self.items.get(self.sel).cloned();
         let Some(it) = picked else {
-            if items::theme_view(&self.query) {
+            if items::theme_view(self.view_query()) {
                 self.query.clear();
                 self.refresh();
                 self.redraw(qh);
@@ -551,41 +840,51 @@ impl App {
         };
         if matches!(
             it.action,
-            Action::App(_) | Action::Clip(_) | Action::ClipImg(_)
+            Action::App(_) | Action::Clip(_) | Action::ClipFiles(_) | Action::ClipImg(_)
         ) {
             let key = items::key_of(&it);
             self.hist.record(&key);
         }
         match it.action {
-            Action::Window(id) => match windows::focus(id) {
-                Ok(()) => self.hide(),
-                Err(error) => {
-                    self.settings_error = Some(format!("Could not focus window: {error}"));
-                    self.refresh();
-                    self.redraw(qh);
+            Action::WebSearch(url) => {
+                self.hide();
+                if let Err(error) = web_search::open(&url) {
+                    eprintln!("zl: failed to open search URL: {error}");
                 }
-            },
+            }
+            Action::System(action) => {
+                self.hide();
+                if let Err(error) = action.execute() {
+                    eprintln!("zl: failed to execute action: {error}");
+                }
+            }
+            Action::Calculate(result) => {
+                self.hide();
+                self.set_clipboard(result.text_for_clipboard().as_bytes(), false, qh);
+            }
+            Action::Window(id) => {
+                if let Err(error) = windows::focus(&id) {
+                    eprintln!("zl: failed to focus window: {error}");
+                }
+                self.hide();
+            }
             Action::App(i) => {
                 self.hide();
                 let a = &self.apps[i];
-                let mut cmd = items::exec_line(&a.exec);
-                if a.terminal {
-                    cmd = format!("{} {}", self.cfg.terminal, cmd);
+                if let Err(error) = launch::application(&a.exec, a.terminal) {
+                    eprintln!("zl: failed to launch application: {error}");
                 }
-                launch_application(&cmd);
             }
-            Action::Clip(t) => {
-                if self.query.starts_with(':') && emojis::get(&t).is_some() {
-                    hist::emoji_add(&t);
-                }
+            Action::Clip(t) | Action::ClipFiles(t) => {
                 self.hide();
                 self.set_clipboard(t.as_bytes(), false, qh);
             }
             Action::ClipImg(id) => {
                 if let Some(image) = self.clip.images.iter().find(|i| i.id == id) {
-                    let png = image.png.clone();
-                    self.hide();
-                    self.set_clipboard(&png, true, qh);
+                    if let Some(png) = image.bytes() {
+                        self.hide();
+                        self.set_clipboard(&png, true, qh);
+                    }
                 }
             }
             Action::View(view) => {
@@ -599,27 +898,92 @@ impl App {
                 self.redraw(qh);
             }
             Action::Theme(name) => {
-                if config::set_theme(&mut self.cfg, &name) {
-                    // The saved theme stays on; back to the root list, like zlaunch.
-                    self.previewing = false;
-                    self.theme = self.cfg.theme();
-                    self.query.clear();
-                } else {
-                    self.settings_error = Some("Could not save settings".into());
-                }
+                config::set_theme(&mut self.cfg, &name);
+                self.saved_theme_name = name.clone();
+                self.previewing = false;
+                self.theme = self.cfg.theme();
+                self.query.clear();
                 self.refresh();
                 self.redraw(qh);
             }
         }
     }
 
+    fn input_command(&mut self, command: usize) {
+        let selected = self
+            .edit
+            .range()
+            .map(|r| self.query[r].to_string())
+            .unwrap_or_default();
+        match command {
+            0 | 1 => {
+                if !selected.is_empty() && copy_input_text(&selected) && command == 0 {
+                    self.edit.replace(&mut self.query, "");
+                    self.refresh();
+                }
+            }
+            2 => {
+                if let Ok(out) = std::process::Command::new("timeout")
+                    .args(["1", "wl-paste", "--no-newline", "--type", "text"])
+                    .output()
+                {
+                    if out.status.success() {
+                        let text = input::paste_text(&String::from_utf8_lossy(&out.stdout));
+                        self.edit.replace(&mut self.query, &text);
+                        self.refresh();
+                    }
+                }
+            }
+            3 => self.edit.select_all(&self.query),
+            _ => {}
+        }
+        self.pause_caret();
+    }
+
     fn key(&mut self, key: u32, qh: &QueueHandle<App>) -> bool {
+        if self.ime.clear() {
+            self.refresh();
+        }
         self.pause_caret();
         let Some(st) = &self.xkb else { return false };
         let code = xkb::Keycode::new(key + 8);
         let sym = st.key_get_one_sym(code).raw();
         let mut utf8 = st.key_get_utf8(code);
         let ctrl = st.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE);
+        if let Some(menu) = &mut self.input_menu {
+            match sym {
+                xkb::keysyms::KEY_Escape => {
+                    self.input_menu = None;
+                }
+                xkb::keysyms::KEY_Up => menu.step(true),
+                xkb::keysyms::KEY_Down => menu.step(false),
+                xkb::keysyms::KEY_Return | xkb::keysyms::KEY_KP_Enter => {
+                    let command = menu.selected.filter(|&i| menu.enabled[i]);
+                    self.input_menu = None;
+                    if let Some(command) = command {
+                        self.input_command(command);
+                    }
+                }
+                _ => {}
+            }
+            self.redraw(qh);
+            return false;
+        }
+        if ctrl && matches!(sym, xkb::keysyms::KEY_Tab | xkb::keysyms::KEY_ISO_Left_Tab) {
+            let previous = st.mod_name_is_active(xkb::MOD_NAME_SHIFT, xkb::STATE_MODS_EFFECTIVE);
+            if self.modes.cycle(previous) {
+                if self.previewing {
+                    self.theme = self.cfg.theme();
+                    self.previewing = false;
+                }
+                self.query = self.modes.current().prefix().into();
+                self.origin = None;
+                self.edit = input::Edit::default();
+                self.refresh();
+                self.redraw(qh);
+            }
+            return false;
+        }
         if let Some(compose) = self.compose.as_mut() {
             if ctrl || sym == xkb::keysyms::KEY_Escape {
                 compose.reset();
@@ -639,11 +1003,14 @@ impl App {
                 }
             }
         }
-        let (columns, grid) = (self.columns(), self.query.starts_with(':'));
+        let (columns, grid) = (self.columns(), self.view_query().starts_with(':'));
         let selected = self.items.get(self.sel).map(|i| i.action.clone());
+        let previous_selection = self.sel;
         // Only zlaunch's own sub-views hide when entered directly; quicklinks
         // keep returning to the list.
-        let direct_view = self.origin.is_none() && self.query.starts_with([':', ';', '#']);
+        let direct_view = self.origin.is_none()
+            && (self.modes.current() != modes::Mode::Combined
+                || self.view_query().starts_with([':', ';', '#']));
         let effect = keys::handle(
             &mut keys::KeyState {
                 query: &mut self.query,
@@ -675,30 +1042,15 @@ impl App {
                 return false;
             }
             keys::Effect::Edited => self.refresh(),
-            keys::Effect::Moved => {}
-            keys::Effect::Copy(text) => {
-                if !text.is_empty() {
-                    copy_input_text(&text);
+            keys::Effect::Moved => {
+                if self.sel != previous_selection {
+                    self.sync_theme_preview();
+                    self.ensure_visible();
                 }
             }
-            keys::Effect::Cut(text) => {
-                if !text.is_empty() && copy_input_text(&text) {
-                    self.edit.replace(&mut self.query, "");
-                    self.refresh();
-                }
-            }
-            keys::Effect::Paste => {
-                if let Ok(out) = std::process::Command::new("timeout")
-                    .args(["1", "wl-paste", "--no-newline", "--type", "text"])
-                    .output()
-                {
-                    if out.status.success() {
-                        let text: String = input::paste_text(&String::from_utf8_lossy(&out.stdout));
-                        self.edit.replace(&mut self.query, &text);
-                        self.refresh();
-                    }
-                }
-            }
+            keys::Effect::Copy(_) => self.input_command(1),
+            keys::Effect::Cut(_) => self.input_command(0),
+            keys::Effect::Paste => self.input_command(2),
             keys::Effect::DeleteClip => {
                 let position = self.sel;
                 if let Some(action) = selected {
@@ -708,42 +1060,141 @@ impl App {
                 }
                 self.refresh();
                 self.sel = position.min(self.items.len().saturating_sub(1));
+                self.ensure_visible();
             }
         }
         self.redraw(qh);
         repeat
     }
 
+    fn scrollbar_geometry(&self) -> Option<scroll::Geometry> {
+        self.layout().scroll_geometry(
+            &self.items,
+            self.view_query(),
+            self.cfg.width,
+            self.vp(),
+            self.top,
+            self.scroll_remainder,
+        )
+    }
+
+    fn scroll_to_offset(&mut self, offset: f32) {
+        let before = (self.top, self.scroll_remainder);
+        let columns = self.columns();
+        let Some(g) = self.scrollbar_geometry() else {
+            self.top = 0;
+            self.scroll_remainder = 0.0;
+            return;
+        };
+        let offset = offset.clamp(0.0, g.content - g.viewport);
+        if self.view_query().starts_with(':') {
+            self.top = (offset / self.layout().cell) as usize * columns;
+            self.scroll_remainder = offset - (self.top / columns) as f32 * self.layout().cell;
+        } else {
+            let mut lo = 0;
+            let mut hi = self.items.len().saturating_sub(1);
+            while lo < hi {
+                let mid = (lo + hi).div_ceil(2);
+                if self
+                    .layout()
+                    .scroll_offset(&self.items, mid, self.view_query().starts_with(';'))
+                    <= offset
+                {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            self.top = lo;
+            self.scroll_remainder = offset
+                - self
+                    .layout()
+                    .scroll_offset(&self.items, lo, self.view_query().starts_with(';'));
+        }
+        if (self.top, self.scroll_remainder) != before {
+            self.scrollbar.changed();
+        }
+    }
+
+    fn scrollbar_motion(&mut self, qh: &QueueHandle<App>) {
+        let old_hover = (self.scrollbar.hovered, self.scrollbar.thumb_hovered);
+        let right = if self.view_query().starts_with(';') {
+            self.cfg.width as f32 * 0.5
+        } else {
+            self.cfg.width as f32
+        };
+        let geometry = self.scrollbar_geometry();
+        let point = self
+            .pointer
+            .map(|(x, y)| (x as f32, y as f32 - ui::HEAD - ui::LIST_PAD));
+        let on_bar = point
+            .is_some_and(|(x, y)| x >= right - 16.0 && x < right && y >= 0.0 && y < self.vp())
+            && geometry.is_some();
+        self.scrollbar.hovered = on_bar;
+        self.scrollbar.thumb_hovered =
+            self.scrollbar.hovered && point.zip(geometry).is_some_and(|((_, y), g)| g.on_thumb(y));
+        if old_hover.0 || self.scrollbar.hovered {
+            self.scrollbar.changed();
+        }
+        if let (Some(drag), Some((_, y)), Some(g)) = (self.scrollbar.drag, point, geometry) {
+            self.scroll_to_offset(g.offset_at(y, Some(drag)));
+            self.redraw(qh);
+        } else if old_hover != (self.scrollbar.hovered, self.scrollbar.thumb_hovered) {
+            self.redraw(qh);
+        }
+    }
+
     fn row_at(&self, x: f64, y: f64) -> Option<usize> {
-        if self.query.starts_with(';') && x >= self.cfg.width as f64 * 0.5 {
+        if self.view_query().starts_with(';') && x >= self.cfg.width as f64 * 0.5 {
             return None;
         }
-        if self.query.starts_with(':') {
+        // The clipboard list starts 3px higher than the other lists in the release.
+        let origin = if self.view_query().starts_with(';') {
+            ui::HEAD + ui::CLIP_TOP
+        } else {
+            ui::HEAD + ui::LIST_PAD
+        };
+        if y < origin as f64 || y >= (origin + self.vp()) as f64 {
+            return None;
+        }
+        if self.view_query().starts_with(':') {
             // Clicks below the visible grid (the padding under the viewport)
             // hit nothing; the partially visible row stays clickable.
-            if y as f32 > ui::HEAD + ui::LIST_PAD + ui::LIST_VP {
+            if y as f32 > ui::HEAD + ui::LIST_PAD + self.vp() {
                 return None;
             }
-            return ui::emoji_hit(
+            return self.layout().emoji_hit(
                 self.cfg.width,
-                (ui::LIST_VP / ui::EMOJI_CELL).ceil() as usize,
+                ((self.vp() + self.scroll_remainder) / self.layout().cell).ceil() as usize,
                 self.top,
                 self.items.len(),
                 x as f32,
-                y as f32,
+                y as f32 + self.scroll_remainder,
             );
         }
-        ui::item_at(
+        self.layout().item_at(
             &self.items,
             self.top,
-            self.vp(),
-            y as f32 - ui::HEAD - ui::LIST_PAD,
+            self.vp() + self.scroll_remainder,
+            y as f32 - origin + self.scroll_remainder,
         )
     }
 }
 
 impl App {
     fn init_clip(&mut self, qh: &QueueHandle<App>) {
+        // The collector runs only when the Clipboard module is configured,
+        // like zlaunch's init_clipboard_if_enabled.
+        let in_combined = self
+            .cfg
+            .combined_modules()
+            .contains(&config::ConfigModule::Clipboard);
+        let in_modes = self.cfg.default_modes.iter().flatten().any(|m| {
+            modes::Mode::parse(m) == Some(modes::Mode::Module(config::ConfigModule::Clipboard))
+        });
+        if !in_combined && !in_modes {
+            return;
+        }
         if let (Some(m), Some(s)) = (&self.dc_manager, &self.seat) {
             self.dc_device = Some(m.get_data_device(s, qh, ()));
         }
@@ -815,13 +1266,18 @@ impl App {
                 if r.image {
                     self.clip.push_image(&r.buf);
                 } else if let Ok(t) = String::from_utf8(r.buf) {
-                    self.clip
-                        .push(&if r.html { clip::strip_html(&t) } else { t });
+                    if r.files {
+                        let paths = clip::uri_list_paths(&t).unwrap_or_default();
+                        self.clip.push_files(&paths.join("\n"));
+                    } else {
+                        self.clip
+                            .push(&if r.html { clip::strip_html(&t) } else { t });
+                    }
                 }
                 if self.cfg.clipboard_persist {
                     self.clip.save();
                 }
-                if self.shown && self.query.starts_with(';') {
+                if self.shown && self.view_query().starts_with(';') {
                     self.refresh();
                     self.redraw(qh);
                 }
@@ -830,22 +1286,6 @@ impl App {
             }
         }
     }
-}
-
-fn launch_application(cmd: &str) {
-    let mut c = std::process::Command::new("sh");
-    c.arg("-c")
-        .arg(cmd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    unsafe {
-        c.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    let _ = c.spawn();
 }
 
 fn copy_input_text(text: &str) -> bool {
@@ -918,9 +1358,12 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for App {
                     offer.destroy();
                     return;
                 }
-                let image = clip::pick_image(&mimes).is_some();
-                if let Some(m) = clip::pick_mime(&mimes).or_else(|| clip::pick_image(&mimes)) {
+                let image = clip::pick_image(&mimes, a.cfg.store_passwords).is_some();
+                if let Some(m) = clip::pick_image(&mimes, a.cfg.store_passwords)
+                    .or_else(|| clip::pick_mime(&mimes, a.cfg.store_passwords))
+                {
                     let html = m == "text/html";
+                    let files = m == "text/uri-list";
                     let mut fds = [0i32; 2];
                     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0 {
                         let (r, w) = unsafe {
@@ -939,6 +1382,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for App {
                             started: Instant::now(),
                             image,
                             html,
+                            files,
                         });
                     }
                 }
@@ -1066,6 +1510,10 @@ impl Dispatch<WlRegistry, ()> for App {
                     a.dc_manager = Some(r.bind(name, 2.min(version), qh, ()))
                 }
                 "wl_seat" => a.seat = Some(r.bind(name, 5.min(version), qh, ())),
+                "zwp_text_input_manager_v3" => {
+                    a.text_manager = Some(r.bind(name, 1, qh, ()));
+                    a.setup_text_input(qh);
+                }
                 "wl_output" => {
                     let o: WlOutput = r.bind(name, 4.min(version), qh, ());
                     a.outputs.push(Out {
@@ -1080,6 +1528,73 @@ impl Dispatch<WlRegistry, ()> for App {
     }
 }
 
+delegate_noop!(App: ignore ZwpTextInputManagerV3);
+
+impl Dispatch<ZwpTextInputV3, ()> for App {
+    fn event(
+        a: &mut Self,
+        input: &ZwpTextInputV3,
+        event: zwp_text_input_v3::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        use zwp_text_input_v3::Event;
+        match event {
+            Event::Enter { surface } => {
+                if a.shown
+                    && (a.surface.as_ref() == Some(&surface)
+                        || a.backdrop.as_ref().is_some_and(|b| b.surface == surface))
+                {
+                    a.ime.clear();
+                    a.text_focus = Some(surface);
+                    a.text_snapshot = None;
+                    a.text_waiting = false;
+                    input.enable();
+                    a.update_text_input(false);
+                }
+            }
+            Event::Leave { surface } => {
+                if a.text_focus.as_ref() == Some(&surface) {
+                    a.text_focus = None;
+                    if a.ime.clear() {
+                        a.refresh();
+                    }
+                    a.text_snapshot = None;
+                    a.redraw(qh);
+                }
+            }
+            Event::PreeditString {
+                text,
+                cursor_begin,
+                cursor_end,
+            } if a.text_focus.is_some() => {
+                a.ime.pending_preedit = Some(ime::Preedit {
+                    text: text.unwrap_or_default(),
+                    begin: cursor_begin,
+                    end: cursor_end,
+                });
+            }
+            Event::CommitString { text } if a.text_focus.is_some() => a.ime.commit = text,
+            Event::DeleteSurroundingText {
+                before_length,
+                after_length,
+            } if a.text_focus.is_some() => a.ime.delete = (before_length, after_length),
+            Event::Done { serial } if a.text_focus.is_some() && a.shown => {
+                let changed = a.ime.apply(&mut a.query, &mut a.edit);
+                a.text_waiting = serial != a.text_commits;
+                if changed {
+                    a.refresh();
+                }
+                a.pause_caret();
+                a.update_text_input(true);
+                a.redraw(qh);
+            }
+            _ => {}
+        }
+    }
+}
+
 impl Dispatch<WlSeat, ()> for App {
     fn event(
         a: &mut Self,
@@ -1090,6 +1605,7 @@ impl Dispatch<WlSeat, ()> for App {
         qh: &QueueHandle<Self>,
     ) {
         use wayland_client::protocol::wl_seat::Capability;
+        a.setup_text_input(qh);
         if let wayland_client::protocol::wl_seat::Event::Capabilities {
             capabilities: WEnum::Value(c),
         } = ev
@@ -1192,11 +1708,10 @@ impl Dispatch<WlKeyboard, ()> for App {
                     .as_ref()
                     .map(|b| &b.surface)
                     .or(a.surface.as_ref());
-                if a.shown && a.cfg.close_on_focus_loss && current == Some(&surface) {
-                    a.left_at = Some(Instant::now());
+                if a.shown && current == Some(&surface) {
+                    a.hide();
                 }
             }
-            Event::Enter { .. } => a.left_at = None,
             _ => {}
         }
     }
@@ -1226,8 +1741,16 @@ impl Dispatch<WlPointer, ()> for App {
                     .filter(|s| **s == surface)
                     .map(|_| (surface_x, surface_y));
 
+                a.scrollbar_motion(qh);
                 if a.pointer.is_some() && a.input_drag {
-                    let at = ui::input_at(&a.font, &a.query, a.edit.caret, a.cfg.width, surface_x);
+                    let at = ui::input_at_mode(
+                        &a.font,
+                        &a.query,
+                        a.edit.caret,
+                        a.cfg.width,
+                        surface_x,
+                        a.edit.literal_prefix,
+                    );
                     a.edit.move_to(&a.query, at, true);
                     a.redraw(qh);
                 }
@@ -1239,8 +1762,22 @@ impl Dispatch<WlPointer, ()> for App {
             } => {
                 a.pointer = (!a.pointer_on_backdrop).then_some((surface_x, surface_y));
 
+                if let Some(menu) = &mut a.input_menu {
+                    menu.selected = menu.at(surface_x, surface_y);
+                    a.redraw(qh);
+                    return;
+                }
+
+                a.scrollbar_motion(qh);
                 if a.pointer.is_some() && a.input_drag {
-                    let at = ui::input_at(&a.font, &a.query, a.edit.caret, a.cfg.width, surface_x);
+                    let at = ui::input_at_mode(
+                        &a.font,
+                        &a.query,
+                        a.edit.caret,
+                        a.cfg.width,
+                        surface_x,
+                        a.edit.literal_prefix,
+                    );
                     a.edit.move_to(&a.query, at, true);
                     a.redraw(qh);
                 }
@@ -1249,35 +1786,72 @@ impl Dispatch<WlPointer, ()> for App {
                 a.pointer = None;
                 a.input_drag = false;
                 a.pointer_on_backdrop = false;
+                if a.scrollbar.hovered {
+                    a.scrollbar.changed();
+                }
+                a.scrollbar.hovered = false;
+                a.scrollbar.thumb_hovered = false;
+                a.scrollbar.drag = None;
             }
             Event::Button {
                 button: 272,
                 state: WEnum::Value(ButtonState::Pressed),
                 ..
             } => {
+                a.last_click = None;
+                if a.ime.clear() {
+                    a.refresh();
+                }
+                if let Some(menu) = &mut a.input_menu {
+                    if let Some((x, y)) = a.pointer {
+                        if menu.contains(x, y) {
+                            menu.pressed = menu.at(x, y);
+                            return;
+                        }
+                    }
+                    a.input_menu = None;
+                    a.redraw(qh);
+                    return;
+                }
                 if a.shown && a.pointer_on_backdrop {
                     a.hide();
                     return;
                 }
 
-                // The back arrow returns to the combined view, restoring the
-                // query that was there when the sub-view was entered.
+                if a.shown && a.scrollbar.hovered {
+                    if let (Some((_, y)), Some(g)) = (a.pointer, a.scrollbar_geometry()) {
+                        let y = y as f32 - ui::HEAD - ui::LIST_PAD;
+                        if g.on_thumb(y) {
+                            a.scrollbar.drag = Some(y - g.start);
+                        } else {
+                            a.scroll_to_offset(g.offset_at(y, None));
+                        }
+                        a.scrollbar.changed();
+                        a.redraw(qh);
+                        return;
+                    }
+                }
+
+                // The back arrow returns to an unfiltered combined view.
                 if a.shown
                     && a.origin.is_some()
                     && a.pointer.is_some_and(|(x, y)| ui::back_button_at(x, y))
                 {
-                    a.query = a.origin.take().unwrap_or_default();
+                    a.origin = None;
+                    a.query.clear();
                     a.last_click = None;
                     a.refresh();
                     a.redraw(qh);
                     return;
                 }
                 if a.shown
-                    && a.pointer
-                        .is_some_and(|(x, y)| ui::clear_button_at(a.cfg.width, &a.query, x, y))
+                    && a.pointer.is_some_and(|(x, y)| {
+                        ui::clear_button_at_mode(a.cfg.width, &a.query, x, y, a.edit.literal_prefix)
+                    })
                 {
-                    a.query
-                        .truncate(usize::from(a.query.starts_with([':', ';', '#'])));
+                    a.edit.sync(&a.query);
+                    a.edit.select_all(&a.query);
+                    a.edit.replace(&mut a.query, "");
                     a.last_click = None;
                     a.refresh();
                     a.redraw(qh);
@@ -1286,7 +1860,14 @@ impl Dispatch<WlPointer, ()> for App {
                 if let Some((x, y)) = a.pointer.filter(|(_, y)| *y >= 0.0 && *y < ui::HEAD as f64) {
                     let _ = y;
                     a.edit.sync(&a.query);
-                    let at = ui::input_at(&a.font, &a.query, a.edit.caret, a.cfg.width, x);
+                    let at = ui::input_at_mode(
+                        &a.font,
+                        &a.query,
+                        a.edit.caret,
+                        a.cfg.width,
+                        x,
+                        a.edit.literal_prefix,
+                    );
                     let now = Instant::now();
                     let count = a
                         .input_click
@@ -1295,9 +1876,9 @@ impl Dispatch<WlPointer, ()> for App {
                                 && (x - px).abs() < 4.0
                                 && (y - py).abs() < 4.0
                         })
-                        .map_or(1, |(_, n, _, _)| (n % 3) + 1);
+                        .map_or(1, |(_, n, _, _)| n.saturating_add(1));
                     a.input_click = Some((now, count, x, y));
-                    if count == 3 {
+                    if count >= 3 {
                         a.edit.select_all(&a.query);
                     } else if count == 2 {
                         a.edit.select_word(&a.query, at);
@@ -1312,61 +1893,125 @@ impl Dispatch<WlPointer, ()> for App {
                     a.redraw(qh);
                     return;
                 }
-                // A click picks the row under the pointer and runs it, like zlaunch.
                 let row = a.pointer.and_then(|(x, y)| a.row_at(x, y));
-                if let (true, Some(i)) = (a.shown, row) {
-                    a.sel = i;
-                    let now = Instant::now();
-                    let double = a.last_click.is_some_and(|(j, t)| {
-                        j == i && now.duration_since(t) < Duration::from_millis(400)
-                    });
-                    if a.cfg.single_click || double {
-                        a.last_click = None;
-                        a.activate(qh);
-                    } else {
-                        a.last_click = Some((i, now));
-                        a.redraw(qh);
-                    }
-                }
+                a.last_click = row.map(|i| (i, Instant::now()));
             }
             Event::Button {
                 button: 272,
                 state: WEnum::Value(ButtonState::Released),
                 ..
-            } => a.input_drag = false,
+            } => {
+                if let Some(menu) = &a.input_menu {
+                    let released = a.pointer.and_then(|(x, y)| menu.at(x, y));
+                    let command = menu
+                        .pressed
+                        .filter(|&i| Some(i) == released && menu.enabled[i]);
+                    if let Some(command) = command {
+                        a.input_menu = None;
+                        a.input_command(command);
+                        a.redraw(qh);
+                    }
+                    return;
+                }
+                a.input_drag = false;
+                a.edit.end_drag();
+                if a.scrollbar.drag.take().is_some() {
+                    a.scrollbar.changed();
+                    a.redraw(qh);
+                    return;
+                }
+                let pressed = a.last_click.take().map(|(i, _)| i);
+                let released = a.pointer.and_then(|(x, y)| a.row_at(x, y));
+                if let Some(i) = pressed.filter(|_| a.shown && pressed == released) {
+                    // zlaunch: a vlist row click confirms the row's first item,
+                    // so any emoji grid cell copies that row's first emoji.
+                    a.sel = if a.view_query().starts_with(':') {
+                        i - (i % a.columns())
+                    } else {
+                        i
+                    };
+                    a.activate(qh);
+                }
+            }
+            Event::Button {
+                button: 273,
+                state: WEnum::Value(ButtonState::Pressed),
+                ..
+            } => {
+                if let Some((x, y)) = a.pointer.filter(|(_, y)| *y >= 0.0 && *y < ui::HEAD as f64) {
+                    a.edit.sync(&a.query);
+                    let at = ui::input_at_mode(
+                        &a.font,
+                        &a.query,
+                        a.edit.caret,
+                        a.cfg.width,
+                        x,
+                        a.edit.literal_prefix,
+                    );
+                    if !a.edit.range().is_some_and(|r| r.contains(&at)) {
+                        a.edit.move_to(&a.query, at, false);
+                    }
+                    let paste = std::process::Command::new("timeout")
+                        .args(["1", "wl-paste", "--list-types"])
+                        .output()
+                        .is_ok_and(|o| o.status.success() && !o.stdout.is_empty());
+                    a.input_menu = Some(input_menu::Menu::new(
+                        x,
+                        y,
+                        a.cfg.width,
+                        a.cur_h,
+                        a.edit.range().is_some(),
+                        paste,
+                    ));
+                    a.redraw(qh);
+                }
+            }
+            Event::AxisDiscrete {
+                axis: WEnum::Value(Axis::VerticalScroll),
+                ..
+            } => {
+                a.wheel_discrete = true;
+            }
             Event::Axis {
                 axis: WEnum::Value(Axis::VerticalScroll),
                 value,
                 ..
             } => {
-                if a.pointer_on_backdrop {
+                // Measured against the 0.5.1 release: one discrete wheel step of 60 scrolls
+                // 78px there. Pixel-valued (touchpad) deltas stay unscaled.
+                let value = if std::mem::take(&mut a.wheel_discrete) {
+                    value * 1.3
+                } else {
+                    value
+                };
+                if a.pointer_on_backdrop || a.input_menu.is_some() || value == 0.0 {
                     return;
                 }
 
-                a.last_scroll = Some(Instant::now());
-                if a.query.starts_with(':') {
-                    let columns = a.columns();
-                    let rows = a.emoji_rows();
-                    let max_top = a.items.len().div_ceil(columns).saturating_sub(rows);
-                    let step = if value > 0.0 { 1isize } else { -1 };
-                    a.top = ((a.top / columns) as isize + step).clamp(0, max_top as isize) as usize
-                        * columns;
-                    a.sel = a
-                        .sel
-                        .clamp(a.top, a.top + rows * columns - 1)
-                        .min(a.items.len().saturating_sub(1));
+                let right = if a.view_query().starts_with(';') {
+                    a.cfg.width as f64 * 0.5
                 } else {
-                    let vp = a.vp();
-                    let max_top = ui::max_top(&a.items, vp);
-                    let step = if value > 0.0 { 1isize } else { -1 };
-                    a.top = (a.top as isize + step).clamp(0, max_top as isize) as usize;
-                    let shown: Vec<usize> = ui::slots(&a.items, a.top, vp)
-                        .iter()
-                        .filter_map(|x| x.item)
-                        .collect();
-                    if let (Some(&f), Some(&l)) = (shown.first(), shown.last()) {
-                        a.sel = a.sel.clamp(f, l);
-                    }
+                    a.cfg.width as f64
+                };
+                if a.pointer_on_backdrop
+                    || a.pointer.is_none_or(|(x, y)| {
+                        x < 0.0
+                            || x >= right
+                            || y < (ui::HEAD + ui::LIST_PAD) as f64
+                            || y >= (ui::HEAD + ui::LIST_PAD + a.vp()) as f64
+                    })
+                {
+                    return;
+                }
+
+                if let Some(g) = a.scrollbar_geometry() {
+                    let offset = if a.view_query().starts_with(':') {
+                        (a.top / a.columns()) as f32 * a.layout().cell
+                    } else {
+                        a.layout()
+                            .scroll_offset(&a.items, a.top, a.view_query().starts_with(';'))
+                    } + a.scroll_remainder;
+                    a.scroll_to_offset((offset + value as f32).clamp(0.0, g.content - g.viewport));
                 }
                 a.redraw(qh);
             }
@@ -1416,84 +2061,103 @@ fn sock() -> String {
 }
 
 fn load_font(cfg: &Config) -> Font<'static> {
-    let mut paths: Vec<String> = Vec::new();
-    if !cfg.font.is_empty() {
-        paths.push(cfg.font.clone());
-    }
-    if let Ok(o) = std::process::Command::new("fc-match")
-        .args(["-f", "%{file}", "sans"])
-        .output()
-    {
-        paths.push(String::from_utf8_lossy(&o.stdout).into_owned());
-    }
-    paths.push("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf".into());
-    for p in paths {
-        if let Some(f) = std::fs::read(&p).ok().and_then(|d| Font::try_from_vec(d)) {
-            return f;
-        }
-    }
-    eprintln!("zl: no usable font found, set `font = \"/path/to/font.ttf\"` in the config");
-    std::process::exit(1);
+    cfg.font_file(false)
+        .into_iter()
+        .chain(["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf".into()])
+        .find_map(|p| std::fs::read(p).ok().and_then(Font::try_from_vec))
+        .unwrap_or_else(|| {
+            eprintln!("zl: no usable font found");
+            std::process::exit(1)
+        })
 }
 
-/// Bold face for section headers (zlaunch styles them EXTRA_BOLD). Resolved
-/// from the configured font's `-Bold` sibling when `font` is set, otherwise
-/// from fontconfig's bold sans match. None when no bold face exists.
 fn load_bold_font(cfg: &Config) -> Option<Font<'static>> {
-    let mut paths: Vec<String> = Vec::new();
-    if !cfg.font.is_empty() {
-        let p = std::path::Path::new(&cfg.font);
-        if let (Some(stem), Some(ext)) = (p.file_stem(), p.extension()) {
-            let bold = p.with_file_name(format!(
-                "{}-Bold.{}",
-                stem.to_string_lossy(),
-                ext.to_string_lossy()
-            ));
-            paths.push(bold.to_string_lossy().into_owned());
-        }
-    }
-    if let Ok(o) = std::process::Command::new("fc-match")
-        .args(["-f", "%{file}", "sans:weight=bold"])
-        .output()
-    {
-        paths.push(String::from_utf8_lossy(&o.stdout).into_owned());
-    }
-    paths.push("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf".into());
-    paths
-        .iter()
+    cfg.font_file(true)
+        .into_iter()
+        .chain(["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf".into()])
         .find_map(|p| std::fs::read(p).ok().and_then(Font::try_from_vec))
 }
 
 fn main() {
-    if let Some(cmd) = std::env::args().nth(1) {
-        match cmd.as_str() {
-            "show" | "hide" | "toggle" | "quit" | "clear-clipboard" => {}
-            "themes" => {
-                println!("{}", config::THEMES.join("\n"));
-                return;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let wire = match cli::parse(&args) {
+        cli::Cmd::Daemon => None,
+        cli::Cmd::Print(text, code) => {
+            if code == 0 {
+                let _ = write!(std::io::stdout(), "{text}");
+            } else {
+                eprint!("{text}");
             }
-            _ => {
-                eprintln!("usage: zl [show|hide|toggle|clear-clipboard|quit|themes]  (no argument starts the daemon)");
-                std::process::exit(2);
-            }
+            std::process::exit(code);
         }
+        cli::Cmd::ThemeCurrent => Some("theme-current".into()),
+        cli::Cmd::ThemeList => Some("theme-list".into()),
+        cli::Cmd::Show(modes) => Some(format!("show {}", cli::show_modes(&modes))),
+        cli::Cmd::Toggle(modes) => Some(format!("toggle {}", cli::show_modes(&modes))),
+        cli::Cmd::Hide => Some("hide".into()),
+        cli::Cmd::Quit => Some("quit".into()),
+        cli::Cmd::Reload => Some("reload".into()),
+        cli::Cmd::ThemeSet(name) => Some(format!("theme-set {name}")),
+    };
+    if let Some(wire) = wire {
         match UnixStream::connect(sock()) {
             Ok(mut s) => {
-                let _ = s.write_all(cmd.as_bytes());
+                let result = (|| -> std::io::Result<String> {
+                    s.set_read_timeout(Some(Duration::from_secs(2)))?;
+                    s.set_write_timeout(Some(Duration::from_secs(2)))?;
+                    s.write_all(wire.as_bytes())?;
+                    s.shutdown(std::net::Shutdown::Write)?;
+                    let mut reply = String::new();
+                    s.read_to_string(&mut reply)?;
+                    Ok(reply)
+                })();
+                match result {
+                    Ok(reply) if reply.starts_with("ok\n") => {
+                        let payload = &reply[3..];
+                        let mut out = std::io::stdout().lock();
+                        if wire == "theme-current" {
+                            let _ = writeln!(out, "Current theme: {}", payload.trim_end());
+                        } else if wire == "theme-list" {
+                            let _ = write!(out, "Available themes:\n{payload}");
+                        } else if let Some(name) = wire.strip_prefix("theme-set ") {
+                            let _ = writeln!(out, "Theme set to '{name}'");
+                        } else if wire == "reload" {
+                            let _ = writeln!(out, "Daemon is reloading...");
+                        }
+                    }
+                    Ok(reply) => {
+                        eprintln!(
+                            "Error: {}",
+                            reply
+                                .strip_prefix("err ")
+                                .unwrap_or("Invalid daemon response")
+                                .trim_end()
+                        );
+                        std::process::exit(1);
+                    }
+                    Err(error) => {
+                        eprintln!("Error: daemon request failed: {error}");
+                        std::process::exit(1);
+                    }
+                }
             }
             Err(_) => {
-                eprintln!("zl: daemon is not running, start it with `zl`");
+                eprintln!("Error: zl daemon is not running. Start it first by running: zl");
                 std::process::exit(1);
             }
         }
         return;
     }
+    launch::capture_environment();
     let cfg = Config::load();
     if UnixStream::connect(sock()).is_ok() {
         eprintln!("zl: already running");
-        std::process::exit(1);
+        return;
     }
     let _ = std::fs::remove_file(sock());
+    if let Err(error) = hyprland_blur::apply(cfg.hyprland_auto_blur) {
+        eprintln!("zl: failed to apply Hyprland blur rules: {error}");
+    }
     let listener = UnixListener::bind(sock()).expect("cannot create the control socket");
     listener.set_nonblocking(true).unwrap();
     let conn = Connection::connect_to_env().expect("no Wayland display");
@@ -1502,19 +2166,34 @@ fn main() {
     conn.display().get_registry(&qh, ());
     let mut app = App {
         theme: cfg.theme(),
+        saved_theme_name: if config::load_theme(&cfg.theme).is_some() {
+            cfg.theme.clone()
+        } else {
+            "default".into()
+        },
         icons: icons::Cache::new(&cfg.icon_theme, &cfg.emoji_font),
         font: load_font(&cfg),
+        font_size: cfg.startup_font_size(),
+        mono_font_family: cfg.startup_fonts().mono_font_family,
         bold_font: load_bold_font(&cfg),
-        apps: items::scan_apps(&cfg),
+        apps: app_cache::load(&cfg),
         windows: vec![],
         items: vec![],
         query: String::new(),
         edit: input::Edit::default(),
+        ime: ime::State::default(),
+        text_manager: None,
+        text_input: None,
+        text_focus: None,
+        text_commits: 0,
+        text_waiting: false,
+        text_snapshot: None,
         caret_visible: true,
         caret_next: Instant::now(),
         sel: 0,
         top: 0,
-        last_scroll: None,
+        scroll_remainder: 0.0,
+        scrollbar: scroll::State::default(),
         shown: false,
         configured: false,
         cur_h: 0,
@@ -1523,16 +2202,20 @@ fn main() {
         repeat_rate: 25,
         repeat_delay: 400,
         repeating: None,
-        left_at: None,
         pointer: None,
         pointer_on_backdrop: false,
         last_click: None,
+        wheel_discrete: false,
         origin: None,
         input_drag: false,
+        input_menu: None,
         input_click: None,
         settings_error: None,
         hist: hist::Hist::load(),
         previewing: false,
+        theme_catalog: None,
+        theme_palettes: std::collections::HashMap::new(),
+        modes: modes::State::new(cfg.default_modes.as_deref()),
         cfg,
         compositor: None,
         subcompositor: None,
@@ -1557,9 +2240,9 @@ fn main() {
         own_source: None,
     };
     app.clip = if app.cfg.clipboard_persist {
-        clip::History::load(app.cfg.clipboard_max)
+        clip::History::load(app.cfg.clipboard_limit())
     } else {
-        clip::History::new(app.cfg.clipboard_max)
+        clip::History::new(app.cfg.clipboard_limit())
     };
     queue.roundtrip(&mut app).unwrap();
     queue.roundtrip(&mut app).unwrap();
@@ -1568,6 +2251,9 @@ fn main() {
         eprintln!("zl: the compositor has no wlr-layer-shell support");
         std::process::exit(1);
     }
+    let mut app_watch = app_watch::AppWatch::new()
+        .map_err(|error| eprintln!("zl: cannot start application watcher: {error}"))
+        .ok();
     loop {
         queue.dispatch_pending(&mut app).unwrap();
         queue.flush().unwrap();
@@ -1586,6 +2272,13 @@ fn main() {
                 revents: 0,
             },
         ];
+        if let Some(watch) = &app_watch {
+            fds.push(libc::pollfd {
+                fd: watch.fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
         for r in &app.reads {
             fds.push(libc::pollfd {
                 fd: r.file.as_raw_fd(),
@@ -1605,15 +2298,27 @@ fn main() {
                 + 1;
             timeout = if timeout < 0 { wait } else { timeout.min(wait) };
         }
+        if let Some(wait) = app_watch.as_ref().and_then(|watch| watch.wait_ms()) {
+            timeout = if timeout < 0 { wait } else { timeout.min(wait) };
+        }
+        if app.shown {
+            if let Some(wait) = app.scrollbar.next_frame() {
+                let wait = wait.as_millis() as i32 + 1;
+                timeout = if timeout < 0 { wait } else { timeout.min(wait) };
+            }
+        }
         if !app.reads.is_empty() {
             timeout = if timeout < 0 { 500 } else { timeout.min(500) };
         }
-        if let Some(t) = app.left_at {
-            let wait = FOCUS_GRACE.saturating_sub(t.elapsed()).as_millis() as i32 + 1;
-            timeout = if timeout < 0 { wait } else { timeout.min(wait) };
-        }
         unsafe {
             libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout);
+        }
+        if app_watch.as_mut().is_some_and(|watch| watch.changed()) {
+            app.apps = app_cache::load(&app.cfg);
+            if app.shown {
+                app.refresh();
+                app.redraw(&qh);
+            }
         }
         app.finish_reads(&qh);
         if app.shown && Instant::now() >= app.caret_next {
@@ -1621,16 +2326,21 @@ fn main() {
             app.caret_next = Instant::now() + Duration::from_millis(500);
             app.redraw(&qh);
         }
+        if app.shown
+            && !app.scrollbar.hovered
+            && app.scrollbar.drag.is_none()
+            && app
+                .scrollbar
+                .last_scroll
+                .is_some_and(|t| t.elapsed() >= Duration::from_secs(2))
+        {
+            app.redraw(&qh);
+            app.scrollbar.finish_frame();
+        }
         if fds[0].revents & libc::POLLIN != 0 {
             let _ = guard.read();
         } else {
             drop(guard);
-        }
-        if app.left_at.is_some_and(|t| t.elapsed() >= FOCUS_GRACE) {
-            app.left_at = None;
-            if app.shown {
-                app.hide();
-            }
         }
         if let Some((key, at)) = app.repeating {
             if Instant::now() >= at {
@@ -1648,29 +2358,76 @@ fn main() {
                 s.set_read_timeout(Some(Duration::from_millis(200))).ok();
                 let mut b = String::new();
                 let _ = s.read_to_string(&mut b);
-                match b.as_str() {
-                    "show" => app.show(&qh),
-                    "hide" => app.hide(),
+                let (word, arg) = b.split_once(' ').unwrap_or((b.as_str(), ""));
+                match word {
+                    "show" => {
+                        if !app.shown {
+                            app.set_modes(arg);
+                        }
+                        app.show(&qh);
+                        let _ = s.write_all(b"ok\n");
+                    }
+                    "hide" => {
+                        app.hide();
+                        let _ = s.write_all(b"ok\n");
+                    }
                     "toggle" => {
                         if app.shown {
                             app.hide()
                         } else {
-                            app.show(&qh)
+                            app.set_modes(arg);
+                            app.show(&qh);
                         }
+                        let _ = s.write_all(b"ok\n");
                     }
-                    "clear-clipboard" => {
-                        app.clip.clear();
-                        if app.cfg.clipboard_persist {
-                            app.clip.save();
+                    "reload" => {
+                        let _ = s.write_all(b"ok\n");
+                        let _ = std::fs::remove_file(sock());
+                        if let Ok(exe) = std::env::current_exe() {
+                            let err = std::process::Command::new(exe).exec();
+                            eprintln!("zl: reload failed: {err}");
                         }
-                        app.refresh();
-                        app.redraw(&qh);
+                        return;
+                    }
+                    "theme-set" => {
+                        let ok = config::load_theme(arg).is_some() && {
+                            let ok = config::set_theme(&mut app.cfg, arg);
+                            app.saved_theme_name = arg.into();
+                            app.theme = app.cfg.theme();
+                            app.redraw(&qh);
+                            ok
+                        };
+                        let reply = if ok {
+                            "ok\n".into()
+                        } else {
+                            format!("err Theme '{arg}' not found\n")
+                        };
+                        let _ = s.write_all(reply.as_bytes());
+                    }
+                    "theme-current" => {
+                        let _ = writeln!(s, "ok\n{}", app.saved_theme_name);
+                    }
+                    "theme-list" => {
+                        let _ = s.write_all(b"ok\n");
+                        for (name, source) in config::available_themes() {
+                            let kind = if source == "bundled" {
+                                "bundled"
+                            } else {
+                                "user"
+                            };
+                            if writeln!(s, "  {name} ({kind})").is_err() {
+                                break;
+                            }
+                        }
                     }
                     "quit" => {
+                        let _ = s.write_all(b"ok\n");
                         let _ = std::fs::remove_file(sock());
                         return;
                     }
-                    _ => {}
+                    _ => {
+                        let _ = s.write_all(b"err Unknown command\n");
+                    }
                 }
             }
         }
@@ -1680,6 +2437,22 @@ fn main() {
 #[cfg(test)]
 mod backdrop_tests {
     use super::*;
+
+    #[test]
+    fn explicit_window_size_is_clamped_to_the_panel() {
+        let mut cfg = Config {
+            window_size: Some((900.5, 700.0)),
+            ..Config::default()
+        };
+        assert_eq!(explicit_window_size(&cfg, 400), Some((901, 700)));
+        cfg.window_size = Some((1.0, -1.0));
+        assert_eq!(explicit_window_size(&cfg, 400), Some((cfg.width, 400)));
+        cfg.enable_backdrop = false;
+        assert_eq!(explicit_window_size(&cfg, 400), None);
+        cfg.enable_backdrop = true;
+        cfg.window_size = Some((f32::NAN, f32::INFINITY));
+        assert_eq!(explicit_window_size(&cfg, 400), None);
+    }
 
     #[test]
     fn viewport_backdrop_uses_one_pixel_at_any_output_size() {
@@ -1717,19 +2490,34 @@ mod picker_tests {
     fn app(cfg: Config) -> App {
         App {
             theme: cfg.theme(),
+            saved_theme_name: if config::load_theme(&cfg.theme).is_some() {
+                cfg.theme.clone()
+            } else {
+                "default".into()
+            },
             icons: icons::Cache::new(&cfg.icon_theme, &cfg.emoji_font),
             font: load_font(&cfg),
+            font_size: cfg.startup_font_size(),
+            mono_font_family: cfg.startup_fonts().mono_font_family,
             bold_font: load_bold_font(&cfg),
             apps: items::scan_apps(&cfg),
             windows: vec![],
             items: vec![],
             query: String::new(),
             edit: input::Edit::default(),
+            ime: ime::State::default(),
+            text_manager: None,
+            text_input: None,
+            text_focus: None,
+            text_commits: 0,
+            text_waiting: false,
+            text_snapshot: None,
             caret_visible: true,
             caret_next: Instant::now(),
             sel: 0,
             top: 0,
-            last_scroll: None,
+            scroll_remainder: 0.0,
+            scrollbar: scroll::State::default(),
             shown: false,
             configured: false,
             cur_h: 0,
@@ -1740,14 +2528,18 @@ mod picker_tests {
             repeating: None,
             pointer: None,
             last_click: None,
+            wheel_discrete: false,
             pointer_on_backdrop: false,
             origin: None,
             input_drag: false,
+            input_menu: None,
             input_click: None,
-            left_at: None,
             settings_error: None,
             previewing: false,
+            theme_catalog: None,
+            theme_palettes: std::collections::HashMap::new(),
             hist: hist::Hist::default(),
+            modes: modes::State::new(cfg.default_modes.as_deref()),
             cfg,
             compositor: None,
             subcompositor: None,
@@ -1772,6 +2564,181 @@ mod picker_tests {
             own_source: None,
         }
     }
+    fn scroll_fixture(query: &str) -> App {
+        let mut a = app(Config::default());
+        a.query = query.into();
+        a.items = (0..20)
+            .map(|i| Item {
+                title: i.to_string(),
+                sub: String::new(),
+                tag: "Theme",
+                icon: None,
+                action: Action::Theme("default".into()),
+                best: false,
+            })
+            .collect();
+        a
+    }
+
+    #[test]
+    fn pixel_scroll_keeps_selection_and_remainder_and_clamps_both_ends() {
+        let _env = crate::testutil::ENV_LOCK.lock().unwrap();
+        let mut a = scroll_fixture("#");
+        a.scroll_to_offset(123.5);
+        assert_eq!((a.top, a.scroll_remainder, a.sel), (2, 23.5, 0));
+        a.scroll_to_offset(f32::MAX);
+        assert_eq!((a.top, a.scroll_remainder, a.sel), (13, 24.0, 0));
+        a.scroll_to_offset(-1.0);
+        assert_eq!((a.top, a.scroll_remainder), (0, 0.0));
+        a.items.clear();
+        a.scroll_to_offset(100.0);
+        assert_eq!((a.top, a.scroll_remainder), (0, 0.0));
+    }
+
+    #[test]
+    fn navigation_keeps_visible_rows_in_place_then_reveals_only_the_clipped_part() {
+        let _env = crate::testutil::ENV_LOCK.lock().unwrap();
+        let mut a = scroll_fixture("#");
+        a.sel = 1;
+        a.ensure_visible();
+        assert_eq!((a.top, a.scroll_remainder), (0, 0.0));
+        a.sel = 6;
+        a.ensure_visible();
+        assert_eq!((a.top, a.scroll_remainder), (0, 24.0));
+        a.sel = 0;
+        a.ensure_visible();
+        assert_eq!((a.top, a.scroll_remainder), (0, 0.0));
+        a.query = ":".into();
+        a.items = (0..100).map(|_| a.items[0].clone()).collect();
+        a.sel = a.columns();
+        a.ensure_visible();
+        assert_eq!((a.top, a.scroll_remainder), (0, 0.0));
+        a.sel = a.columns() * 5;
+        a.ensure_visible();
+        assert_eq!((a.top, a.scroll_remainder), (0, 58.0));
+    }
+
+    #[test]
+    fn pixel_scrolled_rows_use_the_visible_part_for_pointer_hits() {
+        let _env = crate::testutil::ENV_LOCK.lock().unwrap();
+        let mut a = scroll_fixture("#");
+        a.scroll_to_offset(123.5);
+        assert_eq!(a.row_at(100.0, 66.0), Some(2));
+        assert_eq!(a.row_at(100.0, 93.0), Some(3));
+        assert_eq!(a.row_at(100.0, 65.9), None);
+        assert_eq!(a.row_at(100.0, 392.0), None);
+        a.query = ";".into();
+        assert_eq!(a.row_at(400.0, 100.0), None);
+    }
+
+    #[test]
+    fn clipboard_theme_pitch_is_shared_by_scroll_and_pointer_hits() {
+        let _env = crate::testutil::ENV_LOCK.lock().unwrap();
+        let mut a = scroll_fixture(";");
+        a.theme.metrics.item_content_height += 20.0;
+        let pitch = ui::CLIP_ROW + 20.0;
+        assert_eq!(a.layout().row, pitch);
+        assert_eq!(
+            a.scrollbar_geometry().unwrap().content,
+            a.items.len() as f32 * pitch
+        );
+        let top = ui::HEAD + ui::CLIP_TOP;
+        assert_eq!(a.row_at(100.0, (top + pitch - 0.1) as f64), Some(0));
+        assert_eq!(a.row_at(100.0, (top + pitch + 0.1) as f64), Some(1));
+        a.scroll_to_offset(pitch + 5.0);
+        assert_eq!(a.top, 1);
+        assert_eq!(a.scroll_remainder, 5.0);
+    }
+
+    #[test]
+    fn direct_nonpicker_prefixes_keep_literal_input_and_regular_geometry() {
+        for mode in ["apps", "search", "calculator", "actions", "windows"] {
+            let mut a = app(Config {
+                default_modes: Some(vec![mode.into()]),
+                ..Config::default()
+            });
+            a.apps = vec![items::App {
+                name: ":foo".into(),
+                exec: "true".into(),
+                comment: String::new(),
+                icon: String::new(),
+                terminal: false,
+            }];
+            for query in [":foo", ";foo", "#foo"] {
+                a.query = query.into();
+                a.refresh();
+                assert!(a.edit.literal_prefix);
+                assert_eq!(a.view_query(), "");
+                assert_eq!(a.columns(), 1);
+                assert_eq!(a.layout().row, ui::Layout::new(&a.theme.metrics).row);
+                assert!(a
+                    .items
+                    .iter()
+                    .all(|item| !matches!(item.action, Action::Clip(_) | Action::Theme(_))));
+                if mode == "search" && query == ":foo" {
+                    assert!(a.items.iter().any(|item| item.action
+                        == Action::WebSearch("https://www.google.com/search?q=%3Afoo".into())));
+                    assert_eq!(a.items.len(), 4);
+                }
+                if mode == "apps" && query == ":foo" {
+                    assert_eq!(a.items[0].title, ":foo");
+                }
+                a.edit.select_all(&a.query);
+                assert_eq!(&a.query[a.edit.range().unwrap()], query);
+                a.edit.replace(&mut a.query, "");
+                assert_eq!(a.query, "");
+            }
+        }
+    }
+
+    #[test]
+    fn calculator_and_actions_modes_limit_their_producers() {
+        for (mode, query, count) in [("calculator", "1+2", 1), ("actions", "", 5)] {
+            let mut a = app(Config {
+                default_modes: Some(vec![mode.into()]),
+                ..Config::default()
+            });
+            a.query = query.into();
+            a.refresh();
+            assert_eq!(a.items.len(), count);
+            assert!(a.items.iter().all(|i| if mode == "calculator" {
+                matches!(i.action, Action::Calculate(_))
+            } else {
+                matches!(i.action, Action::System(_))
+            }));
+        }
+    }
+    #[test]
+    fn active_mode_limits_the_search_module_without_mutating_config() {
+        let cfg = Config {
+            default_modes: Some(vec!["apps".into(), "clipboard".into()]),
+            ..Config::default()
+        };
+        let mut a = app(cfg);
+        a.apps = vec![items::App {
+            name: "Fixture app".into(),
+            exec: "true".into(),
+            comment: String::new(),
+            icon: String::new(),
+            terminal: false,
+        }];
+        a.query.clear();
+        a.refresh();
+        assert_eq!(a.items.len(), 1);
+        assert_eq!(a.items[0].title, "Fixture app");
+        assert!(matches!(a.items[0].action, Action::App(_)));
+        assert!(a.cfg.combined_modules.is_none());
+        assert_eq!(a.modes.current().placeholder(), "Search applications...");
+        assert!(a.modes.cycle(false));
+        a.query = a.modes.current().prefix().into();
+        a.clip.max = 10;
+        assert!(a.clip.push("fixture"));
+        a.refresh();
+        assert_eq!(a.query, ";");
+        assert_eq!(a.items.len(), 1);
+        assert_eq!(a.items[0].title, "fixture");
+    }
+
     #[test]
     fn refresh_keeps_search_order_despite_saved_pins_and_usage() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();
@@ -1826,10 +2793,85 @@ mod picker_tests {
     }
 
     #[test]
+    fn theme_catalog_is_a_snapshot_until_the_picker_closes() {
+        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        let themes = Config::path().parent().unwrap().join("themes");
+        std::fs::create_dir_all(&themes).unwrap();
+        std::fs::write(themes.join("custom.toml"), "window_background = '#ff0000'").unwrap();
+        let mut a = app(Config::default());
+        a.query = "#custom".into();
+        a.refresh();
+        a.sync_theme_preview();
+        assert_eq!(a.theme.bg, [255, 0, 0]);
+        std::fs::write(themes.join("custom.toml"), "window_background = '#0000ff'").unwrap();
+        std::fs::write(themes.join("new.toml"), "").unwrap();
+        a.query = "#".into();
+        a.refresh();
+        assert!(!a.items.iter().any(|item| item.title == "new"));
+        a.query = "#custom".into();
+        a.refresh();
+        a.sync_theme_preview();
+        assert_eq!(a.theme.bg, [255, 0, 0]);
+        assert_eq!(a.theme_palettes["custom"].bg, [255, 0, 0]);
+        a.hide();
+        a.refresh();
+        a.sync_theme_preview();
+        assert_eq!(a.theme.bg, [0, 0, 255]);
+        match old {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+
+    #[test]
+    fn opaque_background_stays_opaque_during_cached_theme_preview() {
+        let _env = crate::testutil::ENV_LOCK.lock().unwrap();
+        let mut a = app(Config {
+            enable_transparency: false,
+            ..Config::default()
+        });
+        a.query = "#nord".into();
+        a.refresh();
+        a.sync_theme_preview();
+        assert_eq!(a.theme.bg, config::theme("nord").bg);
+        assert_eq!(a.theme.bg_alpha, 1.0);
+        a.query.clear();
+        a.refresh();
+        a.sync_theme_preview();
+        assert_eq!(a.theme.bg_alpha, 1.0);
+    }
+
+    #[test]
+    fn configured_height_drives_viewport_and_emoji_paging() {
+        let _env = crate::testutil::ENV_LOCK.lock().unwrap();
+        let mut a = app(Config {
+            launcher_size: Some((720.0, 480.0)),
+            width: 720,
+            ..Config::default()
+        });
+        assert_eq!(a.panel_height(), 480);
+        assert_eq!(a.vp(), 406.0);
+        a.query = ":".into();
+        a.refresh();
+        assert_eq!((a.vp() / a.layout().cell).floor() as usize, 6);
+        a.cfg.launcher_size = Some((720.0, 100.0));
+        assert_eq!(a.vp(), 26.0);
+        assert_eq!((a.vp() / a.layout().cell).floor().max(1.0) as usize, 1);
+    }
+
+    #[test]
     fn preview_never_changes_config_and_leaving_restores_it() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();
         let cfg = Config {
             theme: "nord".into(),
+            font: config::FontConfig {
+                font_family: Some("DejaVu Sans".into()),
+                mono_font_family: Some("DejaVu Sans Mono".into()),
+                font_size: Some(17.0),
+            },
             ..Config::default()
         };
         let mut a = app(cfg);
@@ -1837,6 +2879,8 @@ mod picker_tests {
         a.refresh();
         a.sync_theme_preview();
         assert_eq!(a.cfg.theme, "nord");
+        assert_eq!(a.font_size, 17.0);
+        assert_eq!(a.mono_font_family.as_deref(), Some("DejaVu Sans Mono"));
         assert_eq!(a.theme, config::theme("dracula"));
         assert!(a.previewing);
         a.query = "#not-a-theme".into();

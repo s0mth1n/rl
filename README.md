@@ -1,10 +1,11 @@
 # zl basic
 
-A small CPU-rendered Wayland launcher. This branch contains only:
+A small CPU-rendered Wayland launcher. This branch includes:
 
 - Application search and launch from XDG desktop entries.
 - An emoji picker with name and shortcode search.
 - Text and PNG clipboard history.
+- Web search with configurable providers and prefix triggers.
 
 There are no quicklinks, notes, window controls, process browser,
 file search, calculator, currency conversion or other utility views.
@@ -22,7 +23,9 @@ cargo build --release
 ./target/release/zl toggle   # bind this to your launcher shortcut
 ```
 
-CLI commands: `show`, `hide`, `toggle`, `clear-clipboard`, `quit`, `themes`.
+CLI commands, as in zlaunch: `show [-m MODES]`, `hide`, `toggle [-m MODES]`, `quit`,
+`reload`, `theme` (prints the current theme), `theme list` and `theme set NAME`.
+Modes include combined, applications, emojis, clipboard, themes and search.
 The daemon stays alive while the panel is hidden.
 
 ## Controls
@@ -36,48 +39,54 @@ activates a row; single-click activation is a config key. In the emoji grid,
 Left/Right moves one cell and Up/Down moves one grid row, wrapping in the
 same column. Search covers the full emoji list.
 
-In Themes, moving selection previews the palette. Enter saves it and returns
-to the launcher; Escape restores the saved palette. Theme names filter the list.
+In Themes, moving selection previews the palette. Enter applies it and returns
+to the launcher; an existing config file is updated, but a missing one is not created.
+Write failures are logged and the selected theme stays active in memory.
+Escape restores the configured palette. Theme names filter the list.
 
 ## Config and privacy
 
 Config is `$XDG_CONFIG_HOME/zl/config.toml` (normally
-`~/.config/zl/config.toml`). Settings save immediately. Restart the daemon
-after editing the file manually.
+`~/.config/zl/config.toml`). Restart the daemon after editing the file.
 
 ```toml
 theme = "default"
-max_rows = 6
-width = 600
+launcher_size = [600.0, 400.0]
+enable_backdrop = true
+enable_transparency = true
+hyprland_auto_blur = true
+max_clipboard_history = 500
+store_passwords = false
+[font]
+font_family = "DejaVu Sans"
+mono_font_family = "DejaVu Sans Mono"
 font_size = 14.0
-disabled_apps = ["Example App"]
-clipboard_history = true
-clipboard_persist = true
-clipboard_max = 100
-single_click = false
-# Optional paths / names:
-font = ""
-emoji_font = ""
-icon_theme = ""
-monitor = ""
-terminal = "" # e.g. "foot -e" for Terminal=true applications
 ```
 
-The built-in themes are zlaunch's default and its 15 named palettes. Run
-`zl themes` for their names. Existing `dark`, `light`, `gruvbox` and
-`catppuccin` names remain aliases. Color overrides accept hex RGB or RGBA
-(`#RGB`, `#RGBA`, `#RRGGBB`, `#RRGGBBAA`); RGB overrides are opaque.
+Font settings are optional. Theme font settings override the global table at startup;
+changing the picker selection previews colors without changing the startup fonts.
 
-Clipboard history is local. Persistence defaults to on under
-`$XDG_STATE_HOME/zl/clipboard` (normally `~/.local/state/zl/clipboard`),
-with a private directory and files. Turning persistence off removes saved
-history and keeps subsequent copies only in memory. Turning collection off
-stops new reads, but does not clear existing history. Clear clipboard
-history removes every saved entry, not the compositor's current selection.
-Copies marked with password-manager/concealed MIME hints are ignored.
-Other unmarked secrets can still enter history. Text is capped at 16 KiB,
-PNG data at 4 MiB per image, with at most eight images. A zero clipboard
-limit disables storage. Emoji sequences copy in full; some color-font
+`hyprland_auto_blur` is parsed but has no effect in this renderer.
+Panel dimensions are rounded to whole pixels; invalid or nonpositive dimensions
+use defaults, and dimensions above 8192 are capped. Panels needing more than
+256 MiB at the output scale are refused.
+Unknown keys are ignored. The old monitor, width, max_rows, emoji_font,
+clipboard_history, clipboard_max, clipboard_persist, icon_theme, terminal,
+disabled_apps, single_click, close_on_focus_loss, pop_on_backspace,
+escape_key_behavior and colors keys are ignored and are not saved.
+
+Run `zl theme list` for the bundled and user themes. User themes load from
+`$XDG_CONFIG_HOME/zl/themes/{name}.toml` (normally `~/.config/zl/themes/`).
+Bundled names take precedence, with no extra aliases. Theme preview does not
+change the config until confirmed.
+
+Clipboard history is local and saved under `$XDG_STATE_HOME/zl/clipboard`
+(normally `~/.local/state/zl/clipboard`), with a private directory and files.
+Copies marked with password-manager/concealed MIME hints are ignored unless
+`store_passwords = true`. Other unmarked secrets can still enter history.
+Text is capped at 16 KiB, PNG data at 4 MiB per image, with at most eight images.
+An omitted or zero `max_clipboard_history` uses 500 text entries.
+Emoji sequences copy in full; some color-font
 sequences display their first base glyph rather than a composed glyph.
 
 ## Checks
@@ -135,3 +144,32 @@ not implemented.
 
 `tests/niri-windows.sh` runs the real launcher against a synthetic Niri socket
 under the headless compositor. It does not test a running Niri desktop.
+
+## Web search
+
+Nonempty queries show Google, DuckDuckGo, Wikipedia and YouTube fallback rows,
+even when application results exist. `!g`, `!d`, `!wiki` and `!yt` select one
+provider; a trigger alone shows no search row. Triggers are case-sensitive
+prefixes, so `!grust` searches Google for `rust`. `show -m search` limits the
+list to web search. Activating a row opens its URL through `xdg-open` and hides
+the launcher. No web request is made while typing.
+
+`search_providers` replaces the defaults; an empty array disables provider rows.
+For example:
+
+```toml
+[[search_providers]]
+name = "Docs"
+trigger = "!doc"
+url = "https://example.com/search?q={query}"
+icon = "book-open"
+```
+
+`icon` is optional and defaults to magnifying-glass; names use the embedded
+Phosphor set. Query text is percent-encoded before each `{query}` substitution.
+
+Parsed applications are cached at `$XDG_CACHE_HOME/zl/apps.json` (normally
+`~/.cache/zl/apps.json`). A cache version mismatch, corrupt file or changed
+top-level XDG applications-directory mtime causes a rescan. Like the reference,
+in-place file edits and nested-directory edits can stay cached if the top-level
+directory mtime is unchanged. Deleting the cache forces the next load to rescan.

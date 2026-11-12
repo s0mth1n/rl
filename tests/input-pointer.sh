@@ -7,7 +7,7 @@ exec 3<>"$OUT/kbd" 4<>"$OUT/ptr"
 sleep .6
 "$Z" quit
 sleep .2
-printf 'close_on_focus_loss = false\nfont = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"\n' > "$XDG_CONFIG_HOME/zl/config.toml"
+printf 'font = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"\n' > "$XDG_CONFIG_HOME/zl/config.toml"
 "$Z" >"$OUT/restart.log" 2>&1 & record_test_pid $!
 sleep .4
 "$Z" show

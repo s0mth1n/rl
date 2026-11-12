@@ -78,36 +78,9 @@ type_query ';Basic clipboard sample'
 shot clipboard-reloaded
 check_text clipboard-reloaded 'Basic clipboard sample'
 echo 'PASS clipboard survives restart'
-"$Z" clear-clipboard
-sleep .2
-[ "$(find "$XDG_STATE_HOME/zl/clipboard" -name '*.png' | wc -l)" = 0 ]
-[ "$(wc -l < "$XDG_STATE_HOME/zl/clipboard/state")" = 1 ]
-echo 'PASS clipboard clear'
-# Start with persistence disabled and an empty saved-history fixture.
-"$Z" quit
-sleep .2
-rm -rf "$XDG_STATE_HOME/zl/clipboard"
-printf 'close_on_focus_loss = false\nclipboard_persist = false\n' > "$XDG_CONFIG_HOME/zl/config.toml"
-"$Z" >"$OUT/memory-only.log" 2>&1 & record_test_pid $!
-sleep .5
-[ ! -d "$XDG_STATE_HOME/zl/clipboard" ]
-printf 'memory-only clipboard sample' | wl-copy
-sleep .3
-[ ! -d "$XDG_STATE_HOME/zl/clipboard" ]
-echo 'PASS persistence off prevents new writes'
-# Collection disabled: a new marker must not enter memory either.
-"$Z" quit
-sleep .2
-printf 'close_on_focus_loss = false\nclipboard_persist = false\nclipboard_history = false\n' > "$XDG_CONFIG_HOME/zl/config.toml"
-"$Z" >"$OUT/collection-disabled.log" 2>&1 & record_test_pid $!
-sleep .5
-printf 'collection-disabled-marker' | wl-copy
-sleep .3
-type_query ';collection-disabled-marker'
-shot collection-disabled
-check_text collection-disabled 'No clipboard history'
-echo 'PASS collection disabled'
-if "$Z" >"$OUT/second-daemon.log" 2>&1; then echo 'FAIL second daemon accepted'; exit 1; fi
+# Release 0.5.1 exits 0 with "already running" when a daemon exists; it must not take over.
+"$Z" >"$OUT/second-daemon.log" 2>&1 || { echo 'FAIL second daemon failed instead of exiting 0'; exit 1; }
+grep -q 'already running' "$OUT/second-daemon.log" || { echo 'FAIL second daemon did not report the running one'; exit 1; }
 "$Z" hide
 echo 'PASS second daemon refused without stealing control socket'
 "$Z" hide

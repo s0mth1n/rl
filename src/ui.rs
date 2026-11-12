@@ -7,11 +7,17 @@ use rusttype::{point, Font, Scale};
 // Layout metrics follow zlaunch (MIT, see NOTICE): 600x400 panel, 12 px corner
 // radius, 1 px border, 57 px header (12 + 32 input + 12 + 1 separator), 8 px
 // list padding, 50 px rows, 24 px icons, 14 px titles and input text.
-pub const HEAD: f32 = 57.0;
+pub const HEAD: f32 = 58.0;
+#[allow(dead_code)]
 pub const ROW: f32 = 50.0;
+#[allow(dead_code)]
 pub const HDR: f32 = 28.0;
+#[cfg(test)]
 pub const ICON: f32 = 24.0;
 pub const LIST_PAD: f32 = 8.0;
+/// Clipboard rows in the 0.5.1 release: 58px pitch, list origin HEAD + 5.
+pub const CLIP_ROW: f32 = 58.0;
+pub const CLIP_TOP: f32 = 5.0;
 /// Query text origin in the header; the search icon box sits at (22, 20.5), drawn by the icon code.
 pub const INPUT_X: f32 = 49.7;
 /// Right edge the query text must clear (room for the clear button).
@@ -22,9 +28,8 @@ pub const INPUT_RIGHT: f32 = 90.0;
 /// text and caret #fafafa, placeholder and header icons #737373.
 pub(crate) const INPUT_FG: Rgb = [250, 250, 250];
 pub(crate) const INPUT_DIM: Rgb = [115, 115, 115];
-/// Input text selection: gpui theme.selection from Default Dark, constant
-/// across launcher themes (selection.background #1d4ed8).
-const INPUT_SELECTION: Rgb = [29, 78, 216];
+/// Input selection measured from the reference launcher's Default Dark input.
+const INPUT_SELECTION: Rgb = [17, 31, 73];
 /// Header separator: gpui theme.border, which zlaunch overrides to white at
 /// 10% for every theme (daemon/theme.rs configure_theme).
 pub(crate) const SEPARATOR: Rgb = [255, 255, 255];
@@ -38,6 +43,7 @@ pub struct Canvas {
     /// clip. The list sets it to the viewport bottom so a partial row is cut
     /// off mid-row, like zlaunch's overflow-hidden vlist.
     clip_y: i32,
+    clip_top: i32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -48,6 +54,7 @@ impl Canvas {
             h,
             buf: vec![0; (w * h * 4) as usize],
             clip_y: i32::MAX,
+            clip_top: 0,
         }
     }
 
@@ -56,8 +63,13 @@ impl Canvas {
         self.clip_y = max_y;
     }
 
+    pub fn set_clip_top(&mut self, min_y: i32) {
+        self.clip_top = min_y;
+    }
+
     pub fn clear_clip(&mut self) {
         self.clip_y = i32::MAX;
+        self.clip_top = 0;
     }
 
     #[inline]
@@ -67,6 +79,7 @@ impl Canvas {
             || x >= self.w as i32
             || y >= self.h as i32
             || y >= self.clip_y
+            || y < self.clip_top
             || a <= 0.0
         {
             return;
@@ -78,6 +91,60 @@ impl Canvas {
         self.buf[o + 1] = (c[1] as f32 * a + self.buf[o + 1] as f32 * k) as u8;
         self.buf[o + 2] = (c[0] as f32 * a + self.buf[o + 2] as f32 * k) as u8;
         self.buf[o + 3] = (255.0 * a + self.buf[o + 3] as f32 * k) as u8;
+    }
+
+    /// Gaussian box shadow like CSS/gpui: `blur` is the CSS blur radius (sigma = blur / 2),
+    /// `spread` grows or shrinks the rectangle, the offset is vertical. Corners follow the
+    /// separable profile, which is close enough for small radii.
+    #[allow(clippy::too_many_arguments)]
+    pub fn shadow(
+        &mut self,
+        (x, y, w, h): (f32, f32, f32, f32),
+        offset_y: f32,
+        blur: f32,
+        spread: f32,
+        alpha: f32,
+    ) {
+        // Abramowitz & Stegun constants carry more digits than f32 holds.
+        #[allow(clippy::excessive_precision)]
+        fn erf(x: f32) -> f32 {
+            let t = 1.0 / (1.0 + 0.3275911 * x.abs());
+            let poly = t
+                * (0.254829592
+                    + t * (-0.284496736
+                        + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+            let y = 1.0 - poly * (-x * x).exp();
+            if x >= 0.0 {
+                y
+            } else {
+                -y
+            }
+        }
+        let sigma = (blur / 2.0).max(0.01);
+        let k = sigma * std::f32::consts::SQRT_2;
+        let (x0, x1) = (x - spread, x + w + spread);
+        let (y0, y1) = (y + offset_y - spread, y + offset_y + h + spread);
+        let reach = blur + 1.0;
+        let (px0, px1) = (
+            ((x0 - reach).floor() as i32).max(0),
+            ((x1 + reach).ceil() as i32).min(self.w as i32),
+        );
+        let (py0, py1) = (
+            ((y0 - reach).floor() as i32).max(0),
+            ((y1 + reach).ceil() as i32).min(self.h as i32),
+        );
+        for py in py0..py1 {
+            let fy = py as f32 + 0.5;
+            let ay = 0.5 * (erf((fy - y0) / k) - erf((fy - y1) / k));
+            for px in px0..px1 {
+                let fx = px as f32 + 0.5;
+                let ax = 0.5 * (erf((fx - x0) / k) - erf((fx - x1) / k));
+                let a = alpha * ax * ay;
+                if a > 0.002 {
+                    self.blend(px, py, [0, 0, 0], a);
+                }
+            }
+        }
     }
 
     /// Filled rounded rectangle with a soft edge. Coordinates are physical pixels.
@@ -159,10 +226,15 @@ impl Canvas {
 
     /// Draw a premultiplied icon with its top left at (x, y).
     pub fn icon(&mut self, x: i32, y: i32, ic: &Icon) {
+        self.icon_rounded(x, y, ic, 0.0);
+    }
+
+    pub fn icon_rounded(&mut self, x: i32, y: i32, ic: &Icon, radius: f32) {
         let n = ic.size as i32;
+        let radius = radius.clamp(0.0, ic.size as f32 / 2.0);
         for iy in 0..n {
             let py = y + iy;
-            if py < 0 || py >= self.h as i32 {
+            if py < 0 || py >= self.h as i32 || py < self.clip_top || py >= self.clip_y {
                 continue;
             }
             for ix in 0..n {
@@ -171,17 +243,25 @@ impl Canvas {
                     continue;
                 }
                 let so = ((iy * n + ix) * 4) as usize;
-                let sa = ic.px[so + 3] as u32;
+                let coverage = if radius > 0.0 {
+                    let fx = ix as f32 + 0.5;
+                    let fy = iy as f32 + 0.5;
+                    let dx = (radius - fx).max(fx - (n as f32 - radius)).max(0.0);
+                    let dy = (radius - fy).max(fy - (n as f32 - radius)).max(0.0);
+                    (radius - dx.hypot(dy) + 0.5).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                let src = |offset| (ic.px[so + offset] as f32 * coverage).round() as u32;
+                let sa = src(3);
                 if sa == 0 {
                     continue;
                 }
                 let o = ((py as u32 * self.w + px as u32) * 4) as usize;
                 let k = 255 - sa;
-                self.buf[o] = (ic.px[so + 2] as u32 + self.buf[o] as u32 * k / 255).min(255) as u8;
-                self.buf[o + 1] =
-                    (ic.px[so + 1] as u32 + self.buf[o + 1] as u32 * k / 255).min(255) as u8;
-                self.buf[o + 2] =
-                    (ic.px[so] as u32 + self.buf[o + 2] as u32 * k / 255).min(255) as u8;
+                self.buf[o] = (src(2) + self.buf[o] as u32 * k / 255).min(255) as u8;
+                self.buf[o + 1] = (src(1) + self.buf[o + 1] as u32 * k / 255).min(255) as u8;
+                self.buf[o + 2] = (src(0) + self.buf[o + 2] as u32 * k / 255).min(255) as u8;
                 self.buf[o + 3] = (sa + self.buf[o + 3] as u32 * k / 255).min(255) as u8;
             }
         }
@@ -221,10 +301,10 @@ impl Canvas {
         let asc = font.v_metrics(sc).ascent;
         let mut text = s.to_string();
         if Self::text_width(font, size, &text) > max_w {
-            while !text.is_empty() && Self::text_width(font, size, &format!("{text}...")) > max_w {
+            while !text.is_empty() && Self::text_width(font, size, &format!("{text}…")) > max_w {
                 text.pop();
             }
-            text.push_str("...");
+            text.push('…');
         }
         let mut end = x;
         for g in font.layout(&text, sc, point(x, y + asc)) {
@@ -293,11 +373,17 @@ fn theme_icon(cv: &mut Canvas, x: f32, y: f32, size: f32, th: &Theme) {
 }
 
 pub struct View<'a> {
+    pub theme_palettes: Option<&'a std::collections::HashMap<String, Theme>>,
     pub query: &'a str,
+    pub literal_prefix: bool,
+    pub placeholder: Option<&'a str>,
+    pub input_text: Option<&'a str>,
+    pub marked: Option<std::ops::Range<usize>>,
     pub input: Option<(usize, Option<usize>, bool)>,
     pub items: &'a [Item],
     pub sel: usize,
     pub top: usize,
+    pub scroll_remainder: f32,
     /// List viewport height in unscaled pixels, from `viewport`.
     pub vp: f32,
     pub theme: Theme,
@@ -305,6 +391,7 @@ pub struct View<'a> {
     pub h: u32,
     pub scale: u32,
     pub font_size: f32,
+    pub mono_font_family: Option<&'a str>,
     pub icons: &'a Cache,
     /// Bold face for section headers (zlaunch styles them EXTRA_BOLD); falls
     /// back to the regular face when no bold font was found.
@@ -312,12 +399,193 @@ pub struct View<'a> {
     /// The sub-view was entered from the main list, so the input prefix is a
     /// clickable back arrow instead of the magnifier (zlaunch mode origin).
     pub back: bool,
-    /// Draw the scrollbar thumb; false once scrolling has been idle for a second.
-    pub show_scrollbar: bool,
+    pub scrollbar: crate::scroll::Style,
+}
+impl View<'_> {
+    #[allow(dead_code)]
+    pub fn mono_font_family(&self) -> Option<&str> {
+        self.mono_font_family
+    }
 }
 
-pub fn icon_px(scale: u32) -> u32 {
-    ICON as u32 * scale
+pub fn icon_px(theme: &Theme, scale: u32) -> u32 {
+    (theme.metrics.icon_size * scale as f32).round().max(1.0) as u32
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Layout {
+    pub row: f32,
+    pub header: f32,
+    pub cell: f32,
+    pub gap: f32,
+    pub columns: usize,
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        Self::new(&crate::config::ThemeMetrics::default())
+    }
+}
+
+impl Layout {
+    pub fn new(m: &crate::config::ThemeMetrics) -> Self {
+        Self {
+            row: (2.0 * (m.item_margin_y + m.item_padding_y)
+                + m.item_content_height.max(m.icon_size))
+            .max(1.0),
+            header: (16.0 + m.section_header_margin_top + m.section_header_margin_bottom).max(1.0),
+            cell: m.emoji_cell_size.max(1.0),
+            gap: m.emoji_cell_gap,
+            columns: m.emoji_columns.max(1),
+        }
+    }
+    pub fn clipboard(metrics: &crate::config::ThemeMetrics) -> Self {
+        let mut layout = Self::new(metrics);
+        layout.row = (CLIP_ROW + layout.row - Self::default().row).max(1.0);
+        layout
+    }
+    fn visible_emoji_rows(&self) -> usize {
+        (LIST_VP / self.cell).floor().max(1.0) as usize
+    }
+    pub fn slots(&self, items: &[Item], top: usize, vp: f32) -> Vec<Slot> {
+        let headers = show_headers(items);
+        let mut out = Vec::new();
+        let mut y = 0.0;
+        for (i, item) in items.iter().enumerate().skip(top) {
+            let sec = section_of(item);
+            let starts = i == 0 || sec != section_of(&items[i - 1]);
+            if headers && starts {
+                if let Some(name) = sec {
+                    if y + self.header >= vp {
+                        break;
+                    }
+                    out.push(Slot {
+                        y,
+                        h: self.header,
+                        item: None,
+                        header: name,
+                    });
+                    y += self.header;
+                }
+            }
+            if y >= vp {
+                break;
+            }
+            out.push(Slot {
+                y,
+                h: self.row.min(vp - y),
+                item: Some(i),
+                header: "",
+            });
+            y += self.row;
+        }
+        out
+    }
+    pub fn max_top(&self, items: &[Item], vp: f32) -> usize {
+        let last = items.len().saturating_sub(1);
+        let (mut lo, mut hi) = (0, items.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self
+                .slots(items, mid, vp)
+                .last()
+                .is_some_and(|s| s.item == Some(last))
+            {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        if lo == items.len() {
+            0
+        } else {
+            lo
+        }
+    }
+    pub fn item_at(&self, items: &[Item], top: usize, vp: f32, y: f32) -> Option<usize> {
+        self.slots(items, top, vp)
+            .into_iter()
+            .find(|s| y >= s.y && y < s.y + s.h)
+            .and_then(|s| s.item)
+    }
+    pub fn emoji_columns(&self, width: u32) -> usize {
+        (((width as f32 - 16.0 + self.gap) / (self.cell + self.gap)) as usize)
+            .clamp(1, self.columns)
+    }
+    pub fn emoji_rows(&self, count: usize, width: u32) -> usize {
+        count
+            .div_ceil(self.emoji_columns(width))
+            .clamp(1, self.visible_emoji_rows())
+    }
+    pub fn emoji_hit(
+        &self,
+        width: u32,
+        rows: usize,
+        top: usize,
+        count: usize,
+        x: f32,
+        y: f32,
+    ) -> Option<usize> {
+        let columns = self.emoji_columns(width);
+        let grid_width = columns as f32 * (self.cell + self.gap) - self.gap;
+        let x = x - (width as f32 - grid_width) / 2.0;
+        let y = y - HEAD - EMOJI_PAD;
+        if x < 0.0 || y < 0.0 || x >= grid_width || y >= rows as f32 * self.cell {
+            return None;
+        }
+        let col = (x / (self.cell + self.gap)) as usize;
+        if x % (self.cell + self.gap) >= self.cell {
+            return None;
+        }
+        let index = top + (y / self.cell) as usize * columns + col;
+        (index < count).then_some(index)
+    }
+    pub fn scroll_offset(&self, items: &[Item], top: usize, clipboard: bool) -> f32 {
+        let mut offset = top.min(items.len()) as f32 * self.row;
+        if !clipboard && show_headers(items) {
+            for (i, item) in items.iter().take(top).enumerate() {
+                if section_of(item).is_some()
+                    && (i == 0 || section_of(item) != section_of(&items[i - 1]))
+                {
+                    offset += self.header;
+                }
+            }
+        }
+        offset
+    }
+    pub fn scroll_item_y(&self, items: &[Item], index: usize, clipboard: bool) -> f32 {
+        let header = !clipboard
+            && show_headers(items)
+            && items.get(index).is_some_and(|item| {
+                section_of(item).is_some()
+                    && (index == 0 || section_of(item) != section_of(&items[index - 1]))
+            });
+        self.scroll_offset(items, index, clipboard) + if header { self.header } else { 0.0 }
+    }
+    pub fn scroll_geometry(
+        &self,
+        items: &[Item],
+        query: &str,
+        width: u32,
+        vp: f32,
+        top: usize,
+        remainder: f32,
+    ) -> Option<crate::scroll::Geometry> {
+        let (content, offset) = if query.starts_with(':') {
+            let columns = self.emoji_columns(width);
+            (
+                items.len().div_ceil(columns) as f32 * self.cell,
+                (top / columns) as f32 * self.cell,
+            )
+        } else {
+            let clipboard = query.starts_with(';');
+            (
+                self.scroll_offset(items, items.len(), clipboard),
+                self.scroll_offset(items, top, clipboard),
+            )
+        };
+        crate::scroll::Geometry::new(vp, content, offset + remainder)
+    }
 }
 
 /// Section an item is listed under, if its kind has one.
@@ -328,7 +596,9 @@ pub fn section_of(it: &Item) -> Option<&'static str> {
     match it.tag {
         "Application" => Some("Applications"),
         "Window" => Some("Windows"),
-        "Basic" => Some("Commands"),
+        "Basic" | "System" => Some("Commands"),
+        "Calculator" => Some("Calculator"),
+        "AI" | "Search" => Some("Search and AI"),
         _ => None,
     }
 }
@@ -363,39 +633,9 @@ pub struct Slot {
 /// vlist; its `h` is the visible part only, so hit tests and the scrollbar
 /// only count the visible region. Headers are kept whole: a header is shown
 /// only when it and at least a sliver of the row below it fit.
+#[allow(dead_code)]
 pub fn slots(items: &[Item], top: usize, vp: f32) -> Vec<Slot> {
-    let headers = show_headers(items);
-    let mut out = Vec::new();
-    let mut y = 0.0;
-    for (i, item) in items.iter().enumerate().skip(top) {
-        let sec = section_of(item);
-        let starts = i == 0 || sec != section_of(&items[i - 1]);
-        if headers && starts {
-            if let Some(name) = sec {
-                if y + HDR >= vp {
-                    break;
-                }
-                out.push(Slot {
-                    y,
-                    h: HDR,
-                    item: None,
-                    header: name,
-                });
-                y += HDR;
-            }
-        }
-        if y >= vp {
-            break;
-        }
-        out.push(Slot {
-            y,
-            h: ROW.min(vp - y),
-            item: Some(i),
-            header: "",
-        });
-        y += ROW;
-    }
-    out
+    Layout::default().slots(items, top, vp)
 }
 
 /// Fixed panel height: zlaunch sizes every panel to `launcher_size`
@@ -404,45 +644,30 @@ pub const PANEL_HEIGHT: u32 = 400;
 /// Fixed height of the list viewport inside the 400 px panel.
 pub const LIST_VP: f32 = PANEL_HEIGHT as f32 - HEAD - LIST_PAD * 2.0;
 /// Emoji grid rows that fit in the fixed panel.
+#[allow(dead_code)]
 pub const EMOJI_ROWS: usize = 5; // (400 - HEAD - 2*EMOJI_PAD) / EMOJI_CELL
 
 /// Largest first item that still leaves no gap below the last row.
+#[allow(dead_code)]
 pub fn max_top(items: &[Item], vp: f32) -> usize {
-    let last = items.len().saturating_sub(1);
-    let (mut lo, mut hi) = (0, items.len());
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if slots(items, mid, vp)
-            .last()
-            .is_some_and(|s| s.item == Some(last))
-        {
-            hi = mid;
-        } else {
-            lo = mid + 1;
-        }
-    }
-    if lo == items.len() {
-        0
-    } else {
-        lo
-    }
+    Layout::default().max_top(items, vp)
 }
 
 /// First visible item so that `sel` is fully shown, moving `top` as little as possible.
 /// Item under list-relative y (unscaled), if any.
+#[allow(dead_code)]
 pub fn item_at(items: &[Item], top: usize, vp: f32, y: f32) -> Option<usize> {
-    slots(items, top, vp)
-        .into_iter()
-        .find(|s| y >= s.y && y < s.y + s.h)
-        .and_then(|s| s.item)
+    Layout::default().item_at(items, top, vp, y)
 }
 
 fn action_label(a: &Action) -> &'static str {
     match a {
-        Action::App(_) => "Open",
+        Action::App(_) | Action::WebSearch(_) => "Open",
+        Action::System(_) => "Run",
+        Action::Calculate(_) => "Copy",
         Action::Window(_) => "Switch",
-        Action::Clip(_) | Action::ClipImg(_) => "Copy",
-        Action::View(_) => "Open",
+        Action::Clip(_) | Action::ClipFiles(_) | Action::ClipImg(_) => "Copy",
+        Action::View(_) => "→",
         Action::Theme(_) => "Apply",
     }
 }
@@ -467,43 +692,61 @@ fn text_lh(
 }
 
 /// Small "return" key glyph: a box with an arrow, right edge at `right`. Returns its width.
-fn enter_key(cv: &mut Canvas, s: f32, right: f32, mid: f32, th: &Theme) -> f32 {
-    let (kw, kh) = (18.0 * s, 15.0 * s);
+fn enter_key(cv: &mut Canvas, font: &Font, s: f32, right: f32, mid: f32, th: &Theme) -> f32 {
+    let m = th.metrics;
+    let fs = m.action_indicator_key_font_size * s;
+    let lh = m.action_indicator_key_line_height * s;
+    let px = m.action_indicator_key_padding_x * s;
+    let pt = m.action_indicator_key_padding_top * s;
+    let pb = m.action_indicator_key_padding_bottom * s;
+    let radius = m.action_indicator_key_border_radius * s;
+    let (kw, kh) = (
+        Canvas::text_width(font, fs, "↵") + 2.0 * px + 2.0 * s,
+        lh + pt + pb + 2.0 * s,
+    );
     let (x, y) = (right - kw, mid - kh / 2.0);
     let bg = th.key_background;
-    cv.rrect(x, y, kw, kh, 3.0 * s, bg.rgb, bg.alpha);
+    cv.rrect(x, y, kw, kh, radius, bg.rgb, bg.alpha);
     let bd = th.key_border;
-    cv.rrect_outline(x, y, kw, kh, 3.0 * s, 1.0 * s, bd.rgb, bd.alpha);
-    let (cx, cy) = (x + kw / 2.0, y + kh / 2.0);
-    let t = (1.0 * s).max(1.0);
+    cv.rrect_outline(x, y, kw, kh, radius, s, bd.rgb, bd.alpha);
     let kc = th.key_color;
-    let (c, a) = (kc.rgb, kc.alpha);
-    // right stem, shaft and a two-step arrow head pointing left
-    cv.rrect(cx + 3.0 * s, cy - 3.5 * s, t, 5.5 * s, 0.0, c, a);
-    cv.rrect(cx - 3.5 * s, cy + 1.5 * s, 7.0 * s + t, t, 0.0, c, a);
-    cv.rrect(cx - 2.5 * s, cy + 0.5 * s, t, t, 0.0, c, a);
-    cv.rrect(cx - 2.5 * s, cy + 2.5 * s, t, t, 0.0, c, a);
-    cv.rrect(cx - 1.5 * s, cy - 0.5 * s, t, t, 0.0, c, a);
-    cv.rrect(cx - 1.5 * s, cy + 3.5 * s, t, t, 0.0, c, a);
+    text_lh(
+        cv,
+        font,
+        fs,
+        x + px + s,
+        y + pt + s,
+        lh,
+        "↵",
+        kc.rgb,
+        kc.alpha,
+        kw,
+    );
     kw
 }
 
+#[allow(dead_code)]
 pub const EMOJI_CELL: f32 = 64.0;
+#[allow(dead_code)]
 pub const EMOJI_GAP: f32 = 2.0;
 pub const EMOJI_PAD: f32 = 8.0;
 
+#[allow(dead_code)]
 pub fn emoji_columns(width: u32) -> usize {
-    (((width as f32 - 16.0 + EMOJI_GAP) / (EMOJI_CELL + EMOJI_GAP)) as usize).clamp(1, 8)
+    Layout::default().emoji_columns(width)
 }
 
+#[allow(dead_code)]
 pub fn emoji_rows(count: usize, width: u32) -> usize {
-    count.div_ceil(emoji_columns(width)).clamp(1, EMOJI_ROWS)
+    Layout::default().emoji_rows(count, width)
 }
 
+#[allow(dead_code)]
 pub fn emoji_icon_px(scale: u32) -> u32 {
     28 * scale
 }
 
+#[allow(dead_code)]
 pub fn emoji_hit(
     width: u32,
     rows: usize,
@@ -512,19 +755,7 @@ pub fn emoji_hit(
     x: f32,
     y: f32,
 ) -> Option<usize> {
-    let columns = emoji_columns(width);
-    let grid_width = columns as f32 * (EMOJI_CELL + EMOJI_GAP) - EMOJI_GAP;
-    let x = x - (width as f32 - grid_width) / 2.0;
-    let y = y - HEAD - EMOJI_PAD;
-    if x < 0.0 || y < 0.0 || x >= grid_width || y >= rows as f32 * EMOJI_CELL {
-        return None;
-    }
-    let col = (x / (EMOJI_CELL + EMOJI_GAP)) as usize;
-    if x % (EMOJI_CELL + EMOJI_GAP) >= EMOJI_CELL {
-        return None;
-    }
-    let index = top + (y / EMOJI_CELL) as usize * columns + col;
-    (index < count).then_some(index)
+    Layout::default().emoji_hit(width, rows, top, count, x, y)
 }
 
 #[cfg(test)]
@@ -565,18 +796,23 @@ pub fn emoji_vertical(selected: usize, count: usize, columns: usize, down: bool)
 
 fn draw_emojis(cv: &mut Canvas, font: &Font, v: &View) {
     let s = v.scale as f32;
-    let columns = emoji_columns(v.w);
-    let grid_width = columns as f32 * (EMOJI_CELL + EMOJI_GAP) - EMOJI_GAP;
+    let layout = Layout::new(&v.theme.metrics);
+    let columns = layout.emoji_columns(v.w);
+    let grid_width = columns as f32 * (layout.cell + layout.gap) - layout.gap;
     let left = (v.w as f32 - grid_width) / 2.0;
     if v.items.is_empty() {
-        // centered in empty_state_color, like zlaunch's emoji render_empty
+        // zlaunch's render_empty: the message is centred in a 200px-high box
+        // at the top of the list area, in empty_state_color.
         let es = v.font_size * s;
         let tw = Canvas::text_width(font, es, "No emojis found");
-        cv.text(
+        let lh = (v.font_size * (1.0 + 5.0_f32.sqrt()) / 2.0).round() * s;
+        text_lh(
+            cv,
             font,
             es,
             (v.w as f32 * s - tw) / 2.0,
-            (HEAD + 14.0) * s,
+            (HEAD + LIST_PAD) * s + (v.theme.metrics.empty_state_height * s - lh) / 2.0,
+            lh,
             "No emojis found",
             v.theme.empty_state_color.rgb,
             v.theme.empty_state_color.alpha,
@@ -585,36 +821,70 @@ fn draw_emojis(cv: &mut Canvas, font: &Font, v: &View) {
     }
     // Rows that start above the viewport bottom are drawn and clipped
     // mid-row, like zlaunch's overflow-hidden emoji vlist.
+    cv.set_clip_top(((HEAD + LIST_PAD) * s) as i32);
     cv.set_clip_y(((HEAD + LIST_PAD + v.vp) * s) as i32);
     for (offset, item) in v
         .items
         .iter()
         .skip(v.top)
-        .take((v.vp / EMOJI_CELL).ceil() as usize * columns)
+        .take(((v.vp + v.scroll_remainder) / layout.cell).ceil() as usize * columns)
         .enumerate()
     {
-        let x = (left + (offset % columns) as f32 * (EMOJI_CELL + EMOJI_GAP)) * s;
-        let y = (HEAD + EMOJI_PAD + (offset / columns) as f32 * EMOJI_CELL) * s;
+        let x = (left + (offset % columns) as f32 * (layout.cell + layout.gap)) * s;
+        let y =
+            (HEAD + EMOJI_PAD + (offset / columns) as f32 * layout.cell - v.scroll_remainder) * s;
         if v.top + offset == v.sel {
             cv.rrect(
                 x,
                 y,
-                EMOJI_CELL * s,
-                EMOJI_CELL * s,
-                6.0 * s,
+                layout.cell * s,
+                layout.cell * s,
+                v.theme.metrics.emoji_cell_border_radius * s,
                 v.theme.emoji_selected.rgb,
                 v.theme.emoji_selected.alpha,
             );
         }
-        if let Some(icon) = item
+        if let Some(icon) = item.icon.as_deref().and_then(|name| {
+            v.icons.get(
+                name,
+                (v.theme.metrics.emoji_font_size * s).round().max(1.0) as u32,
+            )
+        }) {
+            let inset = (layout.cell * s - icon.size as f32) / 2.0;
+            cv.icon((x + inset) as i32, (y + inset) as i32, icon);
+        } else if let Some(glyph) = item
             .icon
             .as_deref()
-            .and_then(|name| v.icons.get(name, emoji_icon_px(v.scale)))
+            .and_then(|name| name.strip_prefix("emoji:"))
         {
-            cv.icon((x + 18.0 * s) as i32, (y + 18.0 * s) as i32, icon);
+            let size = v.theme.metrics.emoji_font_size * s;
+            let width = Canvas::text_width(font, size, glyph);
+            let lh = (v.theme.metrics.emoji_font_size * (1.0 + 5.0_f32.sqrt()) / 2.0).round() * s;
+            text_lh(
+                cv,
+                font,
+                size,
+                x + (layout.cell * s - width) / 2.0,
+                y + (layout.cell * s - lh) / 2.0,
+                lh,
+                glyph,
+                v.theme.text,
+                v.theme.text_alpha,
+                layout.cell * s,
+            );
         }
     }
     cv.clear_clip();
+}
+
+impl View<'_> {
+    fn view_query(&self) -> &str {
+        if self.literal_prefix {
+            ""
+        } else {
+            self.query
+        }
+    }
 }
 
 /// Hit zone for the back arrow in the input prefix, shown when a sub-view
@@ -623,11 +893,18 @@ pub fn back_button_at(x: f64, y: f64) -> bool {
     (14.0..40.0).contains(&x) && y >= (HEAD as f64 - 24.0) / 2.0 && y < (HEAD as f64 + 24.0) / 2.0
 }
 
+#[cfg(test)]
 pub fn clear_button_at(width: u32, query: &str, x: f64, y: f64) -> bool {
-    !query
-        .strip_prefix([':', ';', '#'])
-        .unwrap_or(query)
-        .is_empty()
+    clear_button_at_mode(width, query, x, y, false)
+}
+
+pub fn clear_button_at_mode(width: u32, query: &str, x: f64, y: f64, literal: bool) -> bool {
+    !(if literal {
+        query
+    } else {
+        query.strip_prefix([':', ';', '#']).unwrap_or(query)
+    })
+    .is_empty()
         && x >= width as f64 - 44.0
         && x < width as f64 - 20.0
         && y >= (HEAD as f64 - 24.0) / 2.0
@@ -657,11 +934,22 @@ fn input_start(font: &Font, size: f32, query: &str, caret: usize, max_w: f32) ->
     head.len() - tail.len()
 }
 
-pub fn input_at(font: &Font, query: &str, caret: usize, width: u32, x: f64) -> usize {
-    let shown = query
-        .strip_prefix([':', ';', '#'])
-        .map(str::trim_start)
-        .unwrap_or(query);
+pub fn input_at_mode(
+    font: &Font,
+    query: &str,
+    caret: usize,
+    width: u32,
+    x: f64,
+    literal: bool,
+) -> usize {
+    let shown = if literal {
+        query
+    } else {
+        query
+            .strip_prefix([':', ';', '#'])
+            .map(str::trim_start)
+            .unwrap_or(query)
+    };
     let prefix = query.len() - shown.len();
     let caret = caret.saturating_sub(prefix).min(shown.len());
     let start = input_start(
@@ -683,7 +971,52 @@ pub fn input_at(font: &Font, query: &str, caret: usize, width: u32, x: f64) -> u
     query.len()
 }
 
+fn input_visible_text<'a>(query: &str, text: &'a str) -> &'a str {
+    if query.starts_with([':', ';']) {
+        text[1..].trim_start()
+    } else if query.starts_with('#') {
+        &text[1..]
+    } else {
+        text
+    }
+}
+
+pub fn input_cursor_rectangle(
+    font: &Font,
+    query: &str,
+    text: &str,
+    caret: usize,
+    width: u32,
+) -> (i32, i32, i32, i32) {
+    let shown = input_visible_text(query, text);
+    let prefix = text.len() - shown.len();
+    let caret = caret.saturating_sub(prefix).min(shown.len());
+    let start = input_start(
+        font,
+        16.0,
+        shown,
+        caret,
+        (width as f32 - INPUT_X - INPUT_RIGHT).max(0.0),
+    );
+    let x = INPUT_X + Canvas::text_width(font, 16.0, &shown[start..caret]);
+    (
+        x.round() as i32,
+        ((HEAD - 16.0) / 2.0).round() as i32,
+        2,
+        17,
+    )
+}
+
 fn draw_input(cv: &mut Canvas, font: &Font, v: &View) {
+    draw_input_with_placeholder(cv, font, v, None);
+}
+
+pub fn draw_input_with_placeholder(
+    cv: &mut Canvas,
+    font: &Font,
+    v: &View,
+    override_placeholder: Option<&str>,
+) {
     let s = v.scale as f32;
     let w = v.w as f32 * s;
     let fs = 16.0 * s;
@@ -692,10 +1025,15 @@ fn draw_input(cv: &mut Canvas, font: &Font, v: &View) {
     // directly shows a palette, as zlaunch's theme mode does.
     let prefix_icon = if v.back {
         crate::icons::BACK
-    } else if v.query.trim_start().starts_with('#') {
+    } else if v.view_query().trim_start().starts_with('#') {
         crate::icons::PALETTE
     } else {
-        crate::icons::SEARCH
+        match v.placeholder {
+            Some("Search windows...") => crate::icons::DASHBOARD,
+            Some("Search actions...") => crate::icons::MODE_ACTIONS,
+            Some("Search the web...") => crate::icons::MODE_SEARCH,
+            _ => crate::icons::SEARCH,
+        }
     };
     if let Some(icon) = v.icons.get(prefix_icon, 16 * v.scale) {
         cv.symbol(
@@ -708,16 +1046,19 @@ fn draw_input(cv: &mut Canvas, font: &Font, v: &View) {
     }
     let x = INPUT_X * s;
     let max_w = (w - x - INPUT_RIGHT * s).max(0.0);
-    let (query, placeholder) = if let Some(query) = v.query.strip_prefix(':') {
-        (query.trim_start(), "Search emojis...")
-    } else if let Some(query) = v.query.strip_prefix('#') {
-        (query.trim_start(), "Search themes...")
-    } else if let Some(query) = v.query.strip_prefix(';') {
-        (query.trim_start(), "Search clipboard...")
+    let input_text = v.input_text.unwrap_or(v.query);
+    let placeholder = if v.view_query().starts_with(':') {
+        "Search emojis..."
+    } else if v.view_query().starts_with('#') {
+        "Search themes..."
+    } else if v.view_query().starts_with(';') {
+        "Search clipboard..."
     } else {
-        (v.query, "Search anything...")
+        v.placeholder.unwrap_or("Search anything...")
     };
-    let prefix = v.query.len() - query.len();
+    let query = input_visible_text(v.view_query(), input_text);
+    let placeholder = override_placeholder.unwrap_or(placeholder);
+    let prefix = input_text.len() - query.len();
     let (caret, anchor, visible) = v.input.unwrap_or((v.query.len(), None, true));
     let caret = caret.saturating_sub(prefix).min(query.len());
     let start = input_start(font, fs, query, caret, max_w);
@@ -735,7 +1076,7 @@ fn draw_input(cv: &mut Canvas, font: &Font, v: &View) {
         if lo < hi {
             let left = Canvas::text_width(font, fs, &query[start..lo]);
             let width = Canvas::text_width(font, fs, &query[lo..hi]);
-            cv.rrect(x + left, y, width, fs * 1.15, 0.0, INPUT_SELECTION, 1.0);
+            cv.rrect(x + left, y, width, 17.0 * s, 0.0, INPUT_SELECTION, 1.0);
         }
     }
     if query.is_empty() {
@@ -743,9 +1084,18 @@ fn draw_input(cv: &mut Canvas, font: &Font, v: &View) {
     } else {
         cv.text(font, fs, x, y, &query[start..end], INPUT_FG, 1.0, max_w);
     }
+    if let Some(marked) = &v.marked {
+        let lo = marked.start.saturating_sub(prefix).max(start).min(end);
+        let hi = marked.end.saturating_sub(prefix).min(end).max(lo);
+        if lo < hi {
+            let left = Canvas::text_width(font, fs, &query[start..lo]);
+            let width = Canvas::text_width(font, fs, &query[lo..hi]);
+            cv.rrect(x + left, y + 17.0 * s, width, s, 0.0, INPUT_FG, 1.0);
+        }
+    }
     if visible && anchor.is_none_or(|a| a == caret + prefix) {
         let cx = Canvas::text_width(font, fs, &query[start..caret]);
-        cv.rrect(x + cx, y, 2.0 * s, fs * 1.15, 0.0, INPUT_FG, 1.0);
+        cv.rrect(x + cx, y, 2.0 * s, 17.0 * s, 0.0, INPUT_FG, 1.0);
     }
     // zlaunch's Input cleanable(true) shows CircleX whenever text is present;
     // a bare mode prefix (':', ';') alone is not text.
@@ -763,24 +1113,23 @@ fn draw_input(cv: &mut Canvas, font: &Font, v: &View) {
 }
 
 pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
+    let layout = Layout::new(&v.theme.metrics);
     let s = v.scale as f32;
     let th = &v.theme;
     let (w, h) = (v.w as f32 * s, v.h as f32 * s);
     let wr = th.window_border_radius * s;
     cv.rrect(0.0, 0.0, w, h, wr, th.bg, th.bg_alpha);
-    // zlaunch's daemon forces theme.window_border transparent (daemon theme.rs),
-    // so the window outline is invisible; th.border keeps the TOML value for the
-    // theme-picker preview swatch.
-    cv.rrect_outline(0.0, 0.0, w, h, wr, 1.0 * s, th.border, 0.0);
+    cv.rrect_outline(0.0, 0.0, w, h, wr, s, th.border, th.border_alpha);
     draw_input(cv, font, v);
     cv.rrect(0.0, (HEAD - 1.0) * s, w, s, 0.0, SEPARATOR, SEPARATOR_ALPHA);
-    if v.query.starts_with(':') {
+    if v.view_query().starts_with(':') {
         draw_emojis(cv, font, v);
+        draw_scrollbar(cv, v);
         return;
     }
     if v.items.is_empty() {
         let es = v.font_size * s;
-        let label = if crate::items::theme_view(v.query) {
+        let label = if crate::items::theme_view(v.view_query()) {
             "No themes found"
         } else {
             "No items found"
@@ -791,7 +1140,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
             font,
             es,
             (w - tw) / 2.0,
-            (HEAD + LIST_PAD + 17.0) * s,
+            (HEAD + LIST_PAD + v.theme.metrics.empty_state_height / 2.0 - 10.0) * s,
             label,
             ec.rgb,
             ec.alpha,
@@ -800,19 +1149,21 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
         return;
     }
     let title_px = 14.0 * s;
+    let m = th.metrics;
     // Clip rows at the viewport bottom so a partial row is cut mid-row,
     // like zlaunch's overflow-hidden vlist.
+    cv.set_clip_top(((HEAD + LIST_PAD) * s) as i32);
     cv.set_clip_y(((HEAD + LIST_PAD + v.vp) * s) as i32);
-    for sl in slots(v.items, v.top, v.vp) {
-        let y = (HEAD + LIST_PAD + sl.y) * s;
+    for sl in layout.slots(v.items, v.top, v.vp + v.scroll_remainder) {
+        let y = (HEAD + LIST_PAD + sl.y - v.scroll_remainder) * s;
         let Some(i) = sl.item else {
             // section header: EXTRA_BOLD in zlaunch; 8px above, 4px below, 16px in
             text_lh(
                 cv,
                 v.bold_font.unwrap_or(font),
                 12.0 * s,
-                16.0 * s,
-                y + 8.0 * s,
+                (1.0 + m.item_margin_x + m.item_padding_x) * s,
+                y + m.section_header_margin_top * s,
                 16.0 * s,
                 sl.header,
                 th.section_header_color.rgb,
@@ -832,72 +1183,121 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
         };
         if bg_alpha > 0.0 {
             cv.rrect(
-                8.0 * s,
-                y + 1.0 * s,
-                w - 16.0 * s,
-                (ROW - 2.0) * s,
-                6.0 * s,
+                (1.0 + m.item_margin_x) * s,
+                y + m.item_margin_y * s,
+                w - 2.0 * (1.0 + m.item_margin_x) * s,
+                (layout.row - 2.0 * m.item_margin_y) * s,
+                m.item_border_radius * s,
                 bg,
                 bg_alpha,
             );
         }
-        let (ix, iy) = (16.0 * s, y + (ROW - ICON) / 2.0 * s);
+        let icon_size = m.icon_size * s;
+        let (ix, iy) = (
+            (1.0 + m.item_margin_x + m.item_padding_x) * s,
+            y + (layout.row * s - icon_size) / 2.0,
+        );
         let icon_name = it.icon.as_deref();
-        if let Some(name) = icon_name.and_then(|n| n.strip_prefix("theme:")) {
-            theme_icon(cv, ix, iy, ICON * s, &crate::config::theme(name));
-        } else if let Some(ic) = icon_name.and_then(|n| v.icons.get(n, icon_px(v.scale))) {
+        if matches!(it.action, Action::Calculate(_)) {
+            let bg = th.calculator_background;
+            cv.rrect(ix, iy, icon_size, icon_size, 4.0 * s, bg.rgb, bg.alpha);
+            let color = th.calculator_icon;
+            text_lh(
+                cv,
+                font,
+                14.0 * s,
+                ix + 6.0 * s,
+                iy,
+                icon_size,
+                "=",
+                color.rgb,
+                color.alpha,
+                icon_size,
+            );
+        } else if let Some(name) = icon_name.and_then(|n| n.strip_prefix("theme:")) {
+            let palette = v
+                .theme_palettes
+                .and_then(|palettes| palettes.get(name))
+                .copied()
+                .unwrap_or_else(|| crate::config::theme(name));
+            theme_icon(cv, ix, iy, icon_size, &palette);
+        } else if let Some(ic) = icon_name.and_then(|n| v.icons.get(n, icon_px(th, v.scale))) {
             if ic.symbol {
-                cv.symbol(ix as i32, iy as i32, ic, th.dim, th.dim_alpha);
+                let pb = th.icon_placeholder_background;
+                cv.rrect(
+                    ix,
+                    iy,
+                    icon_size,
+                    icon_size,
+                    m.icon_border_radius * s,
+                    pb.rgb,
+                    pb.alpha,
+                );
+                let pc = th.icon_placeholder_color;
+                cv.symbol(ix as i32, iy as i32, ic, pc.rgb, pc.alpha);
             } else {
-                cv.icon(ix as i32, iy as i32, ic);
+                cv.icon_rounded(ix as i32, iy as i32, ic, m.icon_border_radius * s);
             }
         } else {
             let pb = th.icon_placeholder_background;
-            cv.rrect(ix, iy, ICON * s, ICON * s, 4.0 * s, pb.rgb, pb.alpha);
-            let initial: String = it
-                .title
-                .chars()
-                .find(|c| c.is_alphanumeric())
-                .map(|c| c.to_uppercase().to_string())
-                .unwrap_or_default();
-            let iw = Canvas::text_width(font, 14.0 * s, &initial);
+            cv.rrect(
+                ix,
+                iy,
+                icon_size,
+                icon_size,
+                m.icon_border_radius * s,
+                pb.rgb,
+                pb.alpha,
+            );
+            let initial = "?";
+            let iw = Canvas::text_width(font, 14.0 * s, initial);
             let pc = th.icon_placeholder_color;
             text_lh(
                 cv,
                 font,
                 14.0 * s,
-                ix + ICON * s / 2.0 - iw / 2.0,
+                ix + icon_size / 2.0 - iw / 2.0,
                 iy,
-                ICON * s,
-                &initial,
+                icon_size,
+                initial,
                 pc.rgb,
                 pc.alpha,
                 40.0 * s,
             );
         }
         // trailing action hint, shown on the selected row only
-        let mut right = w - 24.0 * s;
+        let mut right = w
+            - (1.0
+                + th.metrics.item_margin_x
+                + th.metrics.item_padding_x
+                + th.metrics.action_indicator_right_position)
+                * s;
         if selected {
             let label = action_label(&it.action);
-            let kw = enter_key(cv, s, right, y + ROW / 2.0 * s, th);
+            let kw = enter_key(cv, font, s, right, y + layout.row / 2.0 * s, th);
             let lw = Canvas::text_width(font, 12.0 * s, label);
             text_lh(
                 cv,
                 font,
                 12.0 * s,
                 right - kw - 8.0 * s - lw,
-                y + (ROW - 16.0) / 2.0 * s,
+                y + (layout.row - 16.0) / 2.0 * s,
                 16.0 * s,
                 label,
                 th.action_label.rgb,
                 th.action_label.alpha,
                 lw + 4.0,
             );
-            right -= kw + 8.0 + lw + 8.0 * s;
+            right -= kw + 8.0 * s + lw + 8.0 * s;
         }
-        let tx = 48.0 * s;
+        let tx = ix + icon_size + 8.0 * s;
         let max_t = right - tx - 8.0 * s;
-        if it.sub.is_empty() {
+        if let Action::Calculate(result) = &it.action {
+            let (color, alpha) = if result.is_error {
+                (th.calculator_error.rgb, th.calculator_error.alpha)
+            } else {
+                (th.text, th.text_alpha)
+            };
             text_lh(
                 cv,
                 font,
@@ -905,6 +1305,19 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
                 tx,
                 y + (ROW - 16.0) / 2.0 * s,
                 16.0 * s,
+                &it.title,
+                color,
+                alpha,
+                max_t,
+            );
+        } else if it.sub.is_empty() {
+            text_lh(
+                cv,
+                font,
+                title_px,
+                tx,
+                y + (layout.row - m.item_title_line_height) / 2.0 * s,
+                m.item_title_line_height * s,
                 &it.title,
                 th.text,
                 th.text_alpha,
@@ -916,8 +1329,8 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
                 font,
                 title_px,
                 tx,
-                y + 8.0 * s,
-                16.0 * s,
+                y + (layout.row - m.item_content_height) / 2.0 * s,
+                m.item_title_line_height * s,
                 &it.title,
                 th.text,
                 th.text_alpha,
@@ -928,8 +1341,8 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
                 font,
                 12.0 * s,
                 tx,
-                y + 24.0 * s,
-                18.0 * s,
+                y + ((layout.row - m.item_content_height) / 2.0 + m.item_title_line_height) * s,
+                m.layout_item_description_height * s,
                 &it.sub,
                 th.dim,
                 th.dim_alpha,
@@ -938,27 +1351,74 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
         }
     }
     cv.clear_clip();
-    // scroll hint
-    let vp = v.vp * s;
-    let max = max_top(v.items, v.vp);
-    if max > 0 && v.show_scrollbar {
-        let track = vp - 12.0 * s;
-        let visible = slots(v.items, v.top, v.vp)
-            .iter()
-            .filter(|x| x.item.is_some())
-            .count();
-        let th_h = (track * visible as f32 / v.items.len() as f32).max(18.0 * s);
-        let ty = (HEAD + LIST_PAD) * s + 6.0 * s + (track - th_h) * (v.top as f32 / max as f32);
-        cv.rrect(
-            w - 5.0 * s,
-            ty,
-            2.5 * s,
-            th_h,
-            1.2 * s,
-            th.dim,
-            th.dim_alpha,
-        );
+    draw_scrollbar(cv, v);
+}
+
+#[allow(dead_code)]
+pub fn scroll_offset(items: &[Item], top: usize, clipboard: bool) -> f32 {
+    Layout::default().scroll_offset(items, top, clipboard)
+}
+
+#[allow(dead_code)]
+pub fn scroll_item_y(items: &[Item], index: usize, clipboard: bool) -> f32 {
+    Layout::default().scroll_item_y(items, index, clipboard)
+}
+
+#[allow(dead_code)]
+pub fn scroll_geometry(
+    items: &[Item],
+    query: &str,
+    width: u32,
+    vp: f32,
+    top: usize,
+    remainder: f32,
+) -> Option<crate::scroll::Geometry> {
+    let layout = if query.starts_with(';') {
+        Layout::clipboard(&crate::config::ThemeMetrics::default())
+    } else {
+        Layout::default()
+    };
+    layout.scroll_geometry(items, query, width, vp, top, remainder)
+}
+
+pub fn draw_scrollbar(cv: &mut Canvas, v: &View) {
+    if v.scrollbar.alpha <= 0.0 {
+        return;
     }
+    let layout = if v.view_query().starts_with(';') {
+        Layout::clipboard(&v.theme.metrics)
+    } else {
+        Layout::new(&v.theme.metrics)
+    };
+    let Some(g) = layout.scroll_geometry(
+        v.items,
+        v.view_query(),
+        v.w,
+        v.vp,
+        v.top,
+        v.scroll_remainder,
+    ) else {
+        return;
+    };
+    let s = v.scale as f32;
+    let right = if v.view_query().starts_with(';') {
+        v.w as f32 * 0.5
+    } else {
+        v.w as f32
+    };
+    let wide = v.scrollbar.active || v.scrollbar.hovered;
+    let width = if wide { 8.0 } else { 6.0 };
+    let color = [82, 82, 82];
+    let alpha = if v.scrollbar.active { 1.0 } else { 0.9 } * v.scrollbar.alpha;
+    cv.rrect(
+        (right - 4.0 - width) * s,
+        (HEAD + LIST_PAD + g.start) * s,
+        width * s,
+        g.length * s,
+        width * s / 2.0,
+        color,
+        alpha,
+    );
 }
 
 #[cfg(test)]
@@ -1009,21 +1469,28 @@ mod tests {
             &mut cv,
             font,
             &View {
+                theme_palettes: None,
+                literal_prefix: false,
                 query: "a",
+                placeholder: None,
+                input_text: None,
+                marked: None,
                 input: None,
                 items,
                 sel,
                 top: 0,
+                scroll_remainder: 0.0,
                 vp,
                 theme: th,
                 w: 640,
                 h,
                 scale: 1,
                 font_size: 15.0,
+                mono_font_family: None,
                 icons: &icons,
                 bold_font: None,
                 back: false,
-                show_scrollbar: true,
+                scrollbar: crate::scroll::Style::visible(),
             },
         );
         cv
@@ -1053,6 +1520,14 @@ mod tests {
     }
 
     #[test]
+    fn preedit_mode_characters_are_visible_until_committed() {
+        assert_eq!(input_visible_text("", ":"), ":");
+        assert_eq!(input_visible_text("", ";"), ";");
+        assert_eq!(input_visible_text("", "#"), "#");
+        assert_eq!(input_visible_text(";", "; café"), "café");
+    }
+
+    #[test]
     fn input_row_matches_zlaunch_gpui_dark() {
         let Some(font) = test_font() else {
             eprintln!("skip: DejaVu Sans not installed");
@@ -1061,7 +1536,7 @@ mod tests {
         let items: Vec<Item> = (0..3).map(|i| app(&format!("a{i}"))).collect();
         let cv = drawn(&font, &items, 0, Theme::default());
         // separator: white at 0.1, constant across themes (gpui theme.border)
-        assert_eq!(px(&cv, 500, 56), [34, 34, 34, 185]);
+        assert_eq!(px(&cv, 500, 57), [34, 34, 34, 185]);
         // magnifier at (22, 20.5) and, with a non-empty query, CircleX right
         assert!(lit(&cv, 22, 38, 20, 37) > 5, "magnifier icon drawn");
         assert!(lit(&cv, 600, 616, 20, 37) > 5, "clear button drawn");
@@ -1086,19 +1561,26 @@ mod tests {
             &mut cv,
             &font,
             &View {
+                theme_palettes: None,
+                literal_prefix: false,
                 query: "",
+                placeholder: None,
+                input_text: None,
+                marked: None,
                 input: None,
                 back: false,
-                show_scrollbar: true,
+                scrollbar: crate::scroll::Style::visible(),
                 items: &items,
                 sel: 0,
                 top: 0,
+                scroll_remainder: 0.0,
                 vp,
                 theme: Theme::default(),
                 w: 640,
                 h,
                 scale: 1,
                 font_size: 15.0,
+                mono_font_family: None,
                 icons: &icons,
                 bold_font: None,
             },
@@ -1120,27 +1602,117 @@ mod tests {
             &mut cv,
             &font,
             &View {
+                theme_palettes: None,
+                literal_prefix: false,
                 query: "a",
+                placeholder: None,
+                input_text: None,
+                marked: None,
                 input: Some((1, Some(0), true)),
                 items: &items,
                 sel: 0,
                 top: 0,
+                scroll_remainder: 0.0,
                 vp,
                 theme: Theme::default(),
                 w: 640,
                 h,
                 scale: 1,
                 font_size: 15.0,
+                mono_font_family: None,
                 back: false,
-                show_scrollbar: false,
+                scrollbar: crate::scroll::Style::default(),
                 icons: &icons,
                 bold_font: None,
             },
         );
         assert!(
-            has_solid(&cv, 50, 62, 20, 40, [216, 78, 29, 255]),
+            has_solid(&cv, 50, 62, 20, 40, [73, 31, 17, 255]),
             "selection"
         );
+    }
+
+    #[test]
+    fn icon_corners_and_partial_rows_clip_premultiplied_pixels() {
+        let icon = Icon {
+            size: 24,
+            px: [128, 64, 32, 128].repeat(24 * 24),
+            symbol: false,
+        };
+        let mut cv = Canvas::new(30, 30);
+        cv.set_clip_y(15);
+        cv.icon_rounded(2, 2, &icon, 4.0);
+        assert_eq!(px(&cv, 2, 2), [0; 4]);
+        assert_eq!(px(&cv, 14, 14), [32, 64, 128, 128]);
+        assert_eq!(px(&cv, 14, 15), [0; 4]);
+        assert_eq!(px(&cv, 14, 25), [0; 4]);
+        let edge = px(&cv, 3, 2);
+        assert!(edge[3] > 0 && edge[3] < 128);
+        assert!(edge[0] <= edge[1] && edge[1] <= edge[2] && edge[2] <= edge[3]);
+        cv.clear_clip();
+        cv.icon_rounded(2, 2, &icon, 100.0);
+        assert_ne!(px(&cv, 14, 25), [0; 4]);
+        let mut plain = Canvas::new(24, 24);
+        plain.icon(0, 0, &icon);
+        assert_eq!(px(&plain, 0, 0), [32, 64, 128, 128]);
+    }
+
+    #[test]
+    fn missing_app_icons_use_the_same_question_mark() {
+        let Some(font) = test_font() else { return };
+        let a = drawn(&font, &[app("Alpha")], 0, Theme::default());
+        let b = drawn(&font, &[app("Beta")], 0, Theme::default());
+        for y in 78..102 {
+            for x in 16..40 {
+                assert_eq!(px(&a, x, y), px(&b, x, y));
+            }
+        }
+    }
+
+    #[test]
+    fn text_ellipsis_and_key_box_use_font_glyph_widths() {
+        let Some(font) = test_font() else { return };
+        let mut actual = Canvas::new(120, 30);
+        let mut expected = Canvas::new(120, 30);
+        let width = Canvas::text_width(&font, 14.0, "ab…");
+        actual.text(&font, 14.0, 0.0, 0.0, "abcdefghijkl", [255; 3], 1.0, width);
+        expected.text(&font, 14.0, 0.0, 0.0, "ab…", [255; 3], 1.0, width);
+        assert_eq!(actual.buf, expected.buf);
+        for scale in [1.0, 2.0, 3.0] {
+            let width = enter_key(&mut actual, &font, scale, 100.0, 15.0, &Theme::default());
+            assert_eq!(
+                width,
+                Canvas::text_width(&font, 10.0 * scale, "↵") + 10.0 * scale
+            );
+        }
+    }
+
+    #[test]
+    fn action_key_uses_theme_padding_font_line_height_and_radius() {
+        let Some(font) = test_font() else { return };
+        let mut theme = Theme::default();
+        theme.metrics.action_indicator_key_padding_x = 9.0;
+        theme.metrics.action_indicator_key_padding_top = 6.0;
+        theme.metrics.action_indicator_key_padding_bottom = 4.0;
+        theme.metrics.action_indicator_key_font_size = 18.0;
+        theme.metrics.action_indicator_key_line_height = 24.0;
+        theme.metrics.action_indicator_key_border_radius = 0.0;
+        theme.key_background.alpha = 1.0;
+        theme.key_background.rgb = [255, 0, 0];
+        for scale in [1.0, 2.0] {
+            let mut cv = Canvas::new(400, 120);
+            let width = enter_key(&mut cv, &font, scale, 150.0 * scale, 30.0 * scale, &theme);
+            assert_eq!(
+                width,
+                Canvas::text_width(&font, 18.0 * scale, "↵") + 20.0 * scale
+            );
+            let height = 36.0 * scale;
+            let left = (150.0 * scale - width).ceil() as u32 + 2;
+            let top = (30.0 * scale - height / 2.0).ceil() as u32;
+            assert_ne!(px(&cv, left, top + 2), [0; 4]);
+            assert_eq!(px(&cv, left, top - 1), [0; 4]);
+            assert_eq!(px(&cv, left, (top as f32 + height + 1.0) as u32), [0; 4]);
+        }
     }
 
     #[test]
@@ -1153,8 +1725,8 @@ mod tests {
         let cv = drawn(&font, &items, 0, Theme::default());
         // panel: gray 15 at 0.7 alpha over a transparent buffer
         assert_eq!(px(&cv, 500, 30), [10, 10, 10, 178]);
-        // window border: daemon forces window_border transparent, only panel shows
-        assert_eq!(px(&cv, 0, 110), [10, 10, 10, 178]);
+        // LauncherTheme.window_border is independent of the transparent GPUI border.
+        assert_eq!(px(&cv, 0, 110), [33, 33, 33, 185]);
         // selected row: white at 0.07 over the panel, not solid white
         assert_eq!(px(&cv, 480, 90), [27, 27, 27, 183]);
         // unselected row: item_background is transparent, the panel shows through
@@ -1435,18 +2007,21 @@ mod tests {
     #[test]
     fn launcher_metrics_match_the_ported_layout() {
         let cfg = crate::config::Config::default();
-        assert_eq!((cfg.width, cfg.max_rows, cfg.font_size), (600, 6, 14.0));
+        assert_eq!(
+            (cfg.width, cfg.max_rows, cfg.startup_font_size()),
+            (600, 6, 14.0)
+        );
         assert_eq!(
             (HEAD, ROW, HDR, ICON, LIST_PAD),
-            (57.0, 50.0, 28.0, 24.0, 8.0)
+            (58.0, 50.0, 28.0, 24.0, 8.0)
         );
         assert_eq!((INPUT_X, INPUT_RIGHT), (49.7, 90.0));
         // zlaunch's default launcher_size fixes every panel at 600x400.
         assert_eq!(PANEL_HEIGHT, 400);
-        assert_eq!(LIST_VP, 327.0);
+        assert_eq!(LIST_VP, 326.0);
         assert_eq!(EMOJI_ROWS, 5);
         for scale in 1..=4 {
-            assert_eq!(icon_px(scale), 24 * scale);
+            assert_eq!(icon_px(&Theme::default(), scale), 24 * scale);
         }
     }
     #[test]
@@ -1491,43 +2066,149 @@ mod tests {
     }
     #[test]
     fn partial_row_is_clipped_at_the_viewport_bottom() {
-        // The fixed 327px viewport shows full rows plus a clipped last row.
+        // The fixed 326px viewport shows full rows plus a clipped last row.
         let Some(font) = test_font() else { return };
         let mut icons = Cache::new("", "");
         icons.ensure_input(1);
         let items = sectioned(30);
         let sl = slots(&items, 0, LIST_VP);
         let last = sl.last().unwrap();
-        assert_eq!(last.h, 21.0); // 327 - (2*28 + 5*50)
+        assert_eq!(last.h, 20.0); // 326 - (2*28 + 5*50)
                                   // The 7th row's box and text stop at the viewport bottom (392px).
         let mut cv = Canvas::new(600, PANEL_HEIGHT);
         draw(
             &mut cv,
             &font,
             &View {
+                theme_palettes: None,
+                literal_prefix: false,
                 query: "a",
+                placeholder: None,
+                input_text: None,
+                marked: None,
                 input: None,
                 items: &items,
                 sel: 5,
                 top: 0,
+                scroll_remainder: 0.0,
                 vp: LIST_VP,
                 theme: Theme::default(),
                 w: 600,
                 h: PANEL_HEIGHT,
                 scale: 1,
                 font_size: 14.0,
+                mono_font_family: None,
                 icons: &icons,
                 bold_font: None,
                 back: false,
-                show_scrollbar: false,
+                scrollbar: crate::scroll::Style::default(),
             },
         );
         // Pixels below the viewport keep the panel background.
-        for y in 392..400 {
-            assert_eq!(px(&cv, 300, y), px(&cv, 300, 399), "y={y}");
+        for y in 392..399 {
+            assert_eq!(px(&cv, 300, y), px(&cv, 300, 398), "y={y}");
         }
         assert_ne!(px(&cv, 300, 391), px(&cv, 300, 399));
     }
+    #[test]
+    fn emoji_draws_monochrome_or_missing_glyph_when_bitmap_is_unavailable() {
+        let Some(font) = test_font() else { return };
+        let icons = Cache::new("", "");
+        for glyph in ["😀", "\u{10ffff}"] {
+            let mut item = app("emoji");
+            item.icon = Some(format!("emoji:{glyph}"));
+            let items = [item];
+            let mut cv = Canvas::new(600, 400);
+            let view = View {
+                theme_palettes: None,
+                literal_prefix: false,
+                query: ":",
+                placeholder: None,
+                input_text: None,
+                marked: None,
+                input: None,
+                items: &items,
+                sel: usize::MAX,
+                top: 0,
+                scroll_remainder: 0.0,
+                vp: LIST_VP,
+                theme: Theme::default(),
+                w: 600,
+                h: 400,
+                scale: 1,
+                font_size: 14.0,
+                mono_font_family: None,
+                icons: &icons,
+                bold_font: None,
+                back: false,
+                scrollbar: crate::scroll::Style::default(),
+            };
+            draw_emojis(&mut cv, &font, &view);
+            assert!(
+                cv.buf.as_chunks::<4>().0.iter().any(|p| p[3] != 0),
+                "{glyph}"
+            );
+            assert!(cv
+                .buf
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p[3] != 0)
+                .all(|(i, _)| (HEAD as usize..(HEAD + 64.0) as usize + 12).contains(&(i / 600))));
+        }
+    }
+
+    #[test]
+    fn emoji_empty_state_centres_a_golden_ratio_line_box() {
+        let Some(font) = test_font() else { return };
+        let icons = Cache::new("", "");
+        for scale in [1, 2] {
+            let s = scale as f32;
+            let mut cv = Canvas::new(600 * scale, 400 * scale);
+            let view = View {
+                theme_palettes: None,
+                literal_prefix: false,
+                query: ":missing",
+                placeholder: None,
+                input_text: None,
+                marked: None,
+                input: None,
+                items: &[],
+                sel: 0,
+                top: 0,
+                scroll_remainder: 0.0,
+                vp: LIST_VP,
+                theme: Theme::default(),
+                w: 600,
+                h: 400,
+                scale,
+                font_size: 14.0,
+                mono_font_family: None,
+                icons: &icons,
+                bold_font: None,
+                back: false,
+                scrollbar: crate::scroll::Style::default(),
+            };
+            draw_emojis(&mut cv, &font, &view);
+            let mut expected = Canvas::new(600 * scale, 400 * scale);
+            let lh = 23.0 * s;
+            text_lh(
+                &mut expected,
+                &font,
+                14.0 * s,
+                (600.0 * s - Canvas::text_width(&font, 14.0 * s, "No emojis found")) / 2.0,
+                (HEAD + LIST_PAD) * s + (200.0 * s - lh) / 2.0,
+                lh,
+                "No emojis found",
+                view.theme.empty_state_color.rgb,
+                view.theme.empty_state_color.alpha,
+                600.0 * s,
+            );
+            assert_eq!(cv.buf, expected.buf);
+        }
+    }
+
     #[test]
     fn emoji_grid_clips_a_partial_row_at_the_viewport_bottom() {
         // zlaunch's emoji picker is the same overflow-hidden vlist: with the
@@ -1541,27 +2222,34 @@ mod tests {
             &mut cv,
             &font,
             &View {
+                theme_palettes: None,
+                literal_prefix: false,
                 query: ":smile",
+                placeholder: None,
+                input_text: None,
+                marked: None,
                 input: None,
                 items: &items,
                 sel: 40, // row 5, column 0: the partially visible row
                 top: 0,
+                scroll_remainder: 0.0,
                 vp: LIST_VP,
                 theme: Theme::default(),
                 w: 640,
                 h: PANEL_HEIGHT,
                 scale: 1,
                 font_size: 14.0,
+                mono_font_family: None,
                 icons: &icons,
                 bold_font: None,
                 back: false,
-                show_scrollbar: false,
+                scrollbar: crate::scroll::Style::default(),
             },
         );
         // Row 5's selection box starts at 385 and is cut at 392.
         assert_ne!(px(&cv, 80, 391), px(&cv, 80, 395));
-        for y in 392..400 {
-            assert_eq!(px(&cv, 80, y), px(&cv, 80, 399), "y={y}");
+        for y in 392..399 {
+            assert_eq!(px(&cv, 80, y), px(&cv, 80, 398), "y={y}");
         }
     }
     #[test]
@@ -1590,21 +2278,28 @@ mod tests {
                 &mut cv,
                 &font,
                 &View {
+                    theme_palettes: None,
+                    literal_prefix: false,
                     query: "a",
+                    placeholder: None,
+                    input_text: None,
+                    marked: None,
                     input: None,
                     items: &items,
                     sel: 0,
                     top: 0,
+                    scroll_remainder: 0.0,
                     vp: LIST_VP,
                     theme: Theme::default(),
                     w: 640,
                     h: PANEL_HEIGHT,
                     scale: 1,
                     font_size: 14.0,
+                    mono_font_family: None,
                     icons: &icons,
                     bold_font: bf,
                     back: false,
-                    show_scrollbar: false,
+                    scrollbar: crate::scroll::Style::default(),
                 },
             );
             cv
@@ -1673,23 +2368,6 @@ mod tests {
         }
     }
     #[test]
-    fn selection_scrolls_to_the_top_clamped_to_a_full_page() {
-        // gpui's ScrollStrategy::Top: the selected row heads the viewport.
-        let items = sectioned(30);
-        let vp = LIST_VP;
-        for sel in 0..30 {
-            let top = sel.min(max_top(&items, vp));
-            let sl = slots(&items, top, vp);
-            assert!(
-                sl.iter().any(|s| s.item == Some(sel)),
-                "sel {sel} top {top}"
-            );
-            assert!(sl.last().unwrap().y + sl.last().unwrap().h <= vp + 0.01);
-        }
-        assert_eq!(item_at(&items, 0, vp, 5.0), None);
-        assert_eq!(item_at(&items, 0, vp, HDR + 5.0), Some(0));
-    }
-    #[test]
     fn theme_icon_shows_palette_samples() {
         let th = Theme {
             bg_alpha: 1.0,
@@ -1710,6 +2388,80 @@ mod tests {
         assert_eq!(px(12, 17), th.border, "border bar");
         assert_eq!(px(1, 12), lighten(th.bg, 0.05), "window background");
     }
+    #[test]
+    fn custom_theme_layout_drives_slots_hits_scroll_bounds_and_emoji_cells() {
+        let metrics = crate::config::ThemeMetrics {
+            item_margin_y: 3.0,
+            item_padding_y: 10.0,
+            item_content_height: 58.0,
+            section_header_margin_top: 12.0,
+            section_header_margin_bottom: 5.0,
+            emoji_cell_size: 42.0,
+            emoji_cell_gap: 3.0,
+            emoji_columns: 4,
+            ..crate::config::ThemeMetrics::default()
+        };
+        let layout = Layout::new(&metrics);
+        assert_eq!((layout.row, layout.header), (84.0, 33.0));
+        let items = ["Basic", "Application", "Application"]
+            .into_iter()
+            .map(|tag| Item {
+                title: tag.into(),
+                sub: String::new(),
+                tag,
+                icon: None,
+                action: Action::View(String::new()),
+                best: false,
+            })
+            .collect::<Vec<_>>();
+        let rows = layout.slots(&items, 0, 200.0);
+        assert_eq!((rows[0].h, rows[1].y, rows[1].h), (33.0, 33.0, 84.0));
+        assert_eq!(layout.item_at(&items, 0, 200.0, 32.0), None);
+        assert_eq!(layout.item_at(&items, 0, 200.0, 33.0), Some(0));
+        assert_eq!(layout.item_at(&items, 0, 200.0, 150.0), Some(1));
+        assert_eq!(layout.scroll_offset(&items, items.len(), false), 318.0);
+        assert_eq!(layout.scroll_item_y(&items, 1, false), 150.0);
+        assert_eq!(layout.max_top(&items, 100.0), 2);
+        let geometry = layout
+            .scroll_geometry(&items, "", 600, 200.0, 1, 5.0)
+            .unwrap();
+        assert_eq!(geometry.content, 318.0);
+        assert_eq!(layout.emoji_columns(600), 4);
+        let left = (600.0 - (4.0 * 45.0 - 3.0)) / 2.0;
+        assert_eq!(
+            layout.emoji_hit(600, 3, 0, 12, left + 1.0, HEAD + EMOJI_PAD + 43.0),
+            Some(4)
+        );
+        assert_eq!(
+            layout.emoji_hit(600, 3, 0, 12, left + 43.0, HEAD + EMOJI_PAD + 1.0),
+            None
+        );
+    }
+
+    #[test]
+    fn pixel_scroll_clip_applies_to_shapes_symbols_and_icons() {
+        let mut c = Canvas::new(10, 10);
+        c.set_clip_top(3);
+        c.set_clip_y(7);
+        c.rrect(0.0, 0.0, 10.0, 10.0, 0.0, [255, 0, 0], 1.0);
+        let icon = Icon {
+            symbol: false,
+            size: 10,
+            px: vec![255; 400],
+        };
+        c.icon(0, 0, &icon);
+        c.symbol(0, 0, &icon, [0, 255, 0], 1.0);
+        for y in 0..10 {
+            assert_eq!(
+                c.buf[(y * 10 + 5) * 4 + 3],
+                if (3..7).contains(&y) { 255 } else { 0 }
+            );
+        }
+        c.clear_clip();
+        c.icon(0, 0, &icon);
+        assert!(c.buf.chunks(4).all(|p| p[3] == 255));
+    }
+
     #[test]
     fn rrect_clips_to_canvas() {
         let mut c = Canvas::new(20, 20);

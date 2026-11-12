@@ -2,7 +2,8 @@ Emoji grid geometry and styling, theme TOML files in assets/themes, default
 theme values, and the launcher layout metrics (panel size, corner radius,
 header, row, and icon measurements), clipboard split-pane layout, preview
 padding, relative timestamp labels, clipboard substring filtering and first-line
-preview behavior are from zlaunch
+preview behavior, calculator evaluation and formatting, system action definitions
+and calculator row styling are from zlaunch
 (https://github.com/zortax/zlaunch), Copyright 2025 Leonard Seibold
 <git[at]zrtx.de>, MIT License. Permission notice below.
 
@@ -27,7 +28,8 @@ Input layout values are ported from zlaunch
 (https://github.com/zortax/zlaunch), Copyright 2025 Leonard Seibold, under
 the MIT permission notice above.
 
-The header icons assets/icons/search.svg and the inline CircleX glyph in
+The header icons assets/icons/{search,layout-dashboard,settings,globe}.svg
+and the inline CircleX glyph in
 src/icons.rs are from Lucide (https://lucide.dev), via the copies bundled
 with gpui-component (https://github.com/longbridge/gpui-component).
 search.svg is derived from the Feather project, Copyright (c) 2013-present
@@ -45,3 +47,18 @@ ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
 WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
 ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+The system action SVGs assets/icons/{power,reboot,moon,lock,sign-out}.svg
+are Phosphor Icons, copied from zlaunch. Copyright (c) 2020 Phosphor Icons,
+MIT License. The permission notice above applies.
+
+List action and submenu SVGs in assets/icons/phosphor are from zlaunch's
+Phosphor Icons assets, Copyright (c) 2020 Phosphor Icons, MIT License.
+The full permission notice is in assets/icons/phosphor/LICENSE.
+
+Desktop icon theme detection, 64px lookup and window class fallbacks are
+ported from zlaunch under the MIT permission notice above.
+
+The header Copy glyph in assets/icons/copy.svg is the Lucide copy bundled with
+gpui-component, Copyright (c) 2026 Lucide Icons and Contributors, ISC License
+(the full ISC permission notice above applies).

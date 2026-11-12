@@ -1,8 +1,9 @@
 //! Clipboard list and preview, using zlaunch's split-pane layout.
-use crate::clip::{History, Img};
+use crate::clip::{self, History, Img};
+use crate::config::Rgb;
 use crate::items::Action;
 use crate::ui::{
-    Canvas, View, HEAD, INPUT_DIM, INPUT_FG, LIST_PAD, ROW, SEPARATOR, SEPARATOR_ALPHA,
+    Canvas, View, CLIP_TOP, HEAD, INPUT_DIM, INPUT_FG, LIST_PAD, SEPARATOR, SEPARATOR_ALPHA,
 };
 use rusttype::{Font, Scale};
 use std::cell::RefCell;
@@ -31,6 +32,77 @@ fn fit(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
 }
 
 fn decode(data: &[u8], max_w: u32, max_h: u32) -> Option<Preview> {
+    // zlaunch previews png/jpg/jpeg/gif/webp/svg files (clipboard_rendering.rs).
+    if looks_like_svg(data) {
+        return decode_svg(data, max_w, max_h);
+    }
+    if !data.starts_with(b"\x89PNG") {
+        return decode_raster(data, max_w, max_h);
+    }
+    decode_png(data, max_w, max_h)
+}
+
+fn looks_like_svg(data: &[u8]) -> bool {
+    data[..data.len().min(4096)]
+        .windows(4)
+        .any(|w| w == b"<svg")
+}
+
+fn decode_svg(data: &[u8], max_w: u32, max_h: u32) -> Option<Preview> {
+    use resvg::{tiny_skia, usvg};
+    let tree = usvg::Tree::from_data(data, &usvg::Options::default()).ok()?;
+    let s = tree.size();
+    let (w, h) = fit(
+        s.width().max(1.0) as u32,
+        s.height().max(1.0) as u32,
+        max_w,
+        max_h,
+    );
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let k = (w as f32 / s.width()).min(h as f32 / s.height());
+    let mut pm = tiny_skia::Pixmap::new(w, h)?;
+    resvg::render(
+        &tree,
+        tiny_skia::Transform::from_row(k, 0.0, 0.0, k, 0.0, 0.0),
+        &mut pm.as_mut(),
+    );
+    Some(Preview {
+        w,
+        h,
+        pixels: pm.take(),
+    })
+}
+
+fn decode_raster(data: &[u8], max_w: u32, max_h: u32) -> Option<Preview> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    reader.limits(limits);
+    let img = reader.decode().ok()?;
+    let (w, h) = fit(img.width(), img.height(), max_w, max_h);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let raw = image::imageops::resize(&img, w, h, image::imageops::FilterType::Nearest).into_raw();
+    let mut pixels = Vec::with_capacity(raw.len());
+    for p in raw.as_chunks::<4>().0 {
+        let a = p[3] as u32;
+        pixels.extend_from_slice(&[
+            (p[0] as u32 * a / 255) as u8,
+            (p[1] as u32 * a / 255) as u8,
+            (p[2] as u32 * a / 255) as u8,
+            p[3],
+        ]);
+    }
+    Some(Preview { w, h, pixels })
+}
+
+fn decode_png(data: &[u8], max_w: u32, max_h: u32) -> Option<Preview> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     decoder.set_limits(png::Limits {
@@ -81,7 +153,10 @@ fn image_preview(image: &Img, w: u32, h: u32) -> Option<Rc<Preview>> {
                 return result.clone();
             }
         }
-        let result = decode(&image.png, w, h).map(Rc::new);
+        let result = image
+            .bytes()
+            .and_then(|png| decode(&png, w, h))
+            .map(Rc::new);
         *cache = Some((image.id, w, h, result.clone()));
         result
     })
@@ -160,12 +235,14 @@ fn wrap(font: &Font, size: f32, text: &str, width: f32, max_lines: usize) -> Vec
 
 pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
     let s = v.scale as f32;
+    let layout = crate::ui::Layout::clipboard(&v.theme.metrics);
+    let top0 = HEAD + CLIP_TOP;
     let th = v.theme;
+    let m = th.metrics;
     let w = v.w as f32 * s;
     let h = v.h as f32 * s;
     let split = w * 0.5;
     let fs = v.font_size * s;
-    let rows = (v.vp / ROW).floor().max(1.0) as usize;
     cv.rrect(
         0.0,
         0.0,
@@ -175,7 +252,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
         th.bg,
         th.bg_alpha,
     );
-    // Window outline: invisible, like the daemon's transparent window_border.
+    // Visible LauncherTheme.window_border outline, matching the launcher view.
     cv.rrect_outline(
         0.0,
         0.0,
@@ -184,7 +261,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
         th.window_border_radius * s,
         s,
         th.border,
-        0.0,
+        th.border_alpha,
     );
     let query = v.query.strip_prefix(';').unwrap_or(v.query).trim_start();
     if v.back {
@@ -197,15 +274,24 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
                 1.0,
             );
         }
+    } else if let Some(icon) = v.icons.get("phosphor:copy", 16 * v.scale) {
+        // Direct clipboard mode: zlaunch's input prefix is the copy icon.
+        cv.symbol(
+            (22.0 * s) as i32,
+            ((HEAD - 16.0) * 0.5 * s) as i32,
+            icon,
+            INPUT_DIM,
+            1.0,
+        );
     }
-    let text_x = if v.back { crate::ui::INPUT_X } else { 24.0 };
+    let text_x = crate::ui::INPUT_X;
     cv.text(
         font,
         fs * 1.2,
         text_x * s,
         17.0 * s,
         if query.is_empty() {
-            "Search clipboard..."
+            "Search clipboard history..."
         } else {
             query
         },
@@ -228,81 +314,112 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
         th.border,
         0.0,
     );
-    for (row, item) in v.items.iter().skip(v.top).take(rows).enumerate() {
-        let y = (HEAD + LIST_PAD + row as f32 * ROW) * s;
+    cv.set_clip_top((top0 * s) as i32);
+    cv.set_clip_y(((top0 + v.vp) * s) as i32);
+    for (row, item) in v
+        .items
+        .iter()
+        .skip(v.top)
+        .take(((v.vp + v.scroll_remainder) / layout.row).ceil() as usize)
+        .enumerate()
+    {
+        let y = (top0 + row as f32 * layout.row - v.scroll_remainder) * s;
         let selected = row + v.top == v.sel;
-        if selected {
-            cv.rrect(
-                0.0,
-                y + s,
-                split - 8.0 * s,
-                (ROW - 2.0) * s,
-                6.0 * s,
-                th.select,
-                th.select_alpha,
-            );
-        }
+        let left = 13.0 * s;
+        let box_y = y + (m.item_margin_y - 1.0) * s;
+        let box_h = (layout.row - 2.0 * m.item_margin_y - 8.0).max(1.0) * s;
+        let ix = left + m.item_padding_x * s;
+        let icon_size = m.icon_size.max(0.0) * s;
+        let iy = box_y + (box_h - icon_size) / 2.0;
+        let tx = ix + icon_size + 7.0 * s;
+        let bg = if selected {
+            crate::config::Rgba {
+                rgb: th.select,
+                alpha: th.select_alpha,
+            }
+        } else {
+            th.item_background
+        };
         cv.rrect(
-            8.0 * s,
-            y + 12.0 * s,
-            24.0 * s,
-            24.0 * s,
-            4.0 * s,
+            left,
+            box_y,
+            (split - left - (m.item_margin_x + 12.0) * s).max(0.0),
+            box_h,
+            m.item_border_radius * s,
+            bg.rgb,
+            bg.alpha,
+        );
+        cv.rrect(
+            ix,
+            iy,
+            icon_size,
+            icon_size,
+            m.icon_border_radius * s,
             th.icon_placeholder_background.rgb,
             th.icon_placeholder_background.alpha,
         );
-        let icon = match item.action {
-            Action::ClipImg(_) => "▧",
-            _ => "≡",
-        };
-        cv.text(
-            font,
-            18.0 * s,
-            13.0 * s,
-            y + 13.0 * s,
-            icon,
-            th.dim,
-            th.dim_alpha,
-            18.0 * s,
-        );
-        let removable = selected && matches!(item.action, Action::Clip(_) | Action::ClipImg(_));
-        let max_w = (split - if removable { 116.0 * s } else { 56.0 * s }).max(0.0);
-        if removable {
+        if let Some(color) = match &item.action {
+            Action::Clip(text) => clip::parse_color(text),
+            _ => None,
+        } {
+            // Colour text gets a filled circle inside the icon box, like zlaunch.
+            let d = m.clipboard_color_icon_size * s;
             cv.rrect(
-                split - 70.0 * s,
-                y + 16.0 * s,
-                56.0 * s,
-                17.0 * s,
-                3.0 * s,
-                th.key_background.rgb,
-                th.key_background.alpha,
+                ix + (icon_size - d) / 2.0,
+                iy + (icon_size - d) / 2.0,
+                d,
+                d,
+                d * 0.5,
+                [color[0], color[1], color[2]],
+                color[3] as f32 / 255.0,
             );
             cv.rrect_outline(
-                split - 70.0 * s,
-                y + 16.0 * s,
-                56.0 * s,
-                17.0 * s,
-                3.0 * s,
+                ix + (icon_size - d) / 2.0,
+                iy + (icon_size - d) / 2.0,
+                d,
+                d,
+                d * 0.5,
                 s,
-                th.key_border.rgb,
-                th.key_border.alpha,
+                th.border,
+                th.border_alpha,
             );
-            cv.text(
-                font,
-                10.0 * s,
-                split - 66.0 * s,
-                y + 18.0 * s,
-                "Shift Del",
-                th.dim,
-                th.dim_alpha,
-                50.0 * s,
-            );
+        } else {
+            // zlaunch's phosphor icon per content type.
+            let icon = match &item.action {
+                Action::ClipImg(_) => "phosphor:image",
+                Action::ClipFiles(text) => {
+                    let mut lines = text.lines();
+                    match (lines.next(), lines.next()) {
+                        (Some(path), None) => clip::clip_file_icon(path),
+                        _ => "phosphor:file",
+                    }
+                }
+                Action::Clip(text) => match clip::file_url_path(text) {
+                    Some(path) => clip::clip_file_icon(&path),
+                    None => "phosphor:clipboard-text",
+                },
+                _ => "phosphor:clipboard-text",
+            };
+            if let Some(icon) = v.icons.get(icon, crate::ui::icon_px(&th, v.scale)) {
+                cv.symbol(
+                    ix as i32,
+                    iy as i32,
+                    icon,
+                    th.icon_placeholder_color.rgb,
+                    th.icon_placeholder_color.alpha,
+                );
+            }
         }
+        // The 0.5.1 release shows no Delete / Shift+Del chip on the selected row
+        // (it exists only in pinned ee71f96), so the title gets the full width.
+        let max_w = (split - tx - 16.0 * s).max(0.0);
+        let text_top = box_y
+            + (box_h - (m.item_title_line_height + m.layout_item_description_height) * s) / 2.0;
         cv.text(
             font,
             fs.min(14.0 * s),
-            40.0 * s,
-            y + 7.0 * s,
+            tx,
+            text_top,
             &item.title,
             th.text,
             th.text_alpha,
@@ -311,8 +428,12 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
         cv.text(
             font,
             12.0 * s,
-            40.0 * s,
-            y + 25.0 * s,
+            tx,
+            text_top
+                + (m.item_title_line_height
+                    + (m.layout_item_description_height - 12.0) / 2.0
+                    + 1.0)
+                    * s,
             &item.sub,
             th.dim,
             th.dim_alpha,
@@ -320,29 +441,53 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
         );
     }
     if v.items.is_empty() {
+        // zlaunch centres the empty state in the list column at empty_state_height.
+        let eh = m.empty_state_height * s;
+        let label = "No clipboard history";
+        let tw = Canvas::text_width(font, 14.0 * s, label);
         cv.text(
             font,
             14.0 * s,
-            16.0 * s,
-            (HEAD + 18.0) * s,
-            "No clipboard history",
-            th.dim,
-            th.dim_alpha,
-            split - 32.0 * s,
+            ((split - 8.0 * s - tw) / 2.0).max(0.0),
+            HEAD * s + (eh - 14.0 * s) / 2.0,
+            label,
+            th.empty_state_color.rgb,
+            th.empty_state_color.alpha,
+            tw + 4.0,
         );
     }
-    if v.items.len() > rows {
-        let track = (rows as f32 * ROW - 12.0) * s;
-        let thumb = (track * rows as f32 / v.items.len() as f32)
-            .max(18.0 * s)
-            .min(track);
-        let y = (HEAD + 6.0) * s + (track - thumb) * v.top as f32 / (v.items.len() - rows) as f32;
-        cv.rrect(split - 4.0 * s, y, 2.0 * s, thumb, s, th.dim, 0.5);
-    }
-    let x = split + 17.0 * s;
-    let y = (HEAD + LIST_PAD + 16.0) * s;
-    let pw = (w - x - 16.0 * s).max(0.0);
-    let ph = (h - y - 16.0 * s).max(0.0);
+    cv.clear_clip();
+    // The release draws a 1px divider between the list and the preview pane.
+    cv.rrect(
+        split,
+        HEAD * s,
+        m.layout_separator_width * s,
+        h - HEAD * s,
+        0.0,
+        crate::ui::SEPARATOR,
+        crate::ui::SEPARATOR_ALPHA,
+    );
+    let x = split + (m.layout_separator_width + m.clipboard_preview_padding) * s;
+    // Measured against the 0.5.1 release: preview text starts 4px higher.
+    let y = (HEAD + LIST_PAD + m.clipboard_preview_padding - 4.0) * s;
+    let pw = (w - x - (1.0 + m.clipboard_preview_padding) * s).max(0.0);
+    let ph = (h - y - m.clipboard_preview_padding * s).max(0.0);
+    draw_preview(cv, font, v, history, (x, y, pw, ph));
+    crate::ui::draw_scrollbar(cv, v);
+}
+
+/// Preview pane contents for the selected entry (scrollbar always draws after this).
+fn draw_preview(
+    cv: &mut Canvas,
+    font: &Font,
+    v: &View,
+    history: &History,
+    area: (f32, f32, f32, f32),
+) {
+    let (x, y, pw, ph) = area;
+    let s = v.scale as f32;
+    let th = v.theme;
+    let fs = v.font_size * s;
     let action = v.items.get(v.sel).map(|item| &item.action);
     if let Some(Action::ClipImg(id)) = action {
         if let Some(image) = history
@@ -358,23 +503,55 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
                 (y + (ph - image.h as f32) * 0.5) as u32,
             );
         } else {
-            cv.text(
+            centered_label(
+                cv,
                 font,
-                14.0 * s,
+                s,
                 x,
                 y,
-                "Preview unavailable",
+                pw,
+                ph,
+                "[Image preview unavailable]",
                 th.dim,
                 th.dim_alpha,
-                pw,
             );
         }
     } else {
         IMAGE.with(|slot| *slot.borrow_mut() = None);
-        let text = match action {
-            Some(Action::Clip(text)) => text.as_str(),
-            _ => "No selection",
+        let (text, files) = match action {
+            Some(Action::Clip(text)) => (text.as_str(), false),
+            Some(Action::ClipFiles(text)) => (text.as_str(), true),
+            _ => {
+                centered_label(
+                    cv,
+                    font,
+                    s,
+                    x,
+                    y,
+                    pw,
+                    ph,
+                    "No selection",
+                    th.empty_state_color.rgb,
+                    th.empty_state_color.alpha,
+                );
+                return;
+            }
         };
+        if !files {
+            if let Some(color) = clip::parse_color(text) {
+                draw_color_preview(cv, font, s, (x, y, pw, ph), color, th);
+                return;
+            }
+        }
+        let paths: Option<Vec<String>> = if files {
+            Some(text.lines().map(str::to_string).collect())
+        } else {
+            clip::file_url_path(text).map(|p| vec![p])
+        };
+        if let Some(paths) = paths {
+            draw_paths_preview(cv, font, s, x, y, pw, ph, &paths, th);
+            return;
+        }
         let line_h = 20.0 * s;
         for (row, line) in wrap(font, fs.min(14.0 * s), text, pw, (ph / line_h) as usize)
             .iter()
@@ -394,9 +571,287 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
     }
 }
 
+/// Preview one or more clipboard file paths, like zlaunch's preview panel.
+#[allow(clippy::too_many_arguments)]
+fn draw_paths_preview(
+    cv: &mut Canvas,
+    font: &Font,
+    s: f32,
+    x: f32,
+    y: f32,
+    pw: f32,
+    ph: f32,
+    paths: &[String],
+    th: crate::config::Theme,
+) {
+    if paths.len() == 1 {
+        let path = &paths[0];
+        if clip::is_image_path(path) {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Some(image) = decode(&bytes, pw as u32, ph as u32) {
+                    draw_image(
+                        cv,
+                        &image,
+                        (x + (pw - image.w as f32) * 0.5) as u32,
+                        (y + (ph - image.h as f32) * 0.5) as u32,
+                    );
+                    return;
+                }
+            }
+        }
+        if clip::is_text_path(path) {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                let preview = if content.len() > 10000 {
+                    format!(
+                        "{}...\n\n[Content truncated - {} bytes total]",
+                        &content[..10000],
+                        content.len()
+                    )
+                } else {
+                    content
+                };
+                draw_wrapped(cv, font, s, x, y, pw, ph, &preview, th.text, th.text_alpha);
+                return;
+            }
+        }
+        draw_wrapped(cv, font, s, x, y, pw, ph, path, th.dim, th.dim_alpha);
+        return;
+    }
+    let joined = paths.join("\n");
+    draw_wrapped(cv, font, s, x, y, pw, ph, &joined, th.text, th.text_alpha);
+}
+
+/// Draw wrapped 14px text from the top of the preview pane.
+#[allow(clippy::too_many_arguments)]
+fn draw_wrapped(
+    cv: &mut Canvas,
+    font: &Font,
+    s: f32,
+    x: f32,
+    y: f32,
+    pw: f32,
+    ph: f32,
+    text: &str,
+    c: Rgb,
+    alpha: f32,
+) {
+    let line_h = 20.0 * s;
+    for (row, line) in wrap(font, 14.0 * s, text, pw, (ph / line_h) as usize)
+        .iter()
+        .enumerate()
+    {
+        cv.text(
+            font,
+            14.0 * s,
+            x,
+            y + row as f32 * line_h,
+            line,
+            c,
+            alpha,
+            pw,
+        );
+    }
+}
+
+/// Centre a 14px label in the preview pane.
+#[allow(clippy::too_many_arguments)]
+fn centered_label(
+    cv: &mut Canvas,
+    font: &Font,
+    s: f32,
+    x: f32,
+    y: f32,
+    pw: f32,
+    ph: f32,
+    label: &str,
+    c: Rgb,
+    alpha: f32,
+) {
+    let tw = Canvas::text_width(font, 14.0 * s, label);
+    cv.text(
+        font,
+        14.0 * s,
+        x + (pw - tw) / 2.0,
+        y + (ph - 14.0 * s) / 2.0,
+        label,
+        c,
+        alpha,
+        tw + 4.0,
+    );
+}
+
+/// Hue 0-360, saturation and lightness 0-100, matching zlaunch's conversion.
+fn to_hsl([r, g, b, _]: [u8; 4]) -> (u16, u8, u8) {
+    let (r, g, b) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    let l = (max + min) / 2.0;
+    if delta == 0.0 {
+        return (0, 0, (l * 100.0).round() as u8);
+    }
+    let s = delta / (1.0 - (2.0 * l - 1.0).abs());
+    let mut h = if max == r {
+        60.0 * (((g - b) / delta) % 6.0)
+    } else if max == g {
+        60.0 * ((b - r) / delta + 2.0)
+    } else {
+        60.0 * ((r - g) / delta + 4.0)
+    };
+    if h < 0.0 {
+        h += 360.0;
+    }
+    (
+        h.round() as u16,
+        (s * 100.0).round() as u8,
+        (l * 100.0).round() as u8,
+    )
+}
+
+/// Colour preview: swatch circle with HEX/RGB/HSL codes, centred in the pane.
+#[allow(clippy::too_many_arguments)]
+fn draw_color_preview(
+    cv: &mut Canvas,
+    font: &Font,
+    s: f32,
+    rect: (f32, f32, f32, f32),
+    color: [u8; 4],
+    th: crate::config::Theme,
+) {
+    let (x, y, pw, ph) = rect;
+    let swatch = th.metrics.clipboard_color_swatch_size * s;
+    let (h2, s2, l2) = to_hsl(color);
+    let hex = if color[3] == 255 {
+        format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2])
+    } else {
+        format!(
+            "#{:02X}{:02X}{:02X}{:02X}",
+            color[0], color[1], color[2], color[3]
+        )
+    };
+    let rows = [
+        ("HEX", hex),
+        ("RGB", format!("{}, {}, {}", color[0], color[1], color[2])),
+        ("HSL", format!("{h2}\u{00b0}, {s2}%, {l2}%")),
+    ];
+    let row_h = 16.0 * s;
+    let code_gap = th.metrics.clipboard_color_code_gap * s;
+    let preview_gap = th.metrics.clipboard_color_preview_gap * s;
+    let codes_h = 3.0 * row_h + 2.0 * code_gap;
+    // Measured against the 0.5.1 release: the swatch sits 16px higher.
+    let top = y + (ph - swatch - preview_gap - codes_h) / 2.0 - 12.0 * s;
+    let sx = x + (pw - swatch) / 2.0;
+    cv.rrect(
+        sx,
+        top,
+        swatch,
+        swatch,
+        swatch * 0.5,
+        [color[0], color[1], color[2]],
+        color[3] as f32 / 255.0,
+    );
+    // zlaunch rings the swatch with a 1px window_border outline.
+    cv.rrect_outline(
+        sx,
+        top,
+        swatch,
+        swatch,
+        swatch * 0.5,
+        s,
+        th.border,
+        th.border_alpha,
+    );
+    let mut ry = top + swatch + preview_gap;
+    let label_w = th.metrics.clipboard_color_label_width * s;
+    let value_w = rows
+        .iter()
+        .map(|(_, v)| Canvas::text_width(font, 14.0 * s, v))
+        .fold(0.0, f32::max);
+    let block_w = label_w + code_gap + value_w;
+    let lx = x + (pw - block_w) / 2.0;
+    for (label, value) in rows {
+        cv.text(
+            font,
+            12.0 * s,
+            lx,
+            ry + 2.0 * s,
+            label,
+            th.dim,
+            th.dim_alpha,
+            label_w,
+        );
+        cv.text(
+            font,
+            14.0 * s,
+            lx + label_w + code_gap,
+            ry,
+            &value,
+            th.text,
+            th.text_alpha,
+            value_w + 4.0,
+        );
+        ry += row_h + code_gap;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_metrics_change_row_pitch_and_preview_pixels() {
+        let font = Font::try_from_vec(
+            std::fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf").unwrap(),
+        )
+        .unwrap();
+        let mut theme = crate::config::Theme::default();
+        assert_eq!(
+            crate::ui::Layout::clipboard(&theme.metrics).row,
+            crate::ui::CLIP_ROW
+        );
+        theme.metrics.item_content_height += 20.0;
+        assert_eq!(
+            crate::ui::Layout::clipboard(&theme.metrics).row,
+            crate::ui::CLIP_ROW + 20.0
+        );
+        let mut original = Canvas::new(320, 350);
+        let mut custom = Canvas::new(320, 350);
+        draw_color_preview(
+            &mut original,
+            &font,
+            1.0,
+            (0.0, 0.0, 320.0, 350.0),
+            [255, 0, 0, 255],
+            theme,
+        );
+        theme.metrics.clipboard_color_swatch_size = 64.0;
+        theme.metrics.clipboard_color_preview_gap = 35.0;
+        theme.metrics.clipboard_color_code_gap = 14.0;
+        theme.metrics.clipboard_color_label_width = 45.0;
+        draw_color_preview(
+            &mut custom,
+            &font,
+            1.0,
+            (0.0, 0.0, 320.0, 350.0),
+            [255, 0, 0, 255],
+            theme,
+        );
+        let red_pixels = |cv: &Canvas| {
+            cv.buf
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[2] > 200 && p[1] < 20 && p[0] < 20)
+                .count()
+        };
+        assert!(red_pixels(&original) > 10000);
+        assert!(
+            (2800..3500).contains(&red_pixels(&custom)),
+            "{}",
+            red_pixels(&custom)
+        );
+        assert_ne!(original.buf, custom.buf);
+    }
 
     #[test]
     fn text_wraps_at_words_and_preserves_newlines() {
@@ -468,7 +923,8 @@ mod tests {
     fn selected_image_is_cached_until_size_changes() {
         let image = Img {
             id: 1,
-            png: png(),
+            png: Some(png()),
+            path: std::path::PathBuf::new(),
             w: 2,
             h: 1,
             at: 0,

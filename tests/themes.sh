@@ -78,7 +78,7 @@ grep -q 'theme = "catppuccin-latte"' "$XDG_CONFIG_HOME/zl/config.toml"
 chmod 500 "$XDG_CONFIG_HOME/zl"
 type_query '#nord'
 printf 'k enter\ns 0.2\n' | "$K"
-grim "$OUT/themes-save-error.png"
+grim "$OUT/themes-save-failed-main.png"
 grep -q 'theme = "catppuccin-latte"' "$XDG_CONFIG_HOME/zl/config.toml"
 chmod 700 "$XDG_CONFIG_HOME/zl"
 "$Z" quit
@@ -91,4 +91,4 @@ sleep .2
 type_query '#'
 grim "$OUT/themes-reloaded.png"
 compare "$OUT/themes-saved.png" "$OUT/themes-reloaded.png"
-echo 'PASS theme preview, Escape rollback, Enter persistence, failed-save rollback and restart'
+echo 'PASS theme preview, Escape rollback, Enter persistence, failed-save Main exit and restart'

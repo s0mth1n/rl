@@ -4,6 +4,10 @@
 //! backdrop, close to how it looks over a dark desktop. `--backdrop none`
 //! writes the raw transparent PNG and `--backdrop '#rrggbb'` picks the colour.
 #![allow(dead_code)]
+#[path = "../src/app_cache.rs"]
+mod app_cache;
+#[path = "../src/calculator.rs"]
+mod calculator;
 #[path = "../src/clip.rs"]
 mod clip;
 #[path = "../src/clipboard_ui.rs"]
@@ -22,11 +26,20 @@ mod icons;
 mod input;
 #[path = "../src/items.rs"]
 mod items;
+#[path = "../src/scorer.rs"]
+#[allow(dead_code)]
+mod scorer;
+#[path = "../src/scroll.rs"]
+mod scroll;
+#[path = "../src/system_actions.rs"]
+mod system_actions;
 #[cfg(test)]
 #[path = "../src/testutil.rs"]
 mod testutil;
 #[path = "../src/ui.rs"]
 mod ui;
+#[path = "../src/web_search.rs"]
+mod web_search;
 #[path = "../src/windows.rs"]
 #[allow(dead_code)]
 mod windows;
@@ -56,8 +69,6 @@ impl Options {
             view: "launcher".into(),
             query: String::new(),
             cfg: config::Config {
-                font: "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf".into(),
-                terminal: String::new(),
                 clipboard_persist: false,
                 ..Default::default()
             },
@@ -81,12 +92,12 @@ impl Options {
                 "--view" => o.view = value,
                 "--query" => o.query = value,
                 "--theme" => {
-                    if !config::THEMES.contains(&value.as_str()) {
+                    if config::load_theme(&value).is_none() {
                         return Err(format!("unknown theme: {value}").into());
                     }
                     o.cfg.theme = value;
                 }
-                "--font" => o.cfg.font = value,
+                "--font" => o.cfg.font_path = value,
                 "--emoji-font" => o.cfg.emoji_font = value,
                 "--scale" => o.scale = value.parse()?,
                 "--width" => o.cfg.width = value.parse()?,
@@ -221,21 +232,15 @@ fn composite(canvas: &ui::Canvas, backdrop: config::Rgb) -> Vec<u8> {
 }
 
 fn render(o: &Options) -> Result<(ui::Canvas, usize), Box<dyn Error>> {
-    let font = rusttype::Font::try_from_vec(std::fs::read(&o.cfg.font)?)
+    let font_path = o.cfg.font_file(false).ok_or("could not resolve font")?;
+    let font = rusttype::Font::try_from_vec(std::fs::read(font_path)?)
         .ok_or("could not load font; use --font /path/to/font.ttf")?;
-    // Section headers are EXTRA_BOLD in zlaunch: use the font's -Bold sibling.
-    let bold_font = std::path::Path::new(&o.cfg.font)
-        .file_stem()
-        .zip(std::path::Path::new(&o.cfg.font).extension())
-        .map(|(stem, ext)| {
-            std::path::Path::new(&o.cfg.font).with_file_name(format!(
-                "{}-Bold.{}",
-                stem.to_string_lossy(),
-                ext.to_string_lossy()
-            ))
-        })
-        .and_then(|p| std::fs::read(p).ok())
+    let bold_font = o
+        .cfg
+        .font_file(true)
+        .and_then(|path| std::fs::read(path).ok())
         .and_then(rusttype::Font::try_from_vec);
+    let startup_fonts = o.cfg.startup_fonts();
     let apps = fixture();
     let mut history = clip::History::new(100);
     let now = clip::now();
@@ -251,6 +256,7 @@ fn render(o: &Options) -> Result<(ui::Canvas, usize), Box<dyn Error>> {
         history.entries.push(clip::Clip {
             text: (*text).into(),
             at: now - i as u64 * 70,
+            files: false,
         });
     }
     let mut image = Vec::new();
@@ -272,24 +278,30 @@ fn render(o: &Options) -> Result<(ui::Canvas, usize), Box<dyn Error>> {
         history: &history,
     }
     .run(&o.query);
+    let sel = o.selected.min(items.len().saturating_sub(1));
+    // The picker recolours the panel with the selected theme, exactly like the daemon.
+    let theme = match items.get(sel).map(|it| &it.action) {
+        Some(items::Action::Theme(name)) => {
+            let mut cfg = o.cfg.clone();
+            cfg.theme = name.clone();
+            cfg.theme()
+        }
+        _ => o.cfg.theme(),
+    };
+    let layout = ui::Layout::new(&theme.metrics);
     let emoji = o.view == "emoji";
     let columns = if emoji {
-        ui::emoji_columns(o.cfg.width)
+        layout.emoji_columns(o.cfg.width)
     } else {
         1
     };
-    let rows = ui::emoji_rows(items.len(), o.cfg.width);
-    let vp = if emoji {
-        rows as f32 * ui::EMOJI_CELL
-    } else {
-        ui::LIST_VP
-    };
+    let rows = layout.emoji_rows(items.len(), o.cfg.width);
+    let vp = ui::LIST_VP;
     let top = if emoji {
         (o.top / columns).min(items.len().div_ceil(columns).saturating_sub(rows)) * columns
     } else {
-        o.top.min(ui::max_top(&items, vp))
+        o.top.min(layout.max_top(&items, vp))
     };
-    let sel = o.selected.min(items.len().saturating_sub(1));
     // zlaunch fixes every panel at launcher_size (default 600x400).
     let h = ui::PANEL_HEIGHT;
     let mut icons = icons::Cache::new("", &o.cfg.emoji_font);
@@ -302,40 +314,47 @@ fn render(o: &Options) -> Result<(ui::Canvas, usize), Box<dyn Error>> {
             icons.ensure(
                 name,
                 if emoji {
-                    ui::emoji_icon_px(o.scale)
+                    (theme.metrics.emoji_font_size * o.scale as f32)
+                        .round()
+                        .max(1.0) as u32
                 } else {
-                    ui::icon_px(o.scale)
+                    ui::icon_px(&theme, o.scale)
                 },
             );
         }
     }
     icons.ensure_input(o.scale);
+    if o.view == "clipboard" && !o.back {
+        icons.ensure("phosphor:copy", 16 * o.scale);
+    }
     let mut canvas = ui::Canvas::new(o.cfg.width * o.scale, h * o.scale);
-    // The picker recolours the panel with the selected theme, exactly like the daemon.
-    let theme = match items.get(sel).map(|it| &it.action) {
-        Some(items::Action::Theme(name)) => {
-            let mut cfg = o.cfg.clone();
-            cfg.theme = name.clone();
-            cfg.theme()
-        }
-        _ => o.cfg.theme(),
-    };
     let view = ui::View {
+        theme_palettes: None,
+        placeholder: None,
+        literal_prefix: false,
         query: &o.query,
+        input_text: None,
+        marked: None,
         input: Some(o.input()?),
         items: &items,
         sel,
         top,
+        scroll_remainder: 0.0,
         vp,
         theme,
         w: o.cfg.width,
         h,
         scale: o.scale,
-        font_size: o.cfg.font_size,
+        font_size: o.cfg.startup_font_size(),
+        mono_font_family: startup_fonts.mono_font_family.as_deref(),
         icons: &icons,
         bold_font: bold_font.as_ref(),
         back: o.back,
-        show_scrollbar: o.scrollbar,
+        scrollbar: if o.scrollbar {
+            crate::scroll::Style::visible()
+        } else {
+            crate::scroll::Style::default()
+        },
     };
     if o.view == "clipboard" {
         clipboard_ui::draw(&mut canvas, &font, &view, &history);
@@ -442,7 +461,7 @@ mod tests {
         changed(&direct, &back, (22, 20, 39, 37));
         let idle = render(&parse(&["--query", "fire"])).unwrap();
         let scrolling = render(&parse(&["--query", "fire", "--scrollbar", "true"])).unwrap();
-        changed(&idle, &scrolling, (594, 57, 600, idle.h));
+        changed(&idle, &scrolling, (588, 57, 596, idle.h));
         let hidden = render(&parse(&["--query", "fire", "--caret-visible", "false"])).unwrap();
         changed(&idle, &hidden, (49, 20, 140, 40));
         let selection = render(&parse(&[

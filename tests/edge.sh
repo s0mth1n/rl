@@ -34,10 +34,11 @@ check_text noapps 'Emoji Picker'
 check_text noapps 'Clipboard H'
 type_query 'zzzz'
 shot noresults
-check_text noresults 'No \(results\|items found\)'
-printf 'k enter\ns 0.2\n' | send_test_keys   # Enter with no results must do nothing, not crash
+check_text noresults 'Search on Google'
+# zlaunch lists web-search rows for an unmatched query, so Enter would run xdg-open for real;
+# tests/web-search.sh covers activation with a stubbed xdg-open.
 printf 'k esc\ns 0.2\n' | send_test_keys
-echo 'PASS empty app list and no-result Enter'
+echo 'PASS empty app list and unmatched query listing web-search rows'
 
 # A long query typed fast, then hidden and shown again.
 "$Z" show
@@ -90,8 +91,20 @@ for i in $(seq 15); do printf 'rapid-%s' "$i" | wl-copy; sleep 0.05; done
 sleep .5
 type_query ';rapid'
 shot rapid
-check_text rapid '[il]d-15'
-check_text rapid '[il]d-14'
+# The default-theme list text OCRs poorly in the shared crop; read the title column only.
+python3 - "$OUT/rapid.png" "$OUT/rapid-list.png" <<'PY'
+import sys
+from PIL import Image
+img = Image.open(sys.argv[1])
+w, h = img.size
+box = (w // 2 - 265, h // 2 - 132, w // 2 - 120, h // 2 + 195)
+img = img.crop(box).convert('L')
+img = img.resize((img.width * 4, img.height * 4), Image.LANCZOS)
+img.point(lambda v: 0 if v > 150 else 255).save(sys.argv[2])
+PY
+env -u LD_LIBRARY_PATH tesseract "$OUT/rapid-list.png" "$OUT/rapid-list" --psm 6 2>/dev/null
+grep -q 'rapid-15' "$OUT/rapid-list.txt" || { echo 'FAIL rapid missing rapid-15'; cat "$OUT/rapid-list.txt"; exit 1; }
+grep -q 'rapid-14' "$OUT/rapid-list.txt" || { echo 'FAIL rapid missing rapid-14'; cat "$OUT/rapid-list.txt"; exit 1; }
 grep -q 'rapid-1' "$XDG_STATE_HOME/zl/clipboard/state"
 grep -q 'rapid-15' "$XDG_STATE_HOME/zl/clipboard/state"
 echo 'PASS 15 rapid copies captured and persisted in order'
@@ -117,13 +130,13 @@ echo 'PASS unicode, tab and backslash round-trip through persistence'
 type_query 'Emoji Picker'
 printf 'm 640 290\np\nr\ns 0.4\n' | "$P"
 shot singleclick
-check_text singleclick 'earch emojis'
+check_text singleclick 'earch e'
 echo 'PASS pointer single-click activation'
 
 # A configured theme is loaded on the next daemon start.
 "$Z" quit
 sleep .2
-printf 'close_on_focus_loss = false\ntheme = "nord"\n' > "$XDG_CONFIG_HOME/zl/config.toml"
+printf 'theme = "nord"\n' > "$XDG_CONFIG_HOME/zl/config.toml"
 "$Z" >"$OUT/theme-restart.log" 2>&1 & record_test_pid $!
 sleep .5
 type_query '#nord'

@@ -3,50 +3,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Premultiplied RGBA pixels, `size` x `size`.
-pub struct Icon {
-    pub size: u32,
-    pub px: Vec<u8>,
-    /// Stroke-only builtin symbol: draw tinted, not as-is.
-    pub symbol: bool,
-}
-
-pub const SEARCH: &str = "builtin:search";
-pub const CLEAR: &str = "builtin:clear";
-pub const BACK: &str = "builtin:back";
-pub const PALETTE: &str = "builtin:palette";
-
-const BACK_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg>"#;
-const PALETTE_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><circle cx="8.5" cy="10" r="1.2"/><circle cx="12" cy="7.5" r="1.2"/><circle cx="15.5" cy="10" r="1.2"/><circle cx="9" cy="14.5" r="1.2"/></svg>"#;
-
-// Lucide circle-x (ISC, see NOTICE): the glyph zlaunch's clear button shows.
-const CLEAR_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/></svg>"#;
-
-const SMILEY_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>"#;
-const CLIPBOARD_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></svg>"#;
-const SETTINGS_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 1.8v3M12 19.2v3M1.8 12h3M19.2 12h3M4.7 4.7l2.2 2.2M17.1 17.1l2.2 2.2M4.7 19.3l2.2-2.2M17.1 6.9l2.2-2.2"/></svg>"#;
-const GLOBE_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3c-2.5 2.6-4 5.6-4 9s1.5 6.4 4 9"/><path d="M12 3c2.5 2.6 4 5.6 4 9s-1.5 6.4-4 9"/></svg>"#;
-const TERMINAL_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3"/><line x1="13" y1="15" x2="17" y2="15"/></svg>"#;
-const FOLDER_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>"#;
-
-/// Builtin strokes for the mode rows, used when no icon theme provides them.
-fn fallback_symbol(name: &str) -> Option<&'static [u8]> {
-    Some(match name {
-        "smiley" | "face-smile" => SMILEY_SVG,
-        "clipboard" | "edit-paste" => CLIPBOARD_SVG,
-        "palette" => PALETTE_SVG,
-        "settings" | "preferences-system" | "emblem-system" => SETTINGS_SVG,
-        "globe" | "web-browser" | "applications-internet" => GLOBE_SVG,
-        "folder" | "system-file-manager" => FOLDER_SVG,
-        "utilities-terminal" => TERMINAL_SVG,
-        _ => return None,
-    })
-}
-
-const SIZE_DIRS: [&str; 12] = [
-    "48x48", "64x64", "128x128", "256x256", "512x512", "scalable", "32x32", "96x96", "36x36",
-    "24x24", "22x22", "16x16",
-];
-
 pub fn data_dirs() -> Vec<PathBuf> {
     let home = std::env::var("XDG_DATA_HOME")
         .unwrap_or_else(|_| format!("{}/.local/share", std::env::var("HOME").unwrap_or_default()));
@@ -61,68 +17,124 @@ pub fn data_dirs() -> Vec<PathBuf> {
     v
 }
 
-/// The themes tried in order: the configured one first, then common fallbacks.
-pub fn theme_chain(theme: &str) -> Vec<String> {
-    let mut themes = Vec::new();
-    if !theme.is_empty() {
-        themes.push(theme.to_string());
-    }
-    for t in ["hicolor", "Adwaita", "breeze", "Papirus"] {
-        if !themes.iter().any(|x| x == t) {
-            themes.push(t.to_string());
-        }
-    }
-    themes
+pub struct Icon {
+    pub size: u32,
+    pub px: Vec<u8>,
+    /// Stroke-only builtin symbol: draw tinted, not as-is.
+    pub symbol: bool,
 }
 
-/// Find an icon file for `name`. An absolute path is used as is.
-pub fn find(name: &str, themes: &[String]) -> Option<PathBuf> {
-    if name.is_empty() {
-        return None;
-    }
-    if name.starts_with('/') {
-        return Some(PathBuf::from(name)).filter(|p| p.is_file());
-    }
-    let dirs = data_dirs();
-    let names = [name.to_string(), format!("{name}-symbolic")];
-    for theme in themes {
-        for base in &dirs {
-            let root = base.join("icons").join(theme);
-            if !root.is_dir() {
+pub const SEARCH: &str = "builtin:search";
+pub const CLEAR: &str = "builtin:clear";
+pub const BACK: &str = "builtin:back";
+pub const DASHBOARD: &str = "builtin:dashboard";
+pub const MODE_ACTIONS: &str = "builtin:mode-actions";
+pub const MODE_SEARCH: &str = "builtin:mode-search";
+pub const PALETTE: &str = "builtin:palette";
+
+const BACK_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg>"#;
+const PALETTE_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><circle cx="8.5" cy="10" r="1.2"/><circle cx="12" cy="7.5" r="1.2"/><circle cx="15.5" cy="10" r="1.2"/><circle cx="9" cy="14.5" r="1.2"/></svg>"#;
+
+// Lucide circle-x (ISC, see NOTICE): the glyph zlaunch's clear button shows.
+const CLEAR_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/></svg>"#;
+
+pub fn phosphor(name: &str) -> Option<&'static [u8]> {
+    Some(match name {
+        "power" => include_bytes!("../assets/icons/phosphor/power.svg"),
+        "reboot" => include_bytes!("../assets/icons/phosphor/reboot.svg"),
+        "moon" => include_bytes!("../assets/icons/phosphor/moon.svg"),
+        "lock" => include_bytes!("../assets/icons/phosphor/lock.svg"),
+        "sign-out" => include_bytes!("../assets/icons/phosphor/sign-out.svg"),
+        "smiley" => include_bytes!("../assets/icons/phosphor/smiley.svg"),
+        "terminal" => include_bytes!("../assets/icons/phosphor/terminal.svg"),
+        "clipboard" => include_bytes!("../assets/icons/phosphor/clipboard-bold.svg"),
+        "clipboard-text" => include_bytes!("../assets/icons/phosphor/clipboard-text-bold.svg"),
+        "file" => include_bytes!("../assets/icons/phosphor/file-bold.svg"),
+        "file-text" => include_bytes!("../assets/icons/phosphor/file-text-bold.svg"),
+        "file-image" => include_bytes!("../assets/icons/phosphor/file-image-bold.svg"),
+        "image" => include_bytes!("../assets/icons/phosphor/image-bold.svg"),
+        "magnifying-glass" => include_bytes!("../assets/icons/phosphor/magnifying-glass-bold.svg"),
+        "globe" => include_bytes!("../assets/icons/phosphor/globe-bold.svg"),
+        "book-open" => include_bytes!("../assets/icons/phosphor/book-open-bold.svg"),
+        "youtube-logo" => include_bytes!("../assets/icons/phosphor/youtube-logo-bold.svg"),
+        "brain" => include_bytes!("../assets/icons/phosphor/brain-bold.svg"),
+        "palette" => include_bytes!("../assets/icons/phosphor/palette-bold.svg"),
+        _ => return None,
+    })
+}
+
+fn desktop_theme(config: &Path) -> Option<String> {
+    if let Ok(source) = std::fs::read_to_string(config.join("kdeglobals")) {
+        let mut icons = false;
+        for line in source.lines().map(str::trim) {
+            if line.starts_with('[') {
+                icons = line == "[Icons]";
                 continue;
             }
-            for sz in SIZE_DIRS {
-                for n in &names {
-                    for ext in ["png", "svg"] {
-                        for cat in ["apps", "mimetypes", "places", "devices", "status"] {
-                            for layout in [format!("{sz}/{cat}"), format!("{cat}/{sz}")] {
-                                for file in [format!("{n}.{ext}"), format!("{n}.symbolic.{ext}")] {
-                                    let p = root.join(&layout).join(&file);
-                                    if p.is_file() {
-                                        return Some(p);
-                                    }
-                                }
-                            }
-                        }
-                    }
+            if icons {
+                if let Some(theme) = line.strip_prefix("Theme=") {
+                    return Some(theme.into());
                 }
             }
         }
     }
-    for base in &dirs {
-        for ext in ["png", "svg"] {
-            let p = base.join("pixmaps").join(format!("{name}.{ext}"));
-            if p.is_file() {
-                return Some(p);
+    for file in ["gtk-3.0/settings.ini", "gtk-4.0/settings.ini"] {
+        if let Ok(source) = std::fs::read_to_string(config.join(file)) {
+            for line in source.lines().map(str::trim) {
+                if let Some(theme) = line.strip_prefix("gtk-icon-theme-name=") {
+                    return Some(theme.into());
+                }
             }
         }
     }
-    let p = PathBuf::from("/usr/share/pixmaps").join(format!("{name}.png"));
-    if p.is_file() {
-        Some(p)
-    } else {
-        None
+    None
+}
+
+/// KDE, GTK3, then GTK4 settings choose the theme; hicolor is the fallback.
+pub fn theme_chain(_theme: &str) -> Vec<String> {
+    static THEME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let theme = THEME.get_or_init(|| {
+        let root = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+        desktop_theme(&root)
+    });
+    theme
+        .iter()
+        .cloned()
+        .chain(std::iter::once("hicolor".into()))
+        .collect()
+}
+
+/// Resolve at 64 px through the reference theme library, including inherited themes.
+pub fn find(name: &str, themes: &[String]) -> Option<PathBuf> {
+    if name.starts_with('/') {
+        return Some(PathBuf::from(name)).filter(|path| path.exists());
     }
+    for theme in themes {
+        if let Some(path) = freedesktop_icons::lookup(name)
+            .with_size(64)
+            .with_theme(theme)
+            .find()
+        {
+            return Some(path);
+        }
+    }
+    freedesktop_icons::lookup(name).with_size(64).find()
+}
+
+pub fn find_window(name: &str, themes: &[String]) -> Option<PathBuf> {
+    for candidate in [
+        name.to_string(),
+        name.to_lowercase(),
+        name.rsplit('.').next().unwrap_or(name).to_string(),
+        name.rsplit('.').next().unwrap_or(name).to_lowercase(),
+    ] {
+        if let Some(path) = find(&candidate, themes) {
+            return Some(path);
+        }
+    }
+    None
 }
 
 /// Decode a PNG or SVG file to `size` x `size` premultiplied pixels.
@@ -144,7 +156,7 @@ pub fn load(path: &Path, size: u32) -> Option<Icon> {
     })
 }
 
-fn decode_png(data: &[u8], size: u32) -> Option<Vec<u8>> {
+pub(crate) fn decode_png(data: &[u8], size: u32) -> Option<Vec<u8>> {
     let mut dec = png::Decoder::new(std::io::Cursor::new(data));
     dec.set_transformations(png::Transformations::normalize_to_color8());
     let mut r = dec.read_info().ok()?;
@@ -360,6 +372,9 @@ pub struct Cache {
     map: HashMap<(String, u32), Option<Icon>>,
     themes: Vec<String>,
     emoji_font: Option<Option<memmap2::Mmap>>,
+    /// PNG bytes supplied by the compositor for open windows (KWin), keyed by
+    /// window address; used by "window-data:" icon names.
+    window_pngs: HashMap<String, Vec<u8>>,
 }
 
 impl Cache {
@@ -372,7 +387,15 @@ impl Cache {
             } else {
                 Some(map_file(emoji_font))
             },
+            window_pngs: HashMap::new(),
         }
+    }
+    /// Register compositor-provided PNG icon pixels for a window address.
+    pub fn set_window_icon(&mut self, address: &str, png: Vec<u8>) {
+        if self.window_pngs.len() >= 64 {
+            self.window_pngs.clear();
+        }
+        self.window_pngs.insert(address.to_string(), png);
     }
     pub fn ensure(&mut self, name: &str, size: u32) {
         let key = (name.to_string(), size);
@@ -382,14 +405,44 @@ impl Cache {
         if self.map.len() >= 256 {
             self.map.clear();
         }
-        let symbol = match name {
+        let symbol: Option<&[u8]> = match name {
             SEARCH => Some(include_bytes!("../assets/icons/search.svg").as_slice()),
             CLEAR => Some(CLEAR_SVG),
             BACK => Some(BACK_SVG),
             PALETTE => Some(PALETTE_SVG),
+            "power" => Some(include_bytes!("../assets/icons/power.svg").as_slice()),
+            "reboot" => Some(include_bytes!("../assets/icons/reboot.svg").as_slice()),
+            "moon" => Some(include_bytes!("../assets/icons/moon.svg").as_slice()),
+            "lock" => Some(include_bytes!("../assets/icons/lock.svg").as_slice()),
+            "sign-out" => Some(include_bytes!("../assets/icons/sign-out.svg").as_slice()),
+            DASHBOARD => Some(include_bytes!("../assets/icons/layout-dashboard.svg")),
+            MODE_ACTIONS => Some(include_bytes!("../assets/icons/settings.svg")),
+            MODE_SEARCH => Some(include_bytes!("../assets/icons/globe.svg")),
+            "phosphor:copy" => Some(include_bytes!("../assets/icons/copy.svg").as_slice()),
+            "phosphor:brain" => Some(include_bytes!("../assets/icons/brain.svg").as_slice()),
             _ => None,
         };
-        let icon = if let Some(svg) = symbol {
+        let icon = if symbol.is_none() && name.starts_with("phosphor:") {
+            let name = name.strip_prefix("phosphor:").unwrap();
+            phosphor(name)
+                .and_then(|svg| render_svg(svg, size * 2 / 3))
+                .map(|px| {
+                    let inner = size * 2 / 3;
+                    let mut padded = vec![0; (size * size * 4) as usize];
+                    let offset = (size - inner) / 2;
+                    for y in 0..inner {
+                        let src = (y * inner * 4) as usize;
+                        let dst = (((y + offset) * size + offset) * 4) as usize;
+                        padded[dst..dst + (inner * 4) as usize]
+                            .copy_from_slice(&px[src..src + (inner * 4) as usize]);
+                    }
+                    Icon {
+                        size,
+                        px: padded,
+                        symbol: true,
+                    }
+                })
+        } else if let Some(svg) = symbol {
             render_svg(svg, size).map(|px| Icon {
                 size,
                 px,
@@ -397,18 +450,22 @@ impl Cache {
             })
         } else if let Some(g) = name.strip_prefix("emoji:") {
             self.emoji(g, size)
-        } else {
-            find(name, &self.themes)
-                .and_then(|p| load(&p, size))
-                .or_else(|| {
-                    fallback_symbol(name).and_then(|svg| {
-                        render_svg(svg, size).map(|px| Icon {
-                            size,
-                            px,
-                            symbol: true,
-                        })
-                    })
+        } else if let Some(address) = name.strip_prefix("window-data:") {
+            self.window_pngs
+                .get(address)
+                .and_then(|png| decode_png(png, size))
+                .map(|px| Icon {
+                    size,
+                    px,
+                    symbol: false,
                 })
+        } else {
+            (if let Some(app_id) = name.strip_prefix("window:") {
+                find_window(app_id, &self.themes)
+            } else {
+                find(name, &self.themes)
+            })
+            .and_then(|p| load(&p, size))
         };
         self.map.insert(key, icon);
     }
@@ -422,6 +479,9 @@ impl Cache {
         self.ensure(CLEAR, 16 * scale);
         self.ensure(BACK, 16 * scale);
         self.ensure(PALETTE, 16 * scale);
+        self.ensure(DASHBOARD, 16 * scale);
+        self.ensure(MODE_ACTIONS, 16 * scale);
+        self.ensure(MODE_SEARCH, 16 * scale);
     }
     /// A colour emoji from the system emoji font, when that font stores PNG bitmaps (Noto Color Emoji, Apple).
     fn emoji(&mut self, glyph: &str, size: u32) -> Option<Icon> {
@@ -453,11 +513,65 @@ impl Cache {
 mod tests {
     use super::*;
     #[test]
+    fn clipboard_header_copy_uses_the_component_svg_at_requested_size() {
+        let mut cache = Cache::new("", "");
+        for size in [16, 32, 48] {
+            cache.ensure("phosphor:copy", size);
+            let icon = cache.get("phosphor:copy", size).unwrap();
+            assert!(icon.symbol);
+            assert_eq!(
+                icon.px,
+                render_svg(include_bytes!("../assets/icons/copy.svg"), size).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn phosphor_assets_render_in_sixteen_pixel_glyph_boxes() {
+        for name in [
+            "smiley",
+            "clipboard",
+            "palette",
+            "power",
+            "globe",
+            "file-text",
+        ] {
+            let source = phosphor(name).unwrap();
+            let expected = render_svg(source, 16).unwrap();
+            let mut cache = Cache::new("", "");
+            let key = format!("phosphor:{name}");
+            cache.ensure(&key, 24);
+            let icon = cache.get(&key, 24).unwrap();
+            assert!(icon.symbol);
+            for y in 0..24usize {
+                for x in 0..24usize {
+                    let got = &icon.px[(y * 24 + x) * 4..(y * 24 + x + 1) * 4];
+                    if (4..20).contains(&x) && (4..20).contains(&y) {
+                        let p = ((y - 4) * 16 + x - 4) * 4;
+                        assert_eq!(got, &expected[p..p + 4], "{name} {x},{y}");
+                    } else {
+                        assert_eq!(got, [0, 0, 0, 0], "{name} {x},{y}");
+                    }
+                }
+            }
+        }
+        assert!(phosphor("not-an-icon").is_none());
+    }
+
+    #[test]
     fn input_symbols_are_embedded_and_cached_at_each_scale() {
         let mut cache = Cache::new("", "");
         for scale in [1, 2, 3] {
             cache.ensure_input(scale);
-            for name in [SEARCH, CLEAR, BACK, PALETTE] {
+            for name in [
+                SEARCH,
+                CLEAR,
+                BACK,
+                PALETTE,
+                DASHBOARD,
+                MODE_ACTIONS,
+                MODE_SEARCH,
+            ] {
                 let icon = cache.get(name, 16 * scale).unwrap();
                 assert_eq!(icon.size, 16 * scale);
                 assert_eq!(icon.px.len(), (16 * scale * 16 * scale * 4) as usize);
@@ -466,14 +580,14 @@ mod tests {
             }
         }
         cache.ensure_input(1);
-        assert_eq!(cache.map.len(), 12);
+        assert_eq!(cache.map.len(), 21);
         for index in 0..90 {
             cache.map.insert((format!("missing-{index}"), 16), None);
         }
         cache.ensure_input(4);
         assert!(cache.get(SEARCH, 64).is_some());
         assert!(cache.get(CLEAR, 64).is_some());
-        assert_eq!(cache.map.len(), 4);
+        assert_eq!(cache.map.len(), 7);
     }
 
     #[test]
@@ -560,5 +674,104 @@ mod tests {
         }
         let px = decode_png(&buf, 4).unwrap();
         assert_eq!(&px[0..4], &[0, 0, 255, 255]);
+    }
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use super::*;
+    #[test]
+    fn desktop_theme_priority_is_kde_then_gtk3_then_gtk4() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("gtk-3.0")).unwrap();
+        std::fs::create_dir_all(root.path().join("gtk-4.0")).unwrap();
+        let gtk4 = root.path().join("gtk-4.0/settings.ini");
+        let gtk3 = root.path().join("gtk-3.0/settings.ini");
+        let kde = root.path().join("kdeglobals");
+        std::fs::write(gtk4, "gtk-icon-theme-name=Fourth\n").unwrap();
+        assert_eq!(desktop_theme(root.path()).as_deref(), Some("Fourth"));
+        std::fs::write(&gtk3, "[Settings]\n gtk-icon-theme-name=Third\n").unwrap();
+        assert_eq!(desktop_theme(root.path()).as_deref(), Some("Third"));
+        std::fs::write(
+            &kde,
+            "[Other]\nTheme=Wrong\n[Icons]\nTheme=Kde\n[Else]\nTheme=Wrong\n",
+        )
+        .unwrap();
+        assert_eq!(desktop_theme(root.path()).as_deref(), Some("Kde"));
+        std::fs::remove_file(kde).unwrap();
+        assert_eq!(desktop_theme(root.path()).as_deref(), Some("Third"));
+    }
+    #[test]
+    fn reference_lookup_fixture_worker() {
+        let Some(root) = std::env::var_os("RL_ICON_LOOKUP_TEST_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let themes = theme_chain("");
+        assert_eq!(themes, ["Child", "hicolor"]);
+        assert_eq!(
+            find("shared-icon", &themes),
+            Some(root.join("data/icons/Parent/64x64/apps/shared-icon.svg"))
+        );
+        assert_eq!(
+            find("fallback-icon", &themes),
+            Some(root.join("data/icons/hicolor/64x64/apps/fallback-icon.svg"))
+        );
+        assert_eq!(
+            find_window("ORG.EXAMPLE.SHARED-ICON", &themes),
+            Some(root.join("data/icons/Parent/64x64/apps/shared-icon.svg"))
+        );
+        let absolute = root.join("absolute.svg");
+        assert_eq!(find(absolute.to_str().unwrap(), &themes), Some(absolute));
+        assert!(find("rl-icon-should-not-exist-xyz", &themes).is_none());
+        assert!(find(root.join("missing.svg").to_str().unwrap(), &themes).is_none());
+    }
+    #[test]
+    fn reference_lookup_uses_theme_inheritance_and_window_name_fallbacks() {
+        let root = tempfile::tempdir().unwrap();
+        for theme in ["Child", "Parent", "hicolor"] {
+            let path = root.path().join(format!("data/icons/{theme}"));
+            std::fs::create_dir_all(path.join("64x64/apps")).unwrap();
+            std::fs::write(path.join("index.theme"), format!("[Icon Theme]\nName={theme}\nDirectories=64x64/apps\n{}[64x64/apps]\nSize=64\nType=Fixed\nContext=Applications\n", if theme == "Child" { "Inherits=Parent\n" } else { "" })).unwrap();
+        }
+        let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"64\"/>";
+        std::fs::write(
+            root.path()
+                .join("data/icons/Parent/64x64/apps/shared-icon.svg"),
+            svg,
+        )
+        .unwrap();
+        std::fs::write(
+            root.path()
+                .join("data/icons/hicolor/64x64/apps/fallback-icon.svg"),
+            svg,
+        )
+        .unwrap();
+        std::fs::write(root.path().join("absolute.svg"), svg).unwrap();
+        std::fs::create_dir_all(root.path().join("config/gtk-3.0")).unwrap();
+        std::fs::write(
+            root.path().join("config/gtk-3.0/settings.ini"),
+            "gtk-icon-theme-name=Child\n",
+        )
+        .unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "icons::resolver_tests::reference_lookup_fixture_worker",
+                "--nocapture",
+            ])
+            .env("RL_ICON_LOOKUP_TEST_ROOT", root.path())
+            .env("HOME", root.path())
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_DATA_DIRS", root.path().join("data"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 }

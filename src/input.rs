@@ -7,8 +7,10 @@ type Entry = (String, usize, usize, usize);
 #[derive(Default)]
 pub struct Edit {
     pub caret: usize,
+    pub literal_prefix: bool,
     pub anchor: Option<usize>,
     snapshot: String,
+    selected_word: Option<std::ops::Range<usize>>,
     undo: Vec<Entry>,
     redo: Vec<Entry>,
     version: usize,
@@ -16,10 +18,15 @@ pub struct Edit {
 }
 
 impl Edit {
+    pub fn prefix_len(&self, text: &str) -> usize {
+        usize::from(!self.literal_prefix && text.starts_with([':', ';', '#']))
+    }
+
     pub fn sync(&mut self, text: &str) {
         if self.snapshot != text {
             self.caret = text.len();
             self.anchor = None;
+            self.selected_word = None;
             self.snapshot = text.into();
             self.undo.clear();
             self.redo.clear();
@@ -34,27 +41,48 @@ impl Edit {
     }
 
     pub fn move_to(&mut self, text: &str, to: usize, extend: bool) {
-        let mut to = to
-            .min(text.len())
-            .max(usize::from(text.starts_with([':', ';', '#'])));
+        let mut to = to.min(text.len()).max(self.prefix_len(text));
         while !text.is_char_boundary(to) {
             to -= 1;
         }
         self.anchor = if extend {
-            Some(
-                self.anchor
-                    .unwrap_or(self.caret)
-                    .max(usize::from(text.starts_with([':', ';', '#']))),
-            )
+            Some(self.anchor.unwrap_or(self.caret).max(self.prefix_len(text)))
         } else {
             None
         };
         self.caret = to;
+        if extend {
+            if let Some(word) = self.selected_word.clone() {
+                let range = self.range().unwrap_or(to..to);
+                let start = range.start.min(word.start);
+                let end = range.end.max(word.end);
+                if to < word.start {
+                    self.caret = start;
+                    self.anchor = Some(end);
+                } else {
+                    self.caret = end;
+                    self.anchor = Some(start);
+                }
+            }
+        } else {
+            self.selected_word = None;
+        }
+    }
+
+    pub fn end_drag(&mut self) {
+        self.selected_word = None;
     }
 
     pub fn select_all(&mut self, text: &str) {
-        self.anchor = Some(usize::from(text.starts_with([':', ';', '#'])));
+        self.selected_word = None;
+        self.anchor = Some(self.prefix_len(text));
         self.caret = text.len();
+    }
+
+    pub fn continue_group(&mut self) {
+        if self.last_change.is_some() {
+            self.last_change = Some(Instant::now());
+        }
     }
 
     pub fn replace(&mut self, text: &mut String, insert: &str) {
@@ -63,7 +91,7 @@ impl Edit {
 
     fn replace_at(&mut self, text: &mut String, insert: &str, now: Instant) {
         let mut r = self.range().unwrap_or(self.caret..self.caret);
-        let start = usize::from(text.starts_with([':', ';', '#']));
+        let start = self.prefix_len(text);
         r.start = r.start.max(start);
         r.end = r.end.max(start);
         if text[r.clone()] == *insert {
@@ -85,6 +113,7 @@ impl Edit {
         text.replace_range(r.clone(), insert);
         self.caret = r.start + insert.len();
         self.anchor = None;
+        self.selected_word = None;
         self.snapshot.clone_from(text);
     }
 
@@ -152,6 +181,7 @@ impl Edit {
                 None
             };
         }
+        self.selected_word = None;
         self.snapshot.clone_from(text);
         true
     }
@@ -181,8 +211,9 @@ impl Edit {
                 end += ch.len_utf8();
             }
         }
-        self.anchor = Some(start.max(usize::from(text.starts_with([':', ';', '#']))));
+        self.anchor = Some(start.max(self.prefix_len(text)));
         self.caret = end;
+        self.selected_word = self.range();
     }
 }
 
@@ -203,6 +234,64 @@ fn selection_class(c: char) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn composition_can_finish_the_selection_replacement_history_group() {
+        let mut text = String::from("original");
+        let mut e = Edit::default();
+        e.sync(&text);
+        e.select_all(&text);
+        e.replace(&mut text, "");
+        e.last_change = Some(Instant::now() - Duration::from_secs(2));
+        e.continue_group();
+        e.replace(&mut text, "committed");
+        assert!(e.history(&mut text, false));
+        assert_eq!(text, "original");
+        assert!(e.history(&mut text, true));
+        assert_eq!(text, "committed");
+    }
+
+    #[test]
+    fn clear_is_undoable_without_leaving_the_mode() {
+        for initial in ["sample", ":sample", ";sample", "#sample"] {
+            let mut text = initial.to_string();
+            let mut e = Edit::default();
+            e.sync(&text);
+            e.select_all(&text);
+            e.replace(&mut text, "");
+            assert_eq!(
+                text,
+                &initial[..usize::from(initial.starts_with([':', ';', '#']))]
+            );
+            assert!(e.history(&mut text, false));
+            assert_eq!(text, initial);
+            assert!(e.history(&mut text, true));
+            assert_eq!(
+                text,
+                &initial[..usize::from(initial.starts_with([':', ';', '#']))]
+            );
+        }
+    }
+
+    #[test]
+    fn double_click_drag_keeps_the_initial_word_until_release() {
+        let text = "one two three";
+        let mut e = Edit::default();
+        e.sync(text);
+        e.select_word(text, 5);
+        e.move_to(text, 5, true);
+        assert_eq!(e.range(), Some(4..7));
+        e.move_to(text, 1, true);
+        assert_eq!(e.range(), Some(1..7));
+        e.move_to(text, 11, true);
+        assert_eq!(e.range(), Some(4..11));
+        e.end_drag();
+        e.move_to(text, 5, true);
+        assert_eq!(e.range(), Some(4..5));
+        e.select_word(text, 5);
+        e.move_to(text, 5, false);
+        assert!(e.range().is_none());
+    }
+
     #[test]
     fn double_click_groups_gpui_letters_and_spaces_but_not_punctuation() {
         let mut e = Edit::default();
