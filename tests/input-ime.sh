@@ -13,6 +13,13 @@ echo 'PASS text-input-v3 enables the private input method'
 printf 'preedit 3 3 café\n' >&4
 sleep .5
 grim "$OUT/preedit.png"
+printf 'k shift\n' | send_test_keys
+sleep .8
+grim "$OUT/preedit-after-shift.png"
+python3 "$here/tests/ocr.py" "$OUT/preedit-after-shift.png" "$OUT/preedit-shift-ocr.png"
+env -u LD_LIBRARY_PATH tesseract "$OUT/preedit-shift-ocr.png" "$OUT/preedit-after-shift" --psm 6 2>/dev/null
+grep -qi 'caf' "$OUT/preedit-after-shift.txt"
+echo 'PASS modifier keys preserve active preedit'
 printf 'preedit 0 5 café\n' >&4
 sleep .4
 grim "$OUT/preedit-selection.png"

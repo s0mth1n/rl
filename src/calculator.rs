@@ -84,27 +84,61 @@ pub fn evaluate_expression(input: &str) -> Result<CalculatorItem, String> {
 /// Format a number for display with thousand separators.
 fn format_display(value: &str) -> String {
     // Convert to f64, else return the original string
-    let Ok(value) = value.parse::<f64>() else {
+    let Ok(number) = value.parse::<f64>() else {
         return value.to_string();
     };
-    if value.fract() == 0.0 && value.abs() < 1e15 {
-        // Integer display with thousand separators
-        format_with_separators(value as i64)
-    } else {
-        // Decimal display
-        let formatted = format!("{:.10}", value);
-        let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
-
-        // Add thousand separators to the integer part
-        if let Some(dot_pos) = trimmed.find('.') {
-            let (int_part, dec_part) = trimmed.split_at(dot_pos);
-            let int_val: i64 = int_part.parse().unwrap_or(0);
-            format!("{}{}", format_with_separators(int_val), dec_part)
-        } else {
-            let int_val: i64 = trimmed.parse().unwrap_or(0);
-            format_with_separators(int_val)
+    if number.fract() == 0.0 {
+        if number.abs() < 1e15 {
+            // Integer display with thousand separators
+            return format_with_separators(number as i64);
         }
+        // Past 2^53 an f64 cannot hold the integer exactly and an i64
+        // overflows outright, so dress up fend's exact digits instead.
+        return separate_exact_integer(value).unwrap_or_else(|| value.to_string());
     }
+    // Decimal display
+    let formatted = format!("{:.10}", number);
+    let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
+
+    // Add thousand separators to the integer part
+    if let Some(dot_pos) = trimmed.find('.') {
+        let (int_part, dec_part) = trimmed.split_at(dot_pos);
+        let int_val: i64 = int_part.parse().unwrap_or(0);
+        // "-0" parses to 0, which would drop the sign of proper fractions.
+        let sign = if int_val == 0 && number.is_sign_negative() {
+            "-"
+        } else {
+            ""
+        };
+        format!("{}{}{}", sign, format_with_separators(int_val), dec_part)
+    } else {
+        // The fraction rounded away at ten decimal places; fend's own
+        // rendering keeps the nonzero digits.
+        value.to_string()
+    }
+}
+
+/// Thousand separators for fend's exact integer strings beyond f64 precision.
+fn separate_exact_integer(raw: &str) -> Option<String> {
+    let (sign, digits) = match raw.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", raw),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut result = String::new();
+    for (i, c) in digits.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    Some(format!(
+        "{}{}",
+        sign,
+        result.chars().rev().collect::<String>()
+    ))
 }
 
 /// Format an integer with thousand separators.
@@ -178,5 +212,52 @@ mod tests {
     fn test_trig_functions() {
         let result = evaluate_expression("sin(0)").unwrap();
         assert_eq!(result.display_result, "0");
+    }
+}
+
+#[cfg(test)]
+mod sign_tests {
+    use super::evaluate_expression;
+
+    #[test]
+    fn negative_proper_fraction_keeps_its_sign() {
+        // fend returns the exact string "-0.5"; display must not drop the minus.
+        let result = evaluate_expression("0 - 0.5").unwrap();
+        assert_eq!(result.display_result, "-0.5");
+        assert_eq!(result.text_for_clipboard(), "-0.5");
+        let result = evaluate_expression("-3 / 4").unwrap();
+        assert_eq!(result.display_result, "-0.75");
+    }
+}
+
+#[cfg(test)]
+mod big_small_tests {
+    use super::evaluate_expression;
+
+    #[test]
+    fn huge_integers_do_not_collapse_to_zero() {
+        let result = evaluate_expression("2^100").unwrap();
+        assert_eq!(
+            result.display_result,
+            "1,267,650,600,228,229,401,496,703,205,376"
+        );
+        assert_eq!(
+            result.text_for_clipboard(),
+            "1267650600228229401496703205376"
+        );
+        let result = evaluate_expression("-2^100").unwrap();
+        assert_eq!(
+            result.display_result,
+            "-1,267,650,600,228,229,401,496,703,205,376"
+        );
+    }
+
+    #[test]
+    fn tiny_fractions_do_not_round_to_zero() {
+        let result = evaluate_expression("10^-11").unwrap();
+        assert_eq!(result.display_result, "0.00000000001");
+        assert_eq!(result.text_for_clipboard(), "0.00000000001");
+        let result = evaluate_expression("-10^-11").unwrap();
+        assert_eq!(result.display_result, "-0.00000000001");
     }
 }

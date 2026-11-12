@@ -502,17 +502,17 @@ fn theme_color(value: &toml::Value) -> Option<Rgba> {
 }
 
 fn pixels(value: &toml::Value) -> Option<f32> {
-    if let Some(text) = value.as_str() {
+    let value = if let Some(text) = value.as_str() {
         text.trim_start_matches("Pixels(")
             .trim_end_matches(')')
-            .parse()
-            .ok()
+            .parse::<f32>()
+            .ok()?
     } else {
         value
             .as_float()
-            .or_else(|| value.as_integer().map(|v| v as f64))
-            .map(|v| v as f32)
-    }
+            .or_else(|| value.as_integer().map(|v| v as f64))? as f32
+    };
+    (value.is_finite() && value.abs() <= 8192.0).then_some(value)
 }
 
 fn valid_theme_schema(table: &toml::Value) -> Option<()> {
@@ -621,7 +621,10 @@ fn valid_theme_schema(table: &toml::Value) -> Option<()> {
                     theme_color(value)?;
                 }
                 "pixels" => {
-                    pixels(value)?;
+                    let size = pixels(value)?;
+                    if key.ends_with("font_size") && !(0.0 < size && size <= 1024.0) {
+                        return None;
+                    }
                 }
                 "string" => {
                     value.as_str()?;
@@ -641,9 +644,12 @@ fn valid_theme_schema(table: &toml::Value) -> Option<()> {
             }
         }
         if let Some(value) = font.get("font_size") {
-            value
+            let size = value
                 .as_float()
                 .or_else(|| value.as_integer().map(|v| v as f64))?;
+            if !size.is_finite() || size <= 0.0 || size > 1024.0 {
+                return None;
+            }
         }
     }
     Some(())
@@ -1014,7 +1020,10 @@ impl Config {
             mono_font_family: theme
                 .mono_font_family
                 .or_else(|| self.font.mono_font_family.clone()),
-            font_size: theme.font_size.or(self.font.font_size),
+            font_size: theme
+                .font_size
+                .or(self.font.font_size)
+                .filter(|size| size.is_finite() && *size > 0.0 && *size <= 1024.0),
         }
     }
 
@@ -1205,6 +1214,44 @@ pub fn set_theme(cfg: &mut Config, name: &str) -> bool {
 #[cfg(test)]
 mod save_tests {
     use super::*;
+    #[test]
+    fn invalid_theme_metrics_and_font_sizes_are_rejected() {
+        for value in [
+            "nan",
+            "inf",
+            "-inf",
+            "1e100",
+            "1e30",
+            "8193",
+            "'Pixels(inf)'",
+        ] {
+            assert!(
+                parse_theme(&format!("icon_size = {value}")).is_none(),
+                "{value}"
+            );
+        }
+        for value in ["nan", "inf", "-inf", "0", "-1", "1025", "1e100"] {
+            assert!(
+                parse_theme(&format!("[font]\nfont_size = {value}")).is_none(),
+                "{value}"
+            );
+            let config: Config = toml::from_str(&format!("[font]\nfont_size = {value}")).unwrap();
+            assert_eq!(config.startup_font_size(), 14.0, "{value}");
+        }
+        for value in ["nan", "inf", "0", "-1", "1025", "1e30"] {
+            assert!(
+                parse_theme(&format!("[emoji]\nfont_size = {value}")).is_none(),
+                "{value}"
+            );
+            assert!(
+                parse_theme(&format!("[action_indicator]\nkey_font_size = {value}")).is_none(),
+                "{value}"
+            );
+        }
+        assert_eq!(pixels(&toml::Value::Float(-2.0)), Some(-2.0));
+        assert!(parse_theme("[font]\nfont_size = 1024").is_some());
+    }
+
     #[test]
     fn markdown_code_radius_uses_the_theme_table() {
         assert_eq!(
