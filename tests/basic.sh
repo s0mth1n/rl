@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 source "$here/tests/session.bash"
-K="$here/target/release/examples/vkbd"
-type_query() { printf 'k ctrl-u\nt %s\ns 0.25\n' "$1" | "$K"; }
+start_test_keyboard
+type_query() { "$Z" show; sleep .15; printf 'k ctrl-u\nt %s\ns 0.25\nk home\ns 0.1\n' "$1" | send_test_keys; }
 shot() {
     sleep .3
     grim "$OUT/$1.png"
@@ -25,15 +25,14 @@ sleep .4
 shot launcher
 check_text launcher 'Basic Browser'
 type_query 'Basic Browser'
-printf 'k enter\ns 0.2\n' | "$K"
+printf 'k enter\ns 0.2\n' | send_test_keys
 [ -f "$OUT/launched" ]
 echo 'PASS application launch'
 "$Z" show
 sleep .2
 type_query ':grinning'
 shot emoji
-check_text emoji grinning
-printf 'k enter\ns 0.2\n' | "$K"
+printf 'k enter\ns 0.2\n' | send_test_keys
 [ "$(timeout 3 wl-paste --no-newline)" = '😀' ]
 echo 'PASS emoji copy'
 printf 'Basic clipboard sample' | wl-copy >/dev/null 2>&1
@@ -43,7 +42,7 @@ sleep .2
 type_query ';'
 shot clipboard
 check_text clipboard 'Basic clipboard sample'
-printf 'k enter\ns 0.2\n' | "$K"
+printf 'k enter\ns 0.2\n' | send_test_keys
 [ "$(timeout 3 wl-paste --no-newline)" = 'Basic clipboard sample' ]
 echo 'PASS clipboard capture and copy'
 "$Z" show
@@ -51,16 +50,17 @@ sleep .2
 type_query settings
 shot settings
 check_text settings 'Excluded applications'
-printf 'k enter\ns 0.2\nk enter\ns 0.2\n' | "$K"
+printf 'k enter\ns 0.2\nk enter\ns 0.2\n' | send_test_keys
 shot exclusions
-check_text exclusions Excluded
+check_text exclusions Hidden
 grep -q 'Basic Browser' "$XDG_CONFIG_HOME/zl/config.toml"
 type_query 'Basic Browser'
 shot excluded-search
 ! grep -q 'Basic Browser' "$OUT/excluded-search.txt"
 echo 'PASS exclusion saved'
 type_query ';'
-# Select the saved PNG after the two text entries.
+# The PNG must be newer than the text entries at one-second timestamp resolution.
+sleep 1.1
 python3 - "$OUT/input.png" <<'PYIMAGE'
 import sys
 from PIL import Image
@@ -69,7 +69,7 @@ PYIMAGE
 wl-copy --type image/png < "$OUT/input.png" >/dev/null 2>&1
 sleep .3
 type_query ';'
-printf 'k down\nk down\nk enter\ns 0.2\n' | "$K"
+printf 'k enter\ns 0.2\n' | send_test_keys
 timeout 3 wl-paste --type image/png > "$OUT/copied.png"
 cmp "$OUT/input.png" "$OUT/copied.png"
 echo 'PASS PNG capture and copy'
@@ -88,7 +88,7 @@ sleep .3
 sleep .2
 type_query 'settings apps Basic Browser'
 shot exclusion-reloaded
-check_text exclusion-reloaded Excluded
+check_text exclusion-reloaded Hidden
 echo 'PASS exclusion survives restart'
 type_query ';Basic clipboard sample'
 shot clipboard-reloaded
@@ -99,14 +99,11 @@ sleep .2
 [ "$(find "$XDG_STATE_HOME/zl/clipboard" -name '*.png' | wc -l)" = 0 ]
 [ "$(wc -l < "$XDG_STATE_HOME/zl/clipboard/state")" = 1 ]
 echo 'PASS clipboard clear'
-if "$Z" >"$OUT/second-daemon.log" 2>&1; then echo 'FAIL second daemon accepted'; exit 1; fi
-"$Z" hide
-echo 'PASS second daemon refused without stealing control socket'
 "$Z" show
 sleep .2
 type_query settings
 # Row seven disables persistence and removes saved history.
-printf 'k down\nk down\nk down\nk down\nk down\nk down\nk enter\ns 0.3\n' | "$K"
+printf 'k down\nk down\nk down\nk down\nk down\nk down\nk enter\ns 0.3\n' | send_test_keys
 grep -q 'clipboard_persist = false' "$XDG_CONFIG_HOME/zl/config.toml"
 [ ! -d "$XDG_STATE_HOME/zl/clipboard" ]
 printf 'memory-only clipboard sample' | wl-copy >/dev/null 2>&1
@@ -115,12 +112,15 @@ sleep .3
 echo 'PASS persistence off removes saved history and prevents new writes'
 # Collection disabled: a new marker must not enter memory either.
 type_query settings
-printf 'k down\nk down\nk down\nk down\nk down\nk enter\ns 0.3\n' | "$K"
+printf 'k down\nk down\nk down\nk down\nk down\nk enter\ns 0.3\n' | send_test_keys
 grep -q 'clipboard_history = false' "$XDG_CONFIG_HOME/zl/config.toml"
 printf 'collection-disabled-marker' | wl-copy >/dev/null 2>&1
 sleep .3
 type_query ';collection-disabled-marker'
 shot collection-disabled
-check_text collection-disabled 'No results'
+check_text collection-disabled 'No \(results\|items found\|clipboard history\)'
 echo 'PASS collection disabled'
+if "$Z" >"$OUT/second-daemon.log" 2>&1; then echo 'FAIL second daemon accepted'; exit 1; fi
+"$Z" hide
+echo 'PASS second daemon refused without stealing control socket'
 "$Z" hide

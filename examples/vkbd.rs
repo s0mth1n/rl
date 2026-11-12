@@ -1,5 +1,6 @@
 //! Test helper: a virtual keyboard for headless compositors.
 //! Commands on stdin: `t TEXT` types text (US layout), `k enter|bs|esc|ctrl-l|ctrl-k|ctrl-o|down|up|left|right`, `s SECONDS` sleeps.
+//! `a PATH` writes an acknowledgement after earlier commands finish.
 use std::io::{BufRead, Write};
 use std::os::fd::AsFd;
 use wayland_client::protocol::{wl_registry, wl_seat::WlSeat};
@@ -168,8 +169,16 @@ fn main() {
                 "up" => key(&kb, 103, false, false),
                 "left" => key(&kb, 105, false, false),
                 "right" => key(&kb, 106, false, false),
+                "ctrl-z" => key(&kb, 44, false, true),
+                "ctrl-y" => key(&kb, 21, false, true),
+                "ctrl-a" => key(&kb, 30, false, true),
+                "shift-right" => key(&kb, 106, true, false),
+                "shift-left" => key(&kb, 105, true, false),
                 "ctrl-v" => key(&kb, 47, false, true),
                 "ctrl-c" => key(&kb, 46, false, true),
+                "ctrl-r" => key(&kb, 19, false, true),
+                "ctrl-e" => key(&kb, 18, false, true),
+                "ctrl-d" => key(&kb, 32, false, true),
                 "ctrl-x" => key(&kb, 45, false, true),
                 "ctrl-u" => key(&kb, 22, false, true),
                 "ctrl-up" => key(&kb, 103, false, true),
@@ -188,6 +197,10 @@ fn main() {
                 "pgdn" => key(&kb, 109, false, false),
                 _ => {}
             }
+        } else if let Some(path) = line.strip_prefix("a ") {
+            conn.flush().unwrap();
+            q.roundtrip(&mut s).unwrap();
+            std::fs::write(path, b"ready").unwrap();
         } else if let Some(sec) = line.strip_prefix("s ") {
             std::thread::sleep(std::time::Duration::from_secs_f32(
                 sec.trim().parse().unwrap(),

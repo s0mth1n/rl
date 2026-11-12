@@ -9,7 +9,7 @@ pub struct Hist {
 }
 
 /// Key every fresh install starts with, like vicinae's default "clipboard:history" favorite.
-const SEED_PIN: &str = "Command:Clipboard History";
+const SEED_PIN: &str = "Basic:Clipboard History";
 
 fn now() -> u64 {
     std::time::SystemTime::now()
@@ -186,7 +186,7 @@ pub fn emoji_add(e: &str) {
     let n = f
         .iter()
         .position(|(x, _)| x == e)
-        .map_or(1, |i| f.remove(i).1 + 1);
+        .map_or(1, |i| f.remove(i).1.saturating_add(1));
     f.push((e.to_string(), n));
     f.sort_by_key(|a| std::cmp::Reverse(a.1));
     f.truncate(50);
@@ -204,22 +204,82 @@ pub fn emoji_add(e: &str) {
     );
 }
 
-/// Forget an emoji's recents and usage counts.
+pub fn emoji_tone_path() -> std::path::PathBuf {
+    Hist::path().with_file_name("emoji-tones")
+}
+
+pub fn emoji_tones() -> HashMap<String, usize> {
+    std::fs::read_to_string(emoji_tone_path())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let (name, tone) = line.rsplit_once('\t')?;
+            let tone = tone.parse::<usize>().ok()?;
+            (tone <= 5 && !name.is_empty()).then(|| (name.to_string(), tone))
+        })
+        .collect()
+}
+
+pub fn emoji_tone(name: &str) -> Option<usize> {
+    emoji_tones().get(name).copied()
+}
+
+pub fn emoji_tone_set(name: &str, tone: usize) -> bool {
+    if tone > 5 || name.is_empty() || name.contains(['\n', '\r', '\t']) {
+        return false;
+    }
+    let mut tones = emoji_tones();
+    tones.insert(name.to_string(), tone);
+    write_emoji_tones(tones)
+}
+
+fn write_emoji_tones(tones: HashMap<String, usize>) -> bool {
+    let path = emoji_tone_path();
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
+    let mut tones: Vec<_> = tones.into_iter().collect();
+    tones.sort();
+    let body: String = tones
+        .into_iter()
+        .map(|(name, tone)| format!("{name}\t{tone}\n"))
+        .collect();
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, body)
+        .and_then(|_| std::fs::rename(tmp, path))
+        .is_ok()
+}
+
+/// Forget an emoji's recents, usage counts and tone pick.
 pub fn emoji_reset(e: &str) {
-    let v: Vec<String> = emoji_recent().into_iter().filter(|x| x != e).collect();
-    let _ = std::fs::write(
-        emoji_path(),
-        v.join("\n") + if v.is_empty() { "" } else { "\n" },
-    );
-    let f: Vec<(String, u32)> = emoji_freq().into_iter().filter(|(x, _)| x != e).collect();
-    let _ = std::fs::write(
-        emoji_freq_path(),
-        f.iter()
-            .map(|(x, n)| format!("{x}\t{n}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-            + if f.is_empty() { "" } else { "\n" },
-    );
+    let Some(emoji) = emojis::get(e) else { return };
+    let base = emoji
+        .with_skin_tone(emojis::SkinTone::Default)
+        .unwrap_or(emoji);
+    let same = |sequence: &str| {
+        emojis::get(sequence).map(|e| {
+            e.with_skin_tone(emojis::SkinTone::Default)
+                .unwrap_or(e)
+                .as_str()
+        }) == Some(base.as_str())
+    };
+    let recent: String = emoji_recent()
+        .into_iter()
+        .filter(|e| !same(e))
+        .map(|e| format!("{e}\n"))
+        .collect();
+    let freq: String = emoji_freq()
+        .into_iter()
+        .filter(|(e, _)| !same(e))
+        .map(|(e, n)| format!("{e}\t{n}\n"))
+        .collect();
+    let _ = std::fs::write(emoji_path(), recent);
+    let _ = std::fs::write(emoji_freq_path(), freq);
+    let mut tones = emoji_tones();
+    tones.remove(base.name());
+    write_emoji_tones(tones);
 }
 
 /// Copy counts per emoji, most used first: "emoji<TAB>count" lines.

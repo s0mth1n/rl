@@ -6,6 +6,40 @@ use std::path::{Path, PathBuf};
 pub struct Icon {
     pub size: u32,
     pub px: Vec<u8>,
+    /// Stroke-only builtin symbol: draw tinted, not as-is.
+    pub symbol: bool,
+}
+
+pub const SEARCH: &str = "builtin:search";
+pub const CLEAR: &str = "builtin:clear";
+pub const BACK: &str = "builtin:back";
+pub const PALETTE: &str = "builtin:palette";
+
+const BACK_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg>"#;
+const PALETTE_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><circle cx="8.5" cy="10" r="1.2"/><circle cx="12" cy="7.5" r="1.2"/><circle cx="15.5" cy="10" r="1.2"/><circle cx="9" cy="14.5" r="1.2"/></svg>"#;
+
+// Lucide circle-x (ISC, see NOTICE): the glyph zlaunch's clear button shows.
+const CLEAR_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/></svg>"#;
+
+const SMILEY_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>"#;
+const CLIPBOARD_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></svg>"#;
+const SETTINGS_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 1.8v3M12 19.2v3M1.8 12h3M19.2 12h3M4.7 4.7l2.2 2.2M17.1 17.1l2.2 2.2M4.7 19.3l2.2-2.2M17.1 6.9l2.2-2.2"/></svg>"#;
+const GLOBE_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3c-2.5 2.6-4 5.6-4 9s1.5 6.4 4 9"/><path d="M12 3c2.5 2.6 4 5.6 4 9s-1.5 6.4-4 9"/></svg>"#;
+const TERMINAL_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3"/><line x1="13" y1="15" x2="17" y2="15"/></svg>"#;
+const FOLDER_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>"#;
+
+/// Builtin strokes for the mode rows, used when no icon theme provides them.
+fn fallback_symbol(name: &str) -> Option<&'static [u8]> {
+    Some(match name {
+        "smiley" | "face-smile" => SMILEY_SVG,
+        "clipboard" | "edit-paste" => CLIPBOARD_SVG,
+        "palette" => PALETTE_SVG,
+        "settings" | "preferences-system" | "emblem-system" => SETTINGS_SVG,
+        "globe" | "web-browser" | "applications-internet" => GLOBE_SVG,
+        "folder" | "system-file-manager" => FOLDER_SVG,
+        "utilities-terminal" => TERMINAL_SVG,
+        _ => return None,
+    })
 }
 
 const SIZE_DIRS: [&str; 12] = [
@@ -103,7 +137,11 @@ pub fn load(path: &Path, size: u32) -> Option<Icon> {
         "svg" => render_svg(&data, size)?,
         _ => return None,
     };
-    Some(Icon { size, px })
+    Some(Icon {
+        size,
+        px,
+        symbol: false,
+    })
 }
 
 fn decode_png(data: &[u8], size: u32) -> Option<Vec<u8>> {
@@ -344,12 +382,46 @@ impl Cache {
         if self.map.len() >= 256 {
             self.map.clear();
         }
-        let icon = if let Some(g) = name.strip_prefix("emoji:") {
+        let symbol = match name {
+            SEARCH => Some(include_bytes!("../assets/icons/search.svg").as_slice()),
+            CLEAR => Some(CLEAR_SVG),
+            BACK => Some(BACK_SVG),
+            PALETTE => Some(PALETTE_SVG),
+            _ => None,
+        };
+        let icon = if let Some(svg) = symbol {
+            render_svg(svg, size).map(|px| Icon {
+                size,
+                px,
+                symbol: true,
+            })
+        } else if let Some(g) = name.strip_prefix("emoji:") {
             self.emoji(g, size)
         } else {
-            find(name, &self.themes).and_then(|p| load(&p, size))
+            find(name, &self.themes)
+                .and_then(|p| load(&p, size))
+                .or_else(|| {
+                    fallback_symbol(name).and_then(|svg| {
+                        render_svg(svg, size).map(|px| Icon {
+                            size,
+                            px,
+                            symbol: true,
+                        })
+                    })
+                })
         };
         self.map.insert(key, icon);
+    }
+    pub fn ensure_input(&mut self, scale: u32) {
+        if self.map.len() > 94
+            && (self.get(SEARCH, 16 * scale).is_none() || self.get(CLEAR, 16 * scale).is_none())
+        {
+            self.map.clear();
+        }
+        self.ensure(SEARCH, 16 * scale);
+        self.ensure(CLEAR, 16 * scale);
+        self.ensure(BACK, 16 * scale);
+        self.ensure(PALETTE, 16 * scale);
     }
     /// A colour emoji from the system emoji font, when that font stores PNG bitmaps (Noto Color Emoji, Apple).
     fn emoji(&mut self, glyph: &str, size: u32) -> Option<Icon> {
@@ -368,6 +440,7 @@ impl Cache {
         Some(Icon {
             size,
             px: decode_png(&png, size)?,
+            symbol: false,
         })
     }
 
@@ -379,6 +452,30 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn input_symbols_are_embedded_and_cached_at_each_scale() {
+        let mut cache = Cache::new("", "");
+        for scale in [1, 2, 3] {
+            cache.ensure_input(scale);
+            for name in [SEARCH, CLEAR, BACK, PALETTE] {
+                let icon = cache.get(name, 16 * scale).unwrap();
+                assert_eq!(icon.size, 16 * scale);
+                assert_eq!(icon.px.len(), (16 * scale * 16 * scale * 4) as usize);
+                assert!(icon.px.chunks(4).any(|p| p[3] != 0));
+                assert_eq!(icon.px[3], 0);
+            }
+        }
+        cache.ensure_input(1);
+        assert_eq!(cache.map.len(), 12);
+        for index in 0..90 {
+            cache.map.insert((format!("missing-{index}"), 16), None);
+        }
+        cache.ensure_input(4);
+        assert!(cache.get(SEARCH, 64).is_some());
+        assert!(cache.get(CLEAR, 64).is_some());
+        assert_eq!(cache.map.len(), 4);
+    }
+
     #[test]
     fn resize_keeps_colour_and_centres() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();

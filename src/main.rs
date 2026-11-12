@@ -1,18 +1,25 @@
 //! zl: a small Wayland launcher. One daemon, a unix socket, a layer-shell panel drawn on the CPU.
 mod actions_ui;
 mod clip;
+mod clipboard_ui;
 mod config;
 #[allow(dead_code)]
 mod dates;
+mod details;
 #[allow(dead_code)]
 mod hist;
 mod icons;
+mod input;
 mod items;
 mod keys;
+mod scripts;
 mod settings;
 #[cfg(test)]
 mod testutil;
 mod ui;
+
+/// A keyboard Leave that is not followed by an Enter within this long hides the panel.
+const FOCUS_GRACE: Duration = Duration::from_millis(250);
 
 use config::Config;
 use items::{Action, App as DesktopApp, Item, Search};
@@ -33,10 +40,15 @@ use wayland_client::protocol::{
     wl_seat::WlSeat,
     wl_shm::{Format, WlShm},
     wl_shm_pool::WlShmPool,
+    wl_subcompositor::WlSubcompositor,
+    wl_subsurface::WlSubsurface,
     wl_surface::WlSurface,
 };
 use wayland_client::Proxy;
 use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle, WEnum};
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport::WpViewport, wp_viewporter::WpViewporter,
+};
 use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_device_v1::{self, ZwlrDataControlDeviceV1},
     zwlr_data_control_manager_v1::ZwlrDataControlManagerV1,
@@ -49,10 +61,41 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 };
 use xkbcommon::xkb;
 
+struct Backdrop {
+    surface: WlSurface,
+    panel: WlSubsurface,
+    viewport: Option<WpViewport>,
+    buffer: Option<WlBuffer>,
+    width: u32,
+    height: u32,
+}
+
+fn backdrop_buffer_size(width: u32, height: u32, viewport: bool) -> Option<(u32, u32, usize)> {
+    if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
+        return None;
+    }
+    let (w, h) = if viewport { (1, 1) } else { (width, height) };
+    let bytes = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+    (bytes <= 256 * 1024 * 1024).then_some((w, h, bytes))
+}
+
+fn panel_position(width: u32, height: u32, panel_width: u32, panel_height: u32) -> (i32, i32) {
+    (
+        ((width as i64 - panel_width as i64) / 2) as i32,
+        ((height as i64 - panel_height as i64) / 2) as i32,
+    )
+}
+
 struct Out {
     obj: WlOutput,
     name: String,
     scale: u32,
+}
+
+struct ScriptForm {
+    script: scripts::Script,
+    value: String,
+    option: usize,
 }
 
 struct App {
@@ -62,10 +105,18 @@ struct App {
     font: Font<'static>,
     apps: Vec<DesktopApp>,
     files: items::FileIndex,
+    scripts: Vec<scripts::Script>,
+    scripts_sig: u64,
     items: Vec<Item>,
     query: String,
+    edit: input::Edit,
+    caret_visible: bool,
+    caret_next: Instant,
     sel: usize,
     top: usize,
+    /// Last wheel or keyboard scroll; the scrollbar thumb shows for a second
+    /// after it, as zlaunch's auto-hiding scrollbar does.
+    last_scroll: Option<Instant>,
     shown: bool,
     configured: bool,
     cur_h: u32,
@@ -74,14 +125,30 @@ struct App {
     repeat_rate: i32,
     repeat_delay: i32,
     repeating: Option<(u32, Instant)>,
+    /// When the keyboard left the panel. It hides if focus has not come back shortly after.
+    left_at: Option<Instant>,
     /// Last pointer position on the panel, in surface pixels. Hover never moves the selection.
     pointer: Option<(f64, f64)>,
+    pointer_on_backdrop: bool,
     last_click: Option<(usize, Instant)>,
+    /// The combined-view query to restore on the back arrow, saved when a
+    /// sub-view (emoji, clipboard) is entered from the main list.
+    origin: Option<String>,
+    input_drag: bool,
+    input_click: Option<(Instant, u8, f64, f64)>,
     settings_error: Option<String>,
     hist: hist::Hist,
     panel: Option<(String, Vec<Item>, usize)>,
     panel_filter: String,
+    detail: bool,
+    /// A picker selection is previewing a theme that is not saved yet.
+    previewing: bool,
+    script_form: Option<ScriptForm>,
+    script_run: Option<scripts::Run>,
     compositor: Option<WlCompositor>,
+    subcompositor: Option<WlSubcompositor>,
+    viewporter: Option<WpViewporter>,
+    backdrop: Option<Backdrop>,
     shm: Option<WlShm>,
     shell: Option<ZwlrLayerShellV1>,
     seat: Option<WlSeat>,
@@ -92,6 +159,7 @@ struct App {
     buffer: Option<WlBuffer>,
     ctx: xkb::Context,
     xkb: Option<xkb::State>,
+    compose: Option<xkb::compose::State>,
     clip: clip::History,
     dc_manager: Option<ZwlrDataControlManagerV1>,
     dc_device: Option<ZwlrDataControlDeviceV1>,
@@ -123,15 +191,24 @@ impl App {
     }
 
     fn vp(&self) -> f32 {
-        if self.query.starts_with(':') {
+        let vp = if self.query.starts_with(':') {
             self.emoji_rows() as f32 * ui::EMOJI_CELL
         } else {
             ui::viewport(&self.items, self.cfg.max_rows)
+        };
+        if self.panel.is_some() {
+            vp.max(actions_ui::MIN_VIEWPORT)
+        } else if self.detail {
+            vp.max(300.0)
+        } else {
+            vp
         }
     }
 
     fn panel_height(&self) -> u32 {
-        if self.query.starts_with(':') {
+        if self.panel.is_some() || self.detail {
+            (ui::HEAD + self.vp() + 2.0 * ui::LIST_PAD) as u32
+        } else if self.query.starts_with(':') {
             ui::emoji_panel_height(self.emoji_rows())
         } else {
             ui::panel_height(&self.items, self.cfg.max_rows)
@@ -139,26 +216,43 @@ impl App {
     }
 
     fn refresh(&mut self) {
+        // Typing away the sub-view prefix also leaves the sub-view.
+        if self.origin.is_some() && !self.query.starts_with([':', ';', '#']) {
+            self.origin = None;
+        }
         if self.query.starts_with('/') {
             self.files
                 .load(&self.cfg.file_roots, &self.cfg.file_excludes);
+        }
+        self.edit.sync(&self.query);
+        if let Some(form) = &self.script_form {
+            self.items = vec![Item {
+                title: form.script.arg.clone(),
+                sub: if form.script.arg_secret {
+                    "Password input".into()
+                } else {
+                    form.value.clone()
+                },
+                tag: "Script",
+                icon: None,
+                action: Action::ScriptSubmit,
+                best: false,
+            }];
+            return;
+        }
+        if let Some(run) = &self.script_run {
+            self.items = scripts::output_items(run);
+            return;
         }
         let s = Search {
             cfg: &self.cfg,
             apps: &self.apps,
             files: self.files.files(),
+            scripts: &self.scripts,
             history: &self.clip,
         };
         self.items = s.run(&self.query);
-        if !self.query.starts_with([':', ';']) && !self.query.starts_with("settings") {
-            self.items.sort_by_key(|it| {
-                let key = items::key_of(it);
-                (
-                    self.hist.pin_order(&key).unwrap_or(usize::MAX),
-                    std::cmp::Reverse(self.hist.bonus(&key)),
-                )
-            });
-        }
+        items::rank_history(&mut self.items, &self.query, &self.cfg, &self.hist);
         self.sel = 0;
         self.top = 0;
         if let Some(message) = self.settings_error.take() {
@@ -177,6 +271,7 @@ impl App {
     }
 
     fn ensure_visible(&mut self) {
+        let before = self.top;
         if self.query.starts_with(':') {
             let columns = self.columns();
             let rows = self.emoji_rows();
@@ -193,9 +288,18 @@ impl App {
         } else {
             self.top = ui::scroll_to(&self.items, self.sel, self.top, self.vp());
         }
+        if self.top != before {
+            self.last_scroll = Some(Instant::now());
+        }
+    }
+
+    fn pause_caret(&mut self) {
+        self.caret_visible = true;
+        self.caret_next = Instant::now() + Duration::from_millis(300);
     }
 
     fn show(&mut self, qh: &QueueHandle<App>) {
+        self.pause_caret();
         if self.shown {
             return;
         }
@@ -203,7 +307,21 @@ impl App {
             return;
         }
         self.apps = items::scan_apps(&self.cfg);
+        let sig = scripts::scripts_sig(&self.cfg);
+        if sig != self.scripts_sig {
+            self.scripts = scripts::scan_scripts(&self.cfg);
+            self.scripts_sig = sig;
+        }
+        for script in &mut self.scripts {
+            if script.mode == scripts::ScriptMode::Inline {
+                if let Some(line) = scripts::inline_cached(&script.exec) {
+                    script.comment = line;
+                }
+            }
+        }
+        scripts::refresh_inline(&self.scripts);
         self.last_click = None;
+        self.pointer = None;
         self.query.clear();
         self.refresh();
         let (Some(c), Some(sh)) = (&self.compositor, &self.shell) else {
@@ -226,12 +344,40 @@ impl App {
             .unwrap_or(1)
             .max(1);
         let s = c.create_surface(qh, ());
-        let l = sh.get_layer_surface(&s, out, Layer::Overlay, "zl".into(), qh, ());
         self.cur_h = self.panel_height();
-        l.set_size(self.cfg.width, self.cur_h);
-        l.set_anchor(Anchor::empty());
+        let root = if let Some(sub) = &self.subcompositor {
+            let root = c.create_surface(qh, ());
+            let panel = sub.get_subsurface(&s, &root, qh, ());
+            panel.set_desync();
+            let viewport = self
+                .viewporter
+                .as_ref()
+                .map(|v| v.get_viewport(&root, qh, ()));
+            self.backdrop = Some(Backdrop {
+                surface: root.clone(),
+                panel,
+                viewport,
+                buffer: None,
+                width: 0,
+                height: 0,
+            });
+            root
+        } else {
+            s.clone()
+        };
+        let l = sh.get_layer_surface(&root, out, Layer::Overlay, "zl".into(), qh, ());
+        if self.backdrop.is_some() {
+            l.set_size(0, 0);
+            l.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
+            l.set_exclusive_zone(-1);
+        } else {
+            l.set_size(self.cfg.width, self.cur_h);
+            l.set_anchor(Anchor::empty());
+        }
         l.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-        s.commit();
+        root.commit();
+        self.pointer_on_backdrop = false;
+        self.pointer = None;
         self.surface = Some(s);
         self.layer = Some(l);
         self.shown = true;
@@ -240,8 +386,21 @@ impl App {
 
     fn hide(&mut self) {
         self.files.clear();
+        self.script_form = None;
+        self.script_run = None;
         self.repeating = None;
+        self.left_at = None;
         self.close_panel();
+        self.pointer_on_backdrop = false;
+        self.pointer = None;
+        if let Some(b) = self.backdrop.as_ref() {
+            b.panel.destroy();
+        }
+        // Dismissing the panel cancels an unsaved theme preview.
+        if self.previewing {
+            self.theme = self.cfg.theme();
+            self.previewing = false;
+        }
         if let Some(l) = self.layer.take() {
             l.destroy();
         }
@@ -251,6 +410,15 @@ impl App {
         if let Some(s) = self.surface.take() {
             s.destroy();
         }
+        if let Some(b) = self.backdrop.take() {
+            if let Some(v) = b.viewport {
+                v.destroy();
+            }
+            if let Some(buffer) = b.buffer {
+                buffer.destroy();
+            }
+            b.surface.destroy();
+        }
         self.shown = false;
         self.configured = false;
     }
@@ -259,12 +427,15 @@ impl App {
         if !self.shown || !self.configured {
             return;
         }
+        self.sync_theme_preview();
         self.ensure_visible();
         let h = self.panel_height();
         if h != self.cur_h {
             self.cur_h = h;
-            if let Some(l) = &self.layer {
-                l.set_size(self.cfg.width, h);
+            if self.backdrop.is_none() {
+                if let Some(l) = &self.layer {
+                    l.set_size(self.cfg.width, h);
+                }
             }
         }
         if self.shm.is_none() || self.surface.is_none() {
@@ -292,11 +463,49 @@ impl App {
                 self.icons.ensure(n, icon_size);
             }
         }
+        self.icons.ensure_input(s);
+        if let Some(b) = &self.backdrop {
+            let (x, y) = panel_position(b.width, b.height, self.cfg.width, h);
+            b.panel.set_position(x, y);
+            b.surface.commit();
+        }
         let Some(surf) = &self.surface else { return };
         let mut cv = ui::Canvas::new(self.cfg.width * s, h * s);
+        let display_query = if let Some(form) = &self.script_form {
+            format!(
+                "{}: {}",
+                form.script.name,
+                if form.script.arg_secret {
+                    "*".repeat(form.value.chars().count())
+                } else {
+                    form.value.clone()
+                }
+            )
+        } else if let Some(run) = &self.script_run {
+            format!(
+                "{}{}",
+                run.name,
+                if run.done {
+                    " - Ctrl+C copy, Ctrl+R run again"
+                } else {
+                    " - running"
+                }
+            )
+        } else if self.query.starts_with("confirm script-run ") {
+            "Run script?".into()
+        } else if self.query.starts_with("confirm script-del ") {
+            "Delete script?".into()
+        } else {
+            self.query.clone()
+        };
         let v = ui::View {
             icons: &self.icons,
-            query: &self.query,
+            query: &display_query,
+            input: (self.script_form.is_none() && self.script_run.is_none()).then_some((
+                self.edit.caret,
+                self.edit.anchor,
+                self.caret_visible,
+            )),
             items: &self.items,
             sel: self.sel,
             top: self.top,
@@ -306,8 +515,25 @@ impl App {
             h,
             scale: s,
             font_size: self.cfg.font_size,
+            back: self.origin.is_some(),
+            show_scrollbar: self
+                .last_scroll
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(1)),
         };
-        ui::draw(&mut cv, &self.font, &v);
+        if self.query.starts_with(';') {
+            clipboard_ui::draw(&mut cv, &self.font, &v, &self.clip);
+        } else {
+            ui::draw(&mut cv, &self.font, &v);
+        }
+        if self.detail {
+            if let Some(text) = self
+                .items
+                .get(self.sel)
+                .and_then(|it| details::text(it, &self.cfg, &self.apps, &self.hist))
+            {
+                details::draw(&mut cv, &self.font, &v, &text);
+            }
+        }
         if let Some((title, actions, sel)) = &self.panel {
             actions_ui::draw(
                 &mut cv,
@@ -384,6 +610,72 @@ impl App {
         self.redraw(qh);
     }
 
+    fn configure_backdrop(&mut self, width: u32, height: u32, qh: &QueueHandle<App>) -> bool {
+        let Some(b) = self.backdrop.as_mut() else {
+            return true;
+        };
+        let Some(shm) = &self.shm else { return false };
+        let Some((w, h, size)) = backdrop_buffer_size(width, height, b.viewport.is_some()) else {
+            return false;
+        };
+        let fd = unsafe { libc::memfd_create(c"zl-backdrop".as_ptr(), 0) };
+        if fd < 0 {
+            return false;
+        }
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        if file.set_len(size as u64).is_err() {
+            return false;
+        }
+        let pool = shm.create_pool(file.as_fd(), size as i32, qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            w as i32,
+            h as i32,
+            (w * 4) as i32,
+            Format::Argb8888,
+            qh,
+            (),
+        );
+        pool.destroy();
+        if let Some(v) = &b.viewport {
+            v.set_destination(width as i32, height as i32);
+        }
+        b.width = width;
+        b.height = height;
+        b.surface.attach(Some(&buffer), 0, 0);
+        b.surface.damage_buffer(0, 0, w as i32, h as i32);
+        if let Some(old) = b.buffer.replace(buffer) {
+            old.destroy();
+        }
+        true
+    }
+
+    /// Live theme preview: in the picker the selected row recolours the panel, like
+    /// zlaunch's theme mode. Leaving the picker without Enter restores the saved theme.
+    fn sync_theme_preview(&mut self) {
+        let picked = if items::theme_view(&self.query) {
+            self.items.get(self.sel).and_then(|it| match &it.action {
+                Action::Theme(name) => Some(name.clone()),
+                _ => None,
+            })
+        } else {
+            None
+        };
+        match picked {
+            Some(name) => {
+                let mut cfg = self.cfg.clone();
+                cfg.theme = name;
+                self.theme = cfg.theme();
+                self.previewing = true;
+            }
+            None if self.previewing && !items::theme_view(&self.query) => {
+                self.theme = self.cfg.theme();
+                self.previewing = false;
+            }
+            _ => {}
+        }
+    }
+
     fn activate(&mut self, qh: &QueueHandle<App>) {
         let picked = if self.panel.is_some() {
             let vis = self.panel_vis();
@@ -393,12 +685,37 @@ impl App {
         } else {
             self.items.get(self.sel).cloned()
         };
-        let Some(it) = picked else { return };
+        let Some(mut it) = picked else {
+            if items::theme_view(&self.query) {
+                self.query.clear();
+                self.refresh();
+                self.redraw(qh);
+            }
+            return;
+        };
+        if it.tag == "Action" && matches!(it.action, Action::Web(_)) {
+            if let Some(source) = self.items.get(self.sel) {
+                it.title = source.title.clone();
+                it.tag = source.tag;
+            }
+        }
+        let record_usage = it.tag != "Action"
+            || self
+                .items
+                .get(self.sel)
+                .is_some_and(|source| source.action == it.action);
         self.close_panel();
-        if matches!(
-            it.action,
-            Action::App(_) | Action::Clip(_) | Action::ClipImg(_)
-        ) {
+        if record_usage
+            && matches!(
+                it.action,
+                Action::App(_)
+                    | Action::Clip(_)
+                    | Action::ClipImg(_)
+                    | Action::Script(_)
+                    | Action::AppArg(..)
+                    | Action::AppForce(..)
+            )
+        {
             let key = if it.tag == "Action" {
                 self.items
                     .get(self.sel)
@@ -410,6 +727,60 @@ impl App {
             self.hist.record(&key);
         }
         match it.action {
+            Action::Script(i) | Action::AppArg(i, _) | Action::AppForce(i, _) => {
+                let arg = match &it.action {
+                    Action::AppArg(_, v) => Some(v.clone()),
+                    Action::AppForce(_, v) => v.clone(),
+                    _ => None,
+                };
+                self.run_script(i, arg, matches!(it.action, Action::AppForce(..)), qh);
+            }
+            Action::ScriptToggle(name) => {
+                if scripts::toggle(&name).is_err() {
+                    self.settings_error = Some("Could not save script settings".into());
+                }
+                self.scripts = scripts::scan_scripts(&self.cfg);
+                self.refresh();
+                self.redraw(qh);
+            }
+            Action::ScriptSamples => {
+                if scripts::samples(&self.cfg).is_err() {
+                    self.settings_error = Some("Could not write sample scripts".into());
+                }
+                self.scripts = scripts::scan_scripts(&self.cfg);
+                self.refresh();
+                self.redraw(qh);
+            }
+            Action::ScriptEdit(path) => {
+                let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+                let command = format!(
+                    "{} {editor} '{}'",
+                    self.cfg.terminal,
+                    path.replace('\'', "'\\''")
+                );
+                launch_application(&command);
+                self.hide();
+            }
+            Action::ScriptDelete(path) => {
+                if std::fs::remove_file(&path).is_err() {
+                    self.settings_error = Some("Could not delete script".into());
+                }
+                self.scripts = scripts::scan_scripts(&self.cfg);
+                self.query = "scripts".into();
+                self.refresh();
+                self.redraw(qh);
+            }
+            Action::ScriptSubmit => {
+                if let Some(form) = self.script_form.take() {
+                    self.start_script(form.script, Some(form.value), qh);
+                }
+            }
+            Action::ScriptOutput => {
+                if let Some(run) = &self.script_run {
+                    let text = scripts::strip_ansi(&run.text);
+                    self.set_clipboard(text.as_bytes(), false, qh);
+                }
+            }
             Action::App(i) => {
                 self.hide();
                 let a = &self.apps[i];
@@ -420,6 +791,9 @@ impl App {
                 launch_application(&cmd);
             }
             Action::Clip(t) => {
+                if self.query.starts_with(':') && emojis::get(&t).is_some() {
+                    hist::emoji_add(&t);
+                }
                 self.hide();
                 self.set_clipboard(t.as_bytes(), false, qh);
             }
@@ -449,13 +823,45 @@ impl App {
                     .stderr(std::process::Stdio::null())
                     .spawn();
             }
+            Action::Trash(p) => {
+                if items::trash(&p) {
+                    let dir = format!("{p}/");
+                    self.files.retain(|f| f != &p && !f.starts_with(&dir));
+                } else {
+                    self.settings_error = Some("Could not move to the trash".into());
+                }
+                let error = self.settings_error.take();
+                self.query = "/".into();
+                self.sel = 0;
+                self.top = 0;
+                self.refresh();
+                self.settings_error = error;
+                self.redraw(qh);
+            }
             Action::Nothing => {}
             Action::View(view) => {
+                // Entered through the main list: remember the combined query
+                // so the back arrow returns to it, as zlaunch's sub-views do.
+                if matches!(view.as_str(), ":" | ";" | "#") {
+                    self.origin = Some(self.query.clone());
+                }
                 self.query = view;
                 self.refresh();
                 self.redraw(qh);
             }
             Action::Setting(key) => self.change_setting(&key, 1, qh),
+            Action::Theme(name) => {
+                if settings::set_theme(&mut self.cfg, &name) {
+                    // The saved theme stays on; back to the root list, like zlaunch.
+                    self.previewing = false;
+                    self.theme = self.cfg.theme();
+                    self.query.clear();
+                } else {
+                    self.settings_error = Some("Could not save settings".into());
+                }
+                self.refresh();
+                self.redraw(qh);
+            }
             Action::Exclude(name) => {
                 if !settings::exclude(&mut self.cfg, &name) {
                     self.settings_error = Some("Could not save exclusions".into());
@@ -465,8 +871,67 @@ impl App {
                 self.sel = sel.min(self.items.len().saturating_sub(1));
                 self.redraw(qh);
             }
+            Action::Details => {
+                self.detail = !self.detail;
+                self.redraw(qh);
+            }
+            Action::Web(url) => {
+                if items::link_fill(&url, "").is_some() {
+                    if let Some(link) = self
+                        .cfg
+                        .link
+                        .iter()
+                        .find(|l| l.name == it.title && l.url == url && !l.alias.is_empty())
+                    {
+                        self.query = format!("{} ", link.alias);
+                        self.refresh();
+                        self.redraw(qh);
+                    }
+                    return;
+                }
+                self.hist.record(&format!("Link:{}", it.title));
+                self.hide();
+                let opener = self
+                    .cfg
+                    .link
+                    .iter()
+                    .find(|l| l.name == it.title && !l.app.is_empty())
+                    .and_then(|l| self.apps.iter().find(|a| a.name == l.app));
+                if let Some(a) = opener {
+                    let mut cmd = items::exec_open(&a.exec, &url);
+                    if a.terminal {
+                        cmd = format!("{} {cmd}", self.cfg.terminal);
+                    }
+                    launch_application(&cmd);
+                } else {
+                    let _ = std::process::Command::new("xdg-open")
+                        .arg(&url)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                }
+            }
             Action::PinToggle(key) => {
                 self.hist.toggle_pin(&key);
+                self.refresh();
+                self.redraw(qh);
+            }
+            Action::SetToneFor(name, tone) => {
+                if !hist::emoji_tone_set(&name, tone) {
+                    self.settings_error = Some("Could not save emoji skin tone".into());
+                }
+                let sel = self.sel;
+                self.refresh();
+                self.sel = sel.min(self.items.len().saturating_sub(1));
+                self.redraw(qh);
+            }
+            Action::EmojiReset(sequence) => {
+                if let Some(e) = emojis::get(&sequence) {
+                    self.hist
+                        .reset(&format!("Emoji:{}", items::emoji_base(e).name()));
+                }
+                hist::emoji_reset(&sequence);
                 self.refresh();
                 self.redraw(qh);
             }
@@ -522,18 +987,232 @@ impl App {
         let Some(it) = self.items.get(self.sel) else {
             return;
         };
-        let acts = items::actions_for(it, self.hist.is_pinned(&items::key_of(it)), &self.cfg);
+        let mut acts = items::actions_for(it, self.hist.is_pinned(&items::key_of(it)), &self.cfg);
+        let script = match &it.action {
+            Action::Script(i) | Action::AppArg(i, _) => self.scripts.get(*i),
+            Action::ScriptToggle(name) => self.scripts.iter().find(|s| &s.name == name),
+            _ => None,
+        };
+        if let Some(script) = script {
+            let path = script.exec.trim_matches('\'').replace("'\\''", "'");
+            for (title, action) in [
+                ("Edit script", Action::ScriptEdit(path.clone())),
+                (
+                    "Delete script",
+                    Action::View(format!("confirm script-del {path}")),
+                ),
+            ] {
+                acts.push(Item {
+                    title: title.into(),
+                    sub: script.name.clone(),
+                    tag: "Action",
+                    icon: None,
+                    action,
+                    best: false,
+                });
+            }
+        }
         self.panel = Some((it.title.clone(), acts, 0));
         self.panel_filter.clear();
     }
 
+    fn run_script(&mut self, i: usize, arg: Option<String>, force: bool, qh: &QueueHandle<App>) {
+        let Some(script) = self.scripts.get(i).cloned() else {
+            return;
+        };
+        if scripts::disabled().contains(&format!("cmd:{}", script.name)) {
+            return;
+        }
+        if script.confirm && !force {
+            self.query = format!(
+                "confirm script-run {i}\t{}\t{}",
+                script.name,
+                arg.unwrap_or_default()
+            );
+            self.refresh();
+            self.redraw(qh);
+            return;
+        }
+        if arg.is_none() && !script.arg.is_empty() {
+            self.script_form = Some(ScriptForm {
+                value: script.arg_opts.first().cloned().unwrap_or_default(),
+                option: 0,
+                script,
+            });
+            self.refresh();
+            self.redraw(qh);
+            return;
+        }
+        self.start_script(script, arg, qh);
+    }
+
+    fn start_script(
+        &mut self,
+        script: scripts::Script,
+        arg: Option<String>,
+        qh: &QueueHandle<App>,
+    ) {
+        self.close_panel();
+        let cmd = scripts::command(&script, arg.as_deref());
+        self.script_form = None;
+        if matches!(
+            script.mode,
+            scripts::ScriptMode::Terminal
+                | scripts::ScriptMode::Silent
+                | scripts::ScriptMode::Inline
+        ) {
+            let cmd = if script.terminal {
+                format!(
+                    "{} sh -c '{}'",
+                    term_prefix(&self.cfg.terminal, true),
+                    cmd.replace('\'', "'\\''")
+                )
+            } else {
+                cmd
+            };
+            if script.terminal && self.cfg.terminal.is_empty() {
+                self.settings_error =
+                    Some("Set terminal in config before running terminal scripts".into());
+                self.refresh();
+                self.redraw(qh);
+                return;
+            }
+            launch_application(&cmd);
+            scripts::script_ran(&script.name);
+            self.hide();
+            return;
+        }
+        match scripts::Run::start(script.name, cmd, script.mode == scripts::ScriptMode::Hud) {
+            Ok(run) => self.script_run = Some(run),
+            Err(error) => self.settings_error = Some(format!("Could not start script: {error}")),
+        }
+        self.sel = 0;
+        self.top = 0;
+        self.refresh();
+        self.redraw(qh);
+    }
+
+    fn pump_script(&mut self, qh: &QueueHandle<App>) {
+        let changed = self.script_run.as_mut().is_some_and(|run| run.pump());
+        if self.script_run.as_ref().is_some_and(|run| {
+            run.toast
+                && run
+                    .finished
+                    .is_some_and(|at| at.elapsed() > Duration::from_secs(3))
+        }) {
+            self.hide();
+            return;
+        }
+        if changed {
+            self.refresh();
+            self.redraw(qh);
+        }
+    }
+
+    fn mv(&mut self, d: isize) {
+        let n = self.items.len() as isize;
+        if n > 0 {
+            self.sel = (self.sel as isize + d).clamp(0, n - 1) as usize;
+        }
+    }
+
     fn key(&mut self, key: u32, qh: &QueueHandle<App>) -> bool {
+        self.pause_caret();
         use xkbcommon::xkb::keysyms as k;
         let Some(st) = &self.xkb else { return false };
         let code = xkb::Keycode::new(key + 8);
         let sym = st.key_get_one_sym(code).raw();
-        let utf8 = st.key_get_utf8(code);
+        let mut utf8 = st.key_get_utf8(code);
         let ctrl = st.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE);
+        if self.script_form.is_some() {
+            if sym == k::KEY_Escape {
+                self.script_form = None;
+                self.query.clear();
+                self.refresh();
+                self.redraw(qh);
+                return false;
+            }
+            if sym == k::KEY_Return || sym == k::KEY_KP_Enter {
+                let form = self.script_form.take().unwrap();
+                self.start_script(form.script, Some(form.value), qh);
+                return false;
+            }
+            let form = self.script_form.as_mut().unwrap();
+            if !form.script.arg_opts.is_empty() {
+                if matches!(sym, k::KEY_Down | k::KEY_Tab | k::KEY_Up) {
+                    let n = form.script.arg_opts.len();
+                    form.option = if sym == k::KEY_Up {
+                        (form.option + n - 1) % n
+                    } else {
+                        (form.option + 1) % n
+                    };
+                    form.value = form.script.arg_opts[form.option].clone();
+                }
+            } else if sym == k::KEY_BackSpace {
+                form.value.pop();
+            } else if ctrl && utf8 == "\u{15}" {
+                form.value.clear();
+            } else if !ctrl && !utf8.chars().any(|c| c.is_control()) {
+                form.value.push_str(&utf8);
+            }
+            self.refresh();
+            self.redraw(qh);
+            return true;
+        }
+        if self.script_run.is_some() {
+            if sym == k::KEY_Escape {
+                self.script_run = None;
+                self.query.clear();
+                self.refresh();
+                self.redraw(qh);
+                return false;
+            }
+            if ctrl && utf8 == "\u{3}" {
+                let text = scripts::strip_ansi(&self.script_run.as_ref().unwrap().text);
+                self.set_clipboard(text.as_bytes(), false, qh);
+                return false;
+            }
+            if ctrl && utf8 == "\u{12}" {
+                let run = self.script_run.take().unwrap();
+                let (name, cmd, toast) = (run.name.clone(), run.cmd.clone(), run.toast);
+                drop(run);
+                match scripts::Run::start(name, cmd, toast) {
+                    Ok(run) => self.script_run = Some(run),
+                    Err(e) => self.settings_error = Some(format!("Could not start script: {e}")),
+                };
+                self.refresh();
+                self.redraw(qh);
+                return false;
+            }
+            if matches!(
+                sym,
+                k::KEY_Down | k::KEY_Page_Down | k::KEY_Up | k::KEY_Page_Up
+            ) {
+                self.mv(if matches!(sym, k::KEY_Up | k::KEY_Page_Up) {
+                    -1
+                } else {
+                    1
+                });
+                self.redraw(qh);
+            }
+            return false;
+        }
+        if ctrl && matches!(utf8.as_str(), "\u{5}" | "\u{4}") && self.query.starts_with("scripts") {
+            if let Some(Action::ScriptToggle(name)) = self.items.get(self.sel).map(|i| &i.action) {
+                if let Some(script) = self.scripts.iter().find(|s| &s.name == name) {
+                    let path = script.exec.trim_matches('\'').replace("'\\''", "'");
+                    if utf8 == "\u{5}" {
+                        self.items[self.sel].action = Action::ScriptEdit(path);
+                        self.activate(qh);
+                    } else {
+                        self.query = format!("confirm script-del {path}");
+                        self.refresh();
+                        self.redraw(qh);
+                    }
+                }
+            }
+            return false;
+        }
         let mut repeatable = true;
         if self.panel.is_some() {
             let n = self.panel_vis().len();
@@ -571,16 +1250,41 @@ impl App {
             self.redraw(qh);
             return repeatable;
         }
+        if ctrl && sym == k::KEY_o {
+            self.detail = !self.detail;
+            self.redraw(qh);
+            return false;
+        }
         if ctrl && sym == k::KEY_b {
             self.open_panel();
             self.redraw(qh);
             return false;
+        }
+        if let Some(compose) = self.compose.as_mut() {
+            if ctrl || sym == xkb::keysyms::KEY_Escape {
+                compose.reset();
+            } else {
+                compose.feed(sym.into());
+                match compose.status() {
+                    xkb::compose::Status::Composing => return false,
+                    xkb::compose::Status::Composed => {
+                        utf8 = compose.utf8().unwrap_or_default();
+                        compose.reset();
+                    }
+                    xkb::compose::Status::Cancelled => {
+                        compose.reset();
+                        return false;
+                    }
+                    xkb::compose::Status::Nothing => {}
+                }
+            }
         }
         let (columns, grid) = (self.columns(), self.query.starts_with(':'));
         let selected = self.items.get(self.sel).map(|i| i.action.clone());
         let effect = keys::handle(
             &mut keys::KeyState {
                 query: &mut self.query,
+                edit: &mut self.edit,
                 sel: &mut self.sel,
                 len: self.items.len(),
                 rows: self.cfg.max_rows,
@@ -594,6 +1298,7 @@ impl App {
                 sym,
                 utf8: &utf8,
                 ctrl,
+                shift: st.mod_name_is_active(xkb::MOD_NAME_SHIFT, xkb::STATE_MODS_EFFECTIVE),
             },
         );
         let repeat = effect.repeats();
@@ -609,17 +1314,45 @@ impl App {
             }
             keys::Effect::Edited => self.refresh(),
             keys::Effect::Moved => {}
+            keys::Effect::Copy(text) => {
+                if !text.is_empty() {
+                    copy_input_text(&text);
+                }
+            }
+            keys::Effect::Cut(text) => {
+                if !text.is_empty() && copy_input_text(&text) {
+                    self.edit.replace(&mut self.query, "");
+                    self.refresh();
+                }
+            }
+            keys::Effect::Paste => {
+                if let Ok(out) = std::process::Command::new("timeout")
+                    .args(["1", "wl-paste", "--no-newline", "--type", "text"])
+                    .output()
+                {
+                    if out.status.success() {
+                        let text: String = String::from_utf8_lossy(&out.stdout)
+                            .chars()
+                            .map(|c| if c.is_control() { ' ' } else { c })
+                            .collect();
+                        self.edit.replace(&mut self.query, &text);
+                        self.refresh();
+                    }
+                }
+            }
             keys::Effect::Step(name, dir) => {
                 self.change_setting(&name, dir, qh);
                 return true;
             }
             keys::Effect::DeleteClip => {
+                let position = self.sel;
                 if let Some(action) = selected {
                     if self.clip.remove(&action) && self.cfg.clipboard_persist {
                         self.clip.save();
                     }
                 }
                 self.refresh();
+                self.sel = position.min(self.items.len().saturating_sub(1));
             }
         }
         self.redraw(qh);
@@ -627,6 +1360,9 @@ impl App {
     }
 
     fn row_at(&self, x: f64, y: f64) -> Option<usize> {
+        if self.query.starts_with(';') && x >= self.cfg.width as f64 * 0.5 {
+            return None;
+        }
         if self.query.starts_with(':') {
             return ui::emoji_hit(
                 self.cfg.width,
@@ -736,6 +1472,15 @@ impl App {
     }
 }
 
+fn term_prefix(term: &str, hold: bool) -> String {
+    let known = ["foot", "kitty", "alacritty"];
+    if hold && known.iter().any(|k| term.starts_with(k)) {
+        format!("{term} --hold")
+    } else {
+        term.to_string()
+    }
+}
+
 fn launch_application(cmd: &str) {
     let mut c = std::process::Command::new("sh");
     c.arg("-c")
@@ -750,6 +1495,22 @@ fn launch_application(cmd: &str) {
         });
     }
     let _ = c.spawn();
+}
+
+fn copy_input_text(text: &str) -> bool {
+    let Ok(mut child) = std::process::Command::new("timeout")
+        .args(["1", "wl-copy", "--type", "text/plain;charset=utf-8"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    else {
+        return false;
+    };
+    let written = child
+        .stdin
+        .take()
+        .is_some_and(|mut input| input.write_all(text.as_bytes()).is_ok());
+    let success = child.wait().is_ok_and(|status| status.success());
+    written && success
 }
 
 fn copy_bytes(bytes: &[u8], image: bool) {
@@ -769,6 +1530,10 @@ fn copy_bytes(bytes: &[u8], image: bool) {
 }
 
 delegate_noop!(App: ignore WlCompositor);
+delegate_noop!(App: ignore WlSubcompositor);
+delegate_noop!(App: ignore WlSubsurface);
+delegate_noop!(App: ignore WpViewporter);
+delegate_noop!(App: ignore WpViewport);
 delegate_noop!(App: ignore WlShm);
 delegate_noop!(App: ignore WlShmPool);
 delegate_noop!(App: ignore WlBuffer);
@@ -942,6 +1707,8 @@ impl Dispatch<WlRegistry, ()> for App {
         {
             match interface.as_str() {
                 "wl_compositor" => a.compositor = Some(r.bind(name, 4.min(version), qh, ())),
+                "wl_subcompositor" => a.subcompositor = Some(r.bind(name, 1, qh, ())),
+                "wp_viewporter" => a.viewporter = Some(r.bind(name, 1, qh, ())),
                 "wl_shm" => a.shm = Some(r.bind(name, 1, qh, ())),
                 "zwlr_layer_shell_v1" => a.shell = Some(r.bind(name, 1, qh, ())),
                 "zwlr_data_control_manager_v1" => {
@@ -1016,6 +1783,18 @@ impl Dispatch<WlKeyboard, ()> for App {
                     )
                 } {
                     a.xkb = Some(xkb::State::new(&km));
+                    let locale = std::env::var_os("LC_ALL")
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| std::env::var_os("LC_CTYPE").filter(|s| !s.is_empty()))
+                        .or_else(|| std::env::var_os("LANG").filter(|s| !s.is_empty()))
+                        .unwrap_or_else(|| "C.UTF-8".into());
+                    a.compose = xkb::compose::Table::new_from_locale(
+                        &a.ctx,
+                        &locale,
+                        xkb::compose::COMPILE_NO_FLAGS,
+                    )
+                    .ok()
+                    .map(|t| xkb::compose::State::new(&t, xkb::compose::STATE_NO_FLAGS));
                 }
             }
             Event::Modifiers {
@@ -1054,13 +1833,19 @@ impl Dispatch<WlKeyboard, ()> for App {
                     a.repeating = None;
                 }
             }
-            Event::Leave { .. } => {
+            Event::Leave { surface, .. } => {
                 // Losing keyboard focus hides the panel, like zlaunch.
                 a.repeating = None;
-                if a.shown {
-                    a.hide();
+                let current = a
+                    .backdrop
+                    .as_ref()
+                    .map(|b| &b.surface)
+                    .or(a.surface.as_ref());
+                if a.shown && a.cfg.close_on_focus_loss && current == Some(&surface) {
+                    a.left_at = Some(Instant::now());
                 }
             }
+            Event::Enter { .. } => a.left_at = None,
             _ => {}
         }
     }
@@ -1077,18 +1862,19 @@ impl Dispatch<WlPointer, ()> for App {
     ) {
         use wayland_client::protocol::wl_pointer::{Axis, ButtonState, Event};
         match ev {
-            Event::Motion {
-                surface_x,
-                surface_y,
-                ..
-            }
-            | Event::Enter {
+            Event::Enter {
+                surface,
                 surface_x,
                 surface_y,
                 ..
             } => {
-                a.pointer = Some((surface_x, surface_y));
-                if a.panel.is_some() {
+                a.pointer_on_backdrop = a.backdrop.as_ref().is_some_and(|b| b.surface == surface);
+                a.pointer = a
+                    .surface
+                    .as_ref()
+                    .filter(|s| **s == surface)
+                    .map(|_| (surface_x, surface_y));
+                if a.pointer.is_some() && a.panel.is_some() {
                     if let Some(row) = a.panel_row_at(surface_x, surface_y) {
                         if let Some(p) = &mut a.panel {
                             p.2 = row;
@@ -1096,13 +1882,46 @@ impl Dispatch<WlPointer, ()> for App {
                         a.redraw(qh);
                     }
                 }
+                if a.pointer.is_some() && a.input_drag {
+                    let at = ui::input_at(&a.font, &a.query, a.edit.caret, a.cfg.width, surface_x);
+                    a.edit.move_to(&a.query, at, true);
+                    a.redraw(qh);
+                }
             }
-            Event::Leave { .. } => a.pointer = None,
+            Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                a.pointer = (!a.pointer_on_backdrop).then_some((surface_x, surface_y));
+                if a.pointer.is_some() && a.panel.is_some() {
+                    if let Some(row) = a.panel_row_at(surface_x, surface_y) {
+                        if let Some(p) = &mut a.panel {
+                            p.2 = row;
+                        }
+                        a.redraw(qh);
+                    }
+                }
+                if a.pointer.is_some() && a.input_drag {
+                    let at = ui::input_at(&a.font, &a.query, a.edit.caret, a.cfg.width, surface_x);
+                    a.edit.move_to(&a.query, at, true);
+                    a.redraw(qh);
+                }
+            }
+            Event::Leave { .. } => {
+                a.pointer = None;
+                a.input_drag = false;
+                a.pointer_on_backdrop = false;
+            }
             Event::Button {
                 button: 272,
                 state: WEnum::Value(ButtonState::Pressed),
                 ..
             } => {
+                if a.shown && a.pointer_on_backdrop {
+                    a.hide();
+                    return;
+                }
                 if a.shown && a.panel.is_some() {
                     // A click on an action runs it; a click anywhere else only closes the panel.
                     match a.pointer.and_then(|(x, y)| a.panel_row_at(x, y)) {
@@ -1117,6 +1936,58 @@ impl Dispatch<WlPointer, ()> for App {
                             a.redraw(qh);
                         }
                     }
+                    return;
+                }
+
+                // The back arrow returns to the combined view, restoring the
+                // query that was there when the sub-view was entered.
+                if a.shown
+                    && a.origin.is_some()
+                    && a.pointer.is_some_and(|(x, y)| ui::back_button_at(x, y))
+                {
+                    a.query = a.origin.take().unwrap_or_default();
+                    a.last_click = None;
+                    a.refresh();
+                    a.redraw(qh);
+                    return;
+                }
+                if a.shown
+                    && a.pointer
+                        .is_some_and(|(x, y)| ui::clear_button_at(a.cfg.width, &a.query, x, y))
+                {
+                    a.query.truncate(usize::from(items::theme_view(&a.query)));
+                    a.last_click = None;
+                    a.refresh();
+                    a.redraw(qh);
+                    return;
+                }
+                if let Some((x, y)) = a.pointer.filter(|(_, y)| *y >= 0.0 && *y < ui::HEAD as f64) {
+                    let _ = y;
+                    a.edit.sync(&a.query);
+                    let at = ui::input_at(&a.font, &a.query, a.edit.caret, a.cfg.width, x);
+                    let now = Instant::now();
+                    let count = a
+                        .input_click
+                        .filter(|(t, _, px, py)| {
+                            now.duration_since(*t) < Duration::from_millis(400)
+                                && (x - px).abs() < 4.0
+                                && (y - py).abs() < 4.0
+                        })
+                        .map_or(1, |(_, n, _, _)| (n % 3) + 1);
+                    a.input_click = Some((now, count, x, y));
+                    if count == 3 {
+                        a.edit.select_all(&a.query);
+                    } else if count == 2 {
+                        a.edit.select_word(&a.query, at);
+                    } else {
+                        let shift = a.xkb.as_ref().is_some_and(|s| {
+                            s.mod_name_is_active(xkb::MOD_NAME_SHIFT, xkb::STATE_MODS_EFFECTIVE)
+                        });
+                        a.edit.move_to(&a.query, at, shift);
+                    }
+                    a.input_drag = true;
+                    a.pause_caret();
+                    a.redraw(qh);
                     return;
                 }
                 // A click picks the row under the pointer and runs it, like zlaunch.
@@ -1136,11 +2007,19 @@ impl Dispatch<WlPointer, ()> for App {
                     }
                 }
             }
+            Event::Button {
+                button: 272,
+                state: WEnum::Value(ButtonState::Released),
+                ..
+            } => a.input_drag = false,
             Event::Axis {
                 axis: WEnum::Value(Axis::VerticalScroll),
                 value,
                 ..
             } => {
+                if a.pointer_on_backdrop {
+                    return;
+                }
                 if a.panel.is_some() {
                     let n = a.panel_vis().len();
                     if let Some(p) = &mut a.panel {
@@ -1151,6 +2030,7 @@ impl Dispatch<WlPointer, ()> for App {
                     a.redraw(qh);
                     return;
                 }
+                a.last_scroll = Some(Instant::now());
                 if a.query.starts_with(':') {
                     let columns = a.columns();
                     let rows = a.emoji_rows();
@@ -1191,9 +2071,21 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for App {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
+        if a.layer.as_ref() != Some(ls) {
+            return;
+        }
         match ev {
-            zwlr_layer_surface_v1::Event::Configure { serial, .. } => {
+            zwlr_layer_surface_v1::Event::Configure {
+                serial,
+                width,
+                height,
+            } => {
                 ls.ack_configure(serial);
+                if !a.configure_backdrop(width, height, qh) {
+                    eprintln!("zl: cannot allocate the outside-click surface");
+                    a.hide();
+                    return;
+                }
                 a.configured = true;
                 a.redraw(qh);
             }
@@ -1273,10 +2165,16 @@ fn main() {
         font: load_font(&cfg),
         apps: items::scan_apps(&cfg),
         files: items::FileIndex::default(),
+        scripts: scripts::scan_scripts(&cfg),
+        scripts_sig: scripts::scripts_sig(&cfg),
         items: vec![],
         query: String::new(),
+        edit: input::Edit::default(),
+        caret_visible: true,
+        caret_next: Instant::now(),
         sel: 0,
         top: 0,
+        last_scroll: None,
         shown: false,
         configured: false,
         cur_h: 0,
@@ -1285,14 +2183,26 @@ fn main() {
         repeat_rate: 25,
         repeat_delay: 400,
         repeating: None,
+        left_at: None,
         pointer: None,
+        pointer_on_backdrop: false,
         last_click: None,
+        origin: None,
+        input_drag: false,
+        input_click: None,
         settings_error: None,
         hist: hist::Hist::load(),
         panel: None,
         panel_filter: String::new(),
+        detail: false,
+        previewing: false,
+        script_form: None,
+        script_run: None,
         cfg,
         compositor: None,
+        subcompositor: None,
+        viewporter: None,
+        backdrop: None,
         shm: None,
         shell: None,
         seat: None,
@@ -1303,6 +2213,7 @@ fn main() {
         buffer: None,
         ctx: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
         xkb: None,
+        compose: None,
         clip: clip::History::new(0),
         dc_manager: None,
         dc_device: None,
@@ -1351,17 +2262,44 @@ fn main() {
             Some((_, at)) => at.saturating_duration_since(Instant::now()).as_millis() as i32,
             None => -1,
         };
+        if app.shown {
+            let wait = app
+                .caret_next
+                .saturating_duration_since(Instant::now())
+                .as_millis() as i32
+                + 1;
+            timeout = if timeout < 0 { wait } else { timeout.min(wait) };
+        }
+        if app.script_run.is_some() {
+            timeout = if timeout < 0 { 50 } else { timeout.min(50) };
+        }
         if !app.reads.is_empty() {
             timeout = if timeout < 0 { 500 } else { timeout.min(500) };
+        }
+        if let Some(t) = app.left_at {
+            let wait = FOCUS_GRACE.saturating_sub(t.elapsed()).as_millis() as i32 + 1;
+            timeout = if timeout < 0 { wait } else { timeout.min(wait) };
         }
         unsafe {
             libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout);
         }
         app.finish_reads(&qh);
+        if app.shown && Instant::now() >= app.caret_next {
+            app.caret_visible = !app.caret_visible;
+            app.caret_next = Instant::now() + Duration::from_millis(500);
+            app.redraw(&qh);
+        }
+        app.pump_script(&qh);
         if fds[0].revents & libc::POLLIN != 0 {
             let _ = guard.read();
         } else {
             drop(guard);
+        }
+        if app.left_at.is_some_and(|t| t.elapsed() >= FOCUS_GRACE) {
+            app.left_at = None;
+            if app.shown {
+                app.hide();
+            }
         }
         if let Some((key, at)) = app.repeating {
             if Instant::now() >= at {
@@ -1405,5 +2343,143 @@ fn main() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod backdrop_tests {
+    use super::*;
+
+    #[test]
+    fn viewport_backdrop_uses_one_pixel_at_any_output_size() {
+        for (w, h) in [(1280, 800), (1920, 1080), (3840, 2160), (7680, 4320)] {
+            assert_eq!(backdrop_buffer_size(w, h, true), Some((1, 1, 4)));
+            assert_eq!(
+                backdrop_buffer_size(w, h, false),
+                Some((w, h, w as usize * h as usize * 4))
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_backdrop_sizes_are_rejected_before_allocation() {
+        for (w, h) in [(0, 100), (100, 0), (u32::MAX, 1), (1, u32::MAX)] {
+            assert_eq!(backdrop_buffer_size(w, h, false), None);
+            assert_eq!(backdrop_buffer_size(w, h, true), None);
+        }
+        assert_eq!(backdrop_buffer_size(16384, 8192, false), None);
+        assert_eq!(backdrop_buffer_size(16384, 8192, true), Some((1, 1, 4)));
+    }
+
+    #[test]
+    fn panel_is_centered_in_logical_output_coordinates() {
+        assert_eq!(panel_position(1920, 1080, 640, 470), (640, 305));
+        assert_eq!(panel_position(960, 540, 640, 470), (160, 35));
+        assert_eq!(panel_position(1280, 800, 600, 400), (340, 200));
+        assert_eq!(panel_position(400, 300, 600, 400), (-100, -50));
+    }
+}
+
+#[cfg(test)]
+mod picker_tests {
+    use super::*;
+    fn app(cfg: Config) -> App {
+        App {
+            theme: cfg.theme(),
+            icons: icons::Cache::new(&cfg.icon_theme, &cfg.emoji_font),
+            font: load_font(&cfg),
+            apps: items::scan_apps(&cfg),
+            items: vec![],
+            query: String::new(),
+            edit: input::Edit::default(),
+            caret_visible: true,
+            caret_next: Instant::now(),
+            sel: 0,
+            top: 0,
+            last_scroll: None,
+            shown: false,
+            configured: false,
+            cur_h: 0,
+            scale: 1,
+            outputs: vec![],
+            repeat_rate: 25,
+            repeat_delay: 400,
+            repeating: None,
+            pointer: None,
+            last_click: None,
+            pointer_on_backdrop: false,
+            origin: None,
+            input_drag: false,
+            input_click: None,
+            left_at: None,
+            settings_error: None,
+            previewing: false,
+            hist: hist::Hist::default(),
+            panel: None,
+            panel_filter: String::new(),
+            detail: false,
+            scripts: vec![],
+            scripts_sig: 0,
+            script_form: None,
+            script_run: None,
+            files: items::FileIndex::default(),
+            cfg,
+            compositor: None,
+            subcompositor: None,
+            viewporter: None,
+            backdrop: None,
+            shm: None,
+            shell: None,
+            seat: None,
+            kb: None,
+            ptr: None,
+            surface: None,
+            layer: None,
+            buffer: None,
+            ctx: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
+            xkb: None,
+            compose: None,
+            clip: clip::History::new(0),
+            dc_manager: None,
+            dc_device: None,
+            offers: Default::default(),
+            reads: vec![],
+            own_source: None,
+        }
+    }
+    #[test]
+    fn preview_never_changes_config_and_leaving_restores_it() {
+        let cfg = Config {
+            theme: "nord".into(),
+            ..Config::default()
+        };
+        let mut a = app(cfg);
+        a.query = "#dracula".into();
+        a.refresh();
+        a.sync_theme_preview();
+        assert_eq!(a.cfg.theme, "nord");
+        assert_eq!(a.theme, config::theme("dracula"));
+        assert!(a.previewing);
+        a.query = "#not-a-theme".into();
+        a.refresh();
+        a.sync_theme_preview();
+        assert!(a.items.is_empty());
+        assert_eq!(a.theme, config::theme("dracula"));
+        a.query.clear();
+        a.refresh();
+        a.sync_theme_preview();
+        assert_eq!(a.theme, config::theme("nord"));
+        assert!(!a.previewing);
+        a.query = "#catppuccin".into();
+        a.refresh();
+        a.sync_theme_preview();
+        assert_eq!(a.theme, config::theme("catppuccin-latte"));
+        a.sel = 1;
+        a.sync_theme_preview();
+        assert_eq!(a.theme, config::theme("catppuccin-mocha"));
+        a.hide();
+        assert_eq!(a.theme, config::theme("nord"));
+        assert_eq!(a.cfg.theme, "nord");
+        assert!(!a.previewing);
     }
 }

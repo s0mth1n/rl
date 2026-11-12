@@ -13,9 +13,19 @@ pub const HDR: f32 = 28.0;
 pub const ICON: f32 = 24.0;
 pub const LIST_PAD: f32 = 8.0;
 /// Query text origin in the header; the search icon box sits at (22, 20.5), drawn by the icon code.
-pub const INPUT_X: f32 = 46.0;
+pub const INPUT_X: f32 = 49.7;
 /// Right edge the query text must clear (room for the clear button).
 pub const INPUT_RIGHT: f32 = 90.0;
+/// Input row colors come from zlaunch's pinned gpui-component Default Dark
+/// theme, not from the launcher theme, so they stay constant across themes
+/// (zlaunch daemon/theme.rs overrides only background and borders): query
+/// text and caret #fafafa, placeholder and header icons #737373.
+const INPUT_FG: Rgb = [250, 250, 250];
+const INPUT_DIM: Rgb = [115, 115, 115];
+/// Header separator: gpui theme.border, which zlaunch overrides to white at
+/// 10% for every theme (daemon/theme.rs configure_theme).
+const SEPARATOR: Rgb = [255, 255, 255];
+const SEPARATOR_ALPHA: f32 = 0.1;
 
 pub struct Canvas {
     pub w: u32,
@@ -65,8 +75,15 @@ impl Canvas {
                 let dx = (r - fx).max(fx - (w - r)).max(0.0);
                 let dy = (r - fy).max(fy - (h - r)).max(0.0);
                 let d = (dx * dx + dy * dy).sqrt();
-                let cov = (r - d + 0.5)
-                    .clamp(0.0, 1.0)
+                // A pixel whose center sits inside the shape (d == 0) is fully
+                // covered; without this, r < 0.5 rects - the square ones like
+                // the caret and separators - painted every pixel half strength.
+                let arc = if r >= 0.0 && d == 0.0 {
+                    1.0
+                } else {
+                    (r - d + 0.5).clamp(0.0, 1.0)
+                };
+                let cov = arc
                     .min((fx + 0.5).clamp(0.0, 1.0))
                     .min((w - fx + 0.5).clamp(0.0, 1.0))
                     .min((fy + 0.5).clamp(0.0, 1.0))
@@ -147,6 +164,15 @@ impl Canvas {
         }
     }
 
+    pub fn symbol(&mut self, x: i32, y: i32, icon: &Icon, color: Rgb, alpha: f32) {
+        for iy in 0..icon.size as i32 {
+            for ix in 0..icon.size as i32 {
+                let a = icon.px[((iy * icon.size as i32 + ix) * 4 + 3) as usize];
+                self.blend(x + ix, y + iy, color, a as f32 / 255.0 * alpha);
+            }
+        }
+    }
+
     pub fn text_width(font: &Font, size: f32, s: &str) -> f32 {
         let sc = Scale::uniform(size);
         font.layout(s, sc, point(0.0, 0.0)).last().map_or(0.0, |g| {
@@ -190,8 +216,62 @@ impl Canvas {
     }
 }
 
+fn lighten(c: Rgb, amount: f32) -> Rgb {
+    let c = c.map(|v| v as f32 / 255.0);
+    let hi = c.iter().copied().fold(0.0, f32::max);
+    let lo = c.iter().copied().fold(1.0, f32::min);
+    let light = (hi + lo) / 2.0;
+    let next = (light + amount).min(1.0);
+    let chroma = hi - lo;
+    if chroma == 0.0 {
+        return [(next * 255.0).round() as u8; 3];
+    }
+    let saturation = chroma / (1.0 - (2.0 * light - 1.0).abs());
+    let new_chroma = (1.0 - (2.0 * next - 1.0).abs()) * saturation;
+    c.map(|v| (((v - lo) / chroma * new_chroma + next - new_chroma / 2.0) * 255.0).round() as u8)
+}
+
+/// Theme preview icon, like zlaunch's theme rows: the window background holding
+/// the title, selection and border colours.
+fn theme_icon(cv: &mut Canvas, x: f32, y: f32, size: f32, th: &Theme) {
+    let inner = size * 0.35;
+    let gap = size * 0.08;
+    let pad = size * 0.15;
+    let r = size * 0.12;
+    cv.rrect(
+        x,
+        y,
+        size,
+        size,
+        size / 4.0,
+        lighten(th.bg, 0.05),
+        th.bg_alpha,
+    );
+    cv.rrect(x + pad, y + pad, inner, inner, r, th.text, th.text_alpha);
+    cv.rrect(
+        x + pad + inner + gap,
+        y + pad,
+        inner,
+        inner,
+        r,
+        lighten(th.select, 0.1),
+        th.select_alpha,
+    );
+    let bar_y = y + pad + inner + gap;
+    cv.rrect(
+        x + pad,
+        bar_y,
+        size - 2.0 * pad,
+        y + size - pad - bar_y,
+        r,
+        th.border,
+        th.border_alpha,
+    );
+}
+
 pub struct View<'a> {
     pub query: &'a str,
+    pub input: Option<(usize, Option<usize>, bool)>,
     pub items: &'a [Item],
     pub sel: usize,
     pub top: usize,
@@ -203,6 +283,11 @@ pub struct View<'a> {
     pub scale: u32,
     pub font_size: f32,
     pub icons: &'a Cache,
+    /// The sub-view was entered from the main list, so the input prefix is a
+    /// clickable back arrow instead of the magnifier (zlaunch mode origin).
+    pub back: bool,
+    /// Draw the scrollbar thumb; false once scrolling has been idle for a second.
+    pub show_scrollbar: bool,
 }
 
 pub fn icon_px(scale: u32) -> u32 {
@@ -251,8 +336,8 @@ pub fn slots(items: &[Item], top: usize, vp: f32) -> Vec<Slot> {
     let headers = show_headers(items);
     let mut out = Vec::new();
     let mut y = 0.0;
-    for i in top..items.len() {
-        let sec = section_of(&items[i]);
+    for (i, item) in items.iter().enumerate().skip(top) {
+        let sec = section_of(item);
         let starts = i == 0 || sec != section_of(&items[i - 1]);
         if headers && starts {
             if let Some(name) = sec {
@@ -330,13 +415,26 @@ pub fn item_at(items: &[Item], top: usize, vp: f32, y: f32) -> Option<usize> {
 
 fn action_label(a: &Action) -> &'static str {
     match a {
-        Action::App(_) => "Open",
+        Action::App(_) | Action::Web(_) | Action::Details => "Open",
         Action::Clip(_) | Action::ClipImg(_) => "Copy",
         Action::View(_) | Action::Open(_) => "Open",
+        Action::Trash(_) => "Trash",
         Action::Nothing => "",
         Action::Setting(_) => "Change",
         Action::Exclude(_) => "Toggle",
-        Action::ClearClip | Action::PinToggle(_) | Action::ResetRank(_) => "Run",
+        Action::ClearClip
+        | Action::PinToggle(_)
+        | Action::ResetRank(_)
+        | Action::SetToneFor(..)
+        | Action::EmojiReset(_) => "Run",
+        Action::Theme(_) => "Apply",
+        Action::Script(_) | Action::AppArg(..) | Action::AppForce(..) => "Run",
+        Action::ScriptToggle(_) => "Toggle",
+        Action::ScriptSamples => "Create",
+        Action::ScriptEdit(_) => "Edit",
+        Action::ScriptDelete(_) => "Delete",
+        Action::ScriptOutput => "Copy",
+        Action::ScriptSubmit => "Run",
     }
 }
 
@@ -424,6 +522,7 @@ pub fn emoji_hit(
     (index < count).then_some(index)
 }
 
+#[cfg(test)]
 pub fn emoji_horizontal(selected: usize, count: usize, right: bool) -> usize {
     if count == 0 {
         return 0;
@@ -465,15 +564,18 @@ fn draw_emojis(cv: &mut Canvas, font: &Font, v: &View) {
     let grid_width = columns as f32 * (EMOJI_CELL + EMOJI_GAP) - EMOJI_GAP;
     let left = (v.w as f32 - grid_width) / 2.0;
     if v.items.is_empty() {
+        // centered in empty_state_color, like zlaunch's emoji render_empty
+        let es = v.font_size * s;
+        let tw = Canvas::text_width(font, es, "No emojis found");
         cv.text(
             font,
-            v.font_size * s,
-            24.0 * s,
+            es,
+            (v.w as f32 * s - tw) / 2.0,
             (HEAD + 14.0) * s,
             "No emojis found",
-            v.theme.dim,
-            v.theme.dim_alpha,
-            (v.w as f32 - 48.0) * s,
+            v.theme.empty_state_color.rgb,
+            v.theme.empty_state_color.alpha,
+            v.w as f32 * s,
         );
     }
     for (offset, item) in v
@@ -506,6 +608,164 @@ fn draw_emojis(cv: &mut Canvas, font: &Font, v: &View) {
     }
 }
 
+/// Hit zone for the back arrow in the input prefix, shown when a sub-view
+/// was entered from the main list.
+pub fn back_button_at(x: f64, y: f64) -> bool {
+    (14.0..40.0).contains(&x) && y >= (HEAD as f64 - 24.0) / 2.0 && y < (HEAD as f64 + 24.0) / 2.0
+}
+
+pub fn clear_button_at(width: u32, query: &str, x: f64, y: f64) -> bool {
+    !query.is_empty()
+        && !query.starts_with(crate::items::CONFIRM_TRASH)
+        && x >= width as f64 - 44.0
+        && x < width as f64 - 20.0
+        && y >= (HEAD as f64 - 24.0) / 2.0
+        && y < (HEAD as f64 + 24.0) / 2.0
+}
+
+fn input_tail<'a>(font: &Font, size: f32, query: &'a str, max_w: f32) -> &'a str {
+    let width = Canvas::text_width(font, size, query);
+    if width <= max_w {
+        return query;
+    }
+    for ((index, _), glyph) in
+        query
+            .char_indices()
+            .zip(font.layout(query, Scale::uniform(size), point(0.0, 0.0)))
+    {
+        if glyph.position().x >= width - max_w {
+            return &query[index..];
+        }
+    }
+    ""
+}
+
+fn input_start(font: &Font, size: f32, query: &str, caret: usize, max_w: f32) -> usize {
+    let head = &query[..caret];
+    let tail = input_tail(font, size, head, max_w);
+    head.len() - tail.len()
+}
+
+pub fn input_at(font: &Font, query: &str, caret: usize, width: u32, x: f64) -> usize {
+    let shown = if query.starts_with(crate::items::CONFIRM_TRASH) {
+        &query[query.len()..]
+    } else {
+        query
+            .strip_prefix([':', ';', '#'])
+            .map(str::trim_start)
+            .unwrap_or(query)
+    };
+    let prefix = query.len() - shown.len();
+    let caret = caret.saturating_sub(prefix).min(shown.len());
+    let start = input_start(
+        font,
+        14.0,
+        shown,
+        caret,
+        (width as f32 - INPUT_X - INPUT_RIGHT).max(0.0),
+    );
+    let x = x as f32 - INPUT_X;
+    let mut previous = 0.0;
+    for (i, ch) in shown[start..].char_indices() {
+        let next = Canvas::text_width(font, 14.0, &shown[start..start + i + ch.len_utf8()]);
+        if x < (previous + next) / 2.0 {
+            return prefix + start + i;
+        }
+        previous = next;
+    }
+    query.len()
+}
+
+fn draw_input(cv: &mut Canvas, font: &Font, v: &View) {
+    let s = v.scale as f32;
+    let w = v.w as f32 * s;
+    let fs = 16.0 * s;
+    let y = (HEAD * s - fs) / 2.0;
+    // Menu-entered sub-views show a back arrow; the theme picker entered
+    // directly shows a palette, as zlaunch's theme mode does.
+    let prefix_icon = if v.back {
+        crate::icons::BACK
+    } else if v.query.trim_start().starts_with('#') {
+        crate::icons::PALETTE
+    } else {
+        crate::icons::SEARCH
+    };
+    if let Some(icon) = v.icons.get(prefix_icon, 16 * v.scale) {
+        cv.symbol(
+            (22.0 * s) as i32,
+            ((HEAD - 16.0) * 0.5 * s) as i32,
+            icon,
+            INPUT_DIM,
+            1.0,
+        );
+    }
+    let x = INPUT_X * s;
+    let max_w = (w - x - INPUT_RIGHT * s).max(0.0);
+    let (query, placeholder) = if let Some(query) = v.query.strip_prefix(':') {
+        (query.trim_start(), "Search emojis...")
+    } else if let Some(query) = v.query.strip_prefix('#') {
+        (query.trim_start(), "Search themes...")
+    } else if let Some(query) = v.query.strip_prefix(';') {
+        (query.trim_start(), "Search clipboard...")
+    } else if v.query.starts_with(crate::items::CONFIRM_TRASH) {
+        // the confirm view carries the path in the query; keep the box empty
+        (&v.query[v.query.len()..], "")
+    } else {
+        (v.query, "Search anything...")
+    };
+    let prefix = v.query.len() - query.len();
+    let (caret, anchor, visible) = v.input.unwrap_or((v.query.len(), None, true));
+    let caret = caret.saturating_sub(prefix).min(query.len());
+    let start = input_start(font, fs, query, caret, max_w);
+    let mut end = start;
+    for (i, ch) in query[start..].char_indices() {
+        if Canvas::text_width(font, fs, &query[start..start + i + ch.len_utf8()]) > max_w {
+            break;
+        }
+        end = start + i + ch.len_utf8();
+    }
+    if let Some(anchor) = anchor {
+        let anchor = anchor.saturating_sub(prefix).min(query.len());
+        let lo = caret.min(anchor).max(start);
+        let hi = caret.max(anchor).min(end);
+        if lo < hi {
+            let left = Canvas::text_width(font, fs, &query[start..lo]);
+            let width = Canvas::text_width(font, fs, &query[lo..hi]);
+            cv.rrect(
+                x + left,
+                y,
+                width,
+                fs * 1.15,
+                0.0,
+                v.theme.accent,
+                0.3 * v.theme.accent_alpha,
+            );
+        }
+    }
+    if query.is_empty() {
+        cv.text(font, fs, x, y, placeholder, INPUT_DIM, 1.0, max_w);
+    } else {
+        cv.text(font, fs, x, y, &query[start..end], INPUT_FG, 1.0, max_w);
+    }
+    if visible && anchor.is_none_or(|a| a == caret + prefix) {
+        let cx = Canvas::text_width(font, fs, &query[start..caret]);
+        cv.rrect(x + cx, y, 2.0 * s, fs * 1.15, 0.0, INPUT_FG, 1.0);
+    }
+    // zlaunch's Input cleanable(true) shows CircleX whenever text is present;
+    // a bare mode prefix (':', ';') alone is not text.
+    if !query.is_empty() {
+        if let Some(icon) = v.icons.get(crate::icons::CLEAR, 16 * v.scale) {
+            cv.symbol(
+                (w - 40.0 * s) as i32,
+                ((HEAD - 16.0) * 0.5 * s) as i32,
+                icon,
+                INPUT_DIM,
+                1.0,
+            );
+        }
+    }
+}
+
 pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
     let s = v.scale as f32;
     let th = &v.theme;
@@ -513,102 +773,34 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
     let wr = th.window_border_radius * s;
     cv.rrect(0.0, 0.0, w, h, wr, th.bg, th.bg_alpha);
     cv.rrect_outline(0.0, 0.0, w, h, wr, 1.0 * s, th.border, th.border_alpha);
-    // search field: the magnifier and clear button are positioned by
-    // the icon code and INPUT_RIGHT; this lays out the query text and cursor
-    let fs = v.font_size * s;
-    let qy = ((HEAD - 1.0) / 2.0 - 0.6 * v.font_size).max(2.0) * s;
-    if v.query.starts_with(':') {
-        let query = v.query[1..].trim_start();
-        let (c, a) = if query.is_empty() {
-            (th.dim, th.dim_alpha)
-        } else {
-            (th.text, th.text_alpha)
-        };
-        let tw = cv.text(
-            font,
-            fs,
-            INPUT_X * s,
-            qy,
-            if query.is_empty() {
-                "Search emojis..."
-            } else {
-                query
-            },
-            c,
-            a,
-            w - (INPUT_X + INPUT_RIGHT) * s,
-        );
-        cv.rrect(
-            INPUT_X * s + if query.is_empty() { 0.0 } else { tw } + 2.0 * s,
-            qy,
-            1.5 * s,
-            fs * 1.15,
-            0.5 * s,
-            th.accent,
-            th.accent_alpha,
-        );
-    } else if v.query.is_empty() {
-        cv.text(
-            font,
-            fs,
-            INPUT_X * s,
-            qy,
-            "Search applications - : emoji - ; clipboard - settings",
-            th.dim,
-            th.dim_alpha,
-            w - (INPUT_X + INPUT_RIGHT) * s,
-        );
-    } else {
-        let tw = cv.text(
-            font,
-            fs,
-            INPUT_X * s,
-            qy,
-            v.query,
-            th.text,
-            th.text_alpha,
-            w - (INPUT_X + INPUT_RIGHT) * s,
-        );
-        cv.rrect(
-            INPUT_X * s + tw + 2.0 * s,
-            qy,
-            1.5 * s,
-            fs * 1.15,
-            0.5 * s,
-            th.accent,
-            th.accent_alpha,
-        );
-    }
-    cv.rrect(
-        0.0,
-        (HEAD - 1.0) * s,
-        w,
-        1.0 * s,
-        0.0,
-        th.border,
-        th.border_alpha,
-    );
+    draw_input(cv, font, v);
+    cv.rrect(0.0, (HEAD - 1.0) * s, w, s, 0.0, SEPARATOR, SEPARATOR_ALPHA);
     if v.query.starts_with(':') {
         draw_emojis(cv, font, v);
         return;
     }
     if v.items.is_empty() {
         let es = v.font_size * s;
-        let tw = Canvas::text_width(font, es, "No results");
+        let label = if crate::items::theme_view(v.query) {
+            "No themes found"
+        } else {
+            "No items found"
+        };
+        let tw = Canvas::text_width(font, es, label);
         let ec = th.empty_state_color;
         cv.text(
             font,
             es,
             (w - tw) / 2.0,
             (HEAD + LIST_PAD + 17.0) * s,
-            "No results",
+            label,
             ec.rgb,
             ec.alpha,
             w,
         );
         return;
     }
-    let title_px = v.font_size * s;
+    let title_px = 14.0 * s;
     for sl in slots(v.items, v.top, v.vp) {
         let y = (HEAD + LIST_PAD + sl.y) * s;
         let Some(i) = sl.item else {
@@ -629,25 +821,55 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
         };
         let it = &v.items[i];
         let selected = i == v.sel;
-        // item box: 1px margin, 8px side margin, 6px corners
-        if selected {
+        // item box: 1px margin, 8px side margin, 6px corners; zlaunch draws the
+        // themed background on every row, the selected one with the select colour
+        let (bg, bg_alpha) = if selected {
+            (th.select, th.select_alpha)
+        } else {
+            (th.item_background.rgb, th.item_background.alpha)
+        };
+        if bg_alpha > 0.0 {
             cv.rrect(
                 8.0 * s,
                 y + 1.0 * s,
                 w - 16.0 * s,
                 (ROW - 2.0) * s,
                 6.0 * s,
-                th.select,
-                th.select_alpha,
+                bg,
+                bg_alpha,
             );
         }
+        if it.tag == "Output" {
+            let mut x = 16.0 * s;
+            let right = w - 16.0 * s;
+            for (text, color) in crate::scripts::ansi_spans(&it.title, th.text) {
+                let width = cv.text(
+                    font,
+                    title_px,
+                    x,
+                    y + (ROW - 16.0) / 2.0 * s,
+                    &text,
+                    color,
+                    th.text_alpha,
+                    (right - x).max(0.0),
+                );
+                x += width;
+                if x >= right {
+                    break;
+                }
+            }
+            continue;
+        }
         let (ix, iy) = (16.0 * s, y + (ROW - ICON) / 2.0 * s);
-        let icon = it
-            .icon
-            .as_deref()
-            .and_then(|n| v.icons.get(n, icon_px(v.scale)));
-        if let Some(ic) = icon {
-            cv.icon(ix as i32, iy as i32, ic);
+        let icon_name = it.icon.as_deref();
+        if let Some(name) = icon_name.and_then(|n| n.strip_prefix("theme:")) {
+            theme_icon(cv, ix, iy, ICON * s, &crate::config::theme(name));
+        } else if let Some(ic) = icon_name.and_then(|n| v.icons.get(n, icon_px(v.scale))) {
+            if ic.symbol {
+                cv.symbol(ix as i32, iy as i32, ic, th.dim, th.dim_alpha);
+            } else {
+                cv.icon(ix as i32, iy as i32, ic);
+            }
         } else {
             let pb = th.icon_placeholder_background;
             cv.rrect(ix, iy, ICON * s, ICON * s, 4.0 * s, pb.rgb, pb.alpha);
@@ -737,7 +959,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
     // scroll hint
     let vp = v.vp * s;
     let max = max_top(v.items, v.vp);
-    if max > 0 {
+    if max > 0 && v.show_scrollbar {
         let track = vp - 12.0 * s;
         let visible = slots(v.items, v.top, v.vp)
             .iter()
@@ -759,7 +981,16 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn confirm_trash_query_is_not_shown_or_clearable() {
+        let q = crate::items::confirm_trash_query("/tmp/a b");
+        assert!(!clear_button_at(640, &q, 640.0 - 28.0, HEAD as f64 / 2.0));
+        let Some(font) = test_font() else { return };
+        assert_eq!(input_at(&font, &q, q.len(), 640, 300.0), q.len());
+    }
+
     use super::*;
+    use crate::config::Rgba;
     fn app(name: &str) -> Item {
         Item {
             title: name.into(),
@@ -774,6 +1005,206 @@ mod tests {
         let mut v: Vec<Item> = (0..n).map(|i| app(&format!("a{i}"))).collect();
         v[0].best = true;
         v
+    }
+
+    /// DejaVu Sans, the font examples/render.rs uses. None where it is not installed.
+    fn test_font() -> Option<Font<'static>> {
+        [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        ]
+        .iter()
+        .find_map(|p| std::fs::read(p).ok())
+        .and_then(Font::try_from_vec)
+    }
+
+    /// Pixel at (x, y) as premultiplied B, G, R, A.
+    fn px(cv: &Canvas, x: u32, y: u32) -> [u8; 4] {
+        let o = ((y * cv.w + x) * 4) as usize;
+        [cv.buf[o], cv.buf[o + 1], cv.buf[o + 2], cv.buf[o + 3]]
+    }
+
+    /// A 640 px panel with `items`, `sel` selected and query "a", drawn with `th`.
+    fn drawn(font: &Font, items: &[Item], sel: usize, th: Theme) -> Canvas {
+        let mut icons = Cache::new("", "");
+        icons.ensure_input(1);
+        let vp = viewport(items, 8);
+        let h = panel_height(items, 8);
+        let mut cv = Canvas::new(640, h);
+        draw(
+            &mut cv,
+            font,
+            &View {
+                query: "a",
+                input: None,
+                items,
+                sel,
+                top: 0,
+                vp,
+                theme: th,
+                w: 640,
+                h,
+                scale: 1,
+                font_size: 15.0,
+                icons: &icons,
+                back: false,
+                show_scrollbar: true,
+            },
+        );
+        cv
+    }
+
+    /// Premultiplied blend of `c` at `a` over a buffer byte, as Canvas::blend does.
+    fn over(c: u8, a: f32, buf: u8) -> u8 {
+        (c as f32 * a + buf as f32 * (1.0 - a)) as u8
+    }
+
+    /// Pixels in the region brighter than the panel background.
+    fn lit(cv: &Canvas, x0: u32, x1: u32, y0: u32, y1: u32) -> usize {
+        (x0..x1)
+            .flat_map(|x| (y0..y1).map(move |y| (x, y)))
+            .filter(|&(x, y)| {
+                let p = px(cv, x, y);
+                p[0] as u32 + p[1] as u32 + p[2] as u32 > 150
+            })
+            .count()
+    }
+
+    /// A solidly covered pixel of the given exact color exists in the region.
+    fn has_solid(cv: &Canvas, x0: u32, x1: u32, y0: u32, y1: u32, want: [u8; 4]) -> bool {
+        (x0..x1)
+            .flat_map(|x| (y0..y1).map(move |y| (x, y)))
+            .any(|(x, y)| px(cv, x, y) == want)
+    }
+
+    #[test]
+    fn input_row_matches_zlaunch_gpui_dark() {
+        let Some(font) = test_font() else {
+            eprintln!("skip: DejaVu Sans not installed");
+            return;
+        };
+        let items: Vec<Item> = (0..3).map(|i| app(&format!("a{i}"))).collect();
+        let cv = drawn(&font, &items, 0, Theme::default());
+        // separator: white at 0.1, constant across themes (gpui theme.border)
+        assert_eq!(px(&cv, 500, 56), [34, 34, 34, 185]);
+        // magnifier at (22, 20.5) and, with a non-empty query, CircleX right
+        assert!(lit(&cv, 22, 38, 20, 37) > 5, "magnifier icon drawn");
+        assert!(lit(&cv, 600, 616, 20, 37) > 5, "clear button drawn");
+        // query text and caret are solid #fafafa, not the theme's dimmed text
+        // or accent: 250 over the 10-gray panel at full coverage
+        assert!(
+            has_solid(&cv, 50, 62, 20, 40, [250, 250, 250, 255]),
+            "query"
+        );
+        assert!(
+            has_solid(&cv, 54, 70, 21, 40, [250, 250, 250, 255]),
+            "caret"
+        );
+
+        // empty query: placeholder in #737373, no clear button
+        let mut icons = Cache::new("", "");
+        icons.ensure_input(1);
+        let vp = viewport(&items, 8);
+        let h = panel_height(&items, 8);
+        let mut cv = Canvas::new(640, h);
+        draw(
+            &mut cv,
+            &font,
+            &View {
+                query: "",
+                input: None,
+                back: false,
+                show_scrollbar: true,
+                items: &items,
+                sel: 0,
+                top: 0,
+                vp,
+                theme: Theme::default(),
+                w: 640,
+                h,
+                scale: 1,
+                font_size: 15.0,
+                icons: &icons,
+            },
+        );
+        assert!(
+            has_solid(&cv, 50, 220, 20, 40, [115, 115, 115, 255]),
+            "placeholder"
+        );
+        assert_eq!(lit(&cv, 600, 616, 20, 37), 0, "no clear button");
+        assert!(lit(&cv, 22, 38, 20, 37) > 5, "magnifier still drawn");
+    }
+
+    #[test]
+    fn theme_alpha_reaches_panel_border_and_selected_row() {
+        let Some(font) = test_font() else {
+            eprintln!("skip: DejaVu Sans not installed");
+            return;
+        };
+        let items: Vec<Item> = (0..3).map(|i| app(&format!("a{i}"))).collect();
+        let cv = drawn(&font, &items, 0, Theme::default());
+        // panel: gray 15 at 0.7 alpha over a transparent buffer
+        assert_eq!(px(&cv, 500, 30), [10, 10, 10, 178]);
+        // window border: white at 0.094 over the panel
+        assert_eq!(px(&cv, 0, 110), [33, 33, 33, 185]);
+        // selected row: white at 0.07 over the panel, not solid white
+        assert_eq!(px(&cv, 480, 90), [27, 27, 27, 183]);
+        // unselected row: item_background is transparent, the panel shows through
+        assert_eq!(px(&cv, 480, 140), [10, 10, 10, 178]);
+    }
+
+    #[test]
+    fn unselected_rows_take_the_theme_item_background() {
+        let Some(font) = test_font() else {
+            eprintln!("skip: DejaVu Sans not installed");
+            return;
+        };
+        let items: Vec<Item> = (0..3).map(|i| app(&format!("a{i}"))).collect();
+        let th = Theme {
+            item_background: Rgba {
+                rgb: [255; 3],
+                alpha: 0.2,
+            },
+            ..Theme::default()
+        };
+        let cv = drawn(&font, &items, 0, th);
+        let bg = [10, 10, 10, 178];
+        let want = [
+            over(255, 0.2, bg[0]),
+            over(255, 0.2, bg[0]),
+            over(255, 0.2, bg[0]),
+            over(255, 0.2, bg[3]),
+        ];
+        assert_eq!(px(&cv, 480, 140), want);
+    }
+
+    #[test]
+    fn every_bundled_theme_renders_with_its_own_alpha() {
+        let Some(font) = test_font() else {
+            eprintln!("skip: DejaVu Sans not installed");
+            return;
+        };
+        let items: Vec<Item> = (0..3).map(|i| app(&format!("a{i}"))).collect();
+        for name in crate::config::THEMES {
+            let th = crate::config::theme(name);
+            let cv = drawn(&font, &items, 0, th);
+            let ba = th.bg_alpha;
+            let panel = [
+                (th.bg[2] as f32 * ba) as u8,
+                (th.bg[1] as f32 * ba) as u8,
+                (th.bg[0] as f32 * ba) as u8,
+                (255.0 * ba) as u8,
+            ];
+            assert_eq!(px(&cv, 500, 30), panel, "{name} panel");
+            let sa = th.select_alpha;
+            let selected = [
+                over(th.select[2], sa, panel[0]),
+                over(th.select[1], sa, panel[1]),
+                over(th.select[0], sa, panel[2]),
+                over(255, sa, panel[3]),
+            ];
+            assert_eq!(px(&cv, 480, 90), selected, "{name} selected row");
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -827,8 +1258,12 @@ mod tests {
                     let dx = (r - fx).max(fx - (w - r)).max(0.0);
                     let dy = (r - fy).max(fy - (h - r)).max(0.0);
                     let d = (dx * dx + dy * dy).sqrt();
-                    let cov = (r - d + 0.5)
-                        .clamp(0.0, 1.0)
+                    let arc = if r >= 0.0 && d == 0.0 {
+                        1.0
+                    } else {
+                        (r - d + 0.5).clamp(0.0, 1.0)
+                    };
+                    let cov = arc
                         .min((fx + 0.5).clamp(0.0, 1.0))
                         .min((w - fx + 0.5).clamp(0.0, 1.0))
                         .min((fy + 0.5).clamp(0.0, 1.0))
@@ -952,6 +1387,85 @@ mod tests {
     }
 
     #[test]
+    fn long_input_keeps_its_unicode_suffix_and_caret_visible() {
+        let _env = crate::testutil::ENV_LOCK.lock().unwrap();
+        let out = std::process::Command::new("fc-match")
+            .args(["-f", "%{file}", "sans-serif"])
+            .output()
+            .unwrap();
+        let data = std::fs::read(String::from_utf8(out.stdout).unwrap()).unwrap();
+        let font = Font::try_from_vec(data).unwrap();
+        assert_eq!(input_tail(&font, 14.0, "", 30.0), "");
+        assert_eq!(input_tail(&font, 14.0, "zed", 100.0), "zed");
+        assert_eq!(input_tail(&font, 14.0, "a", 0.0), "");
+        let query = "This is a long query with accented text and emoji café 😀";
+        let tail = input_tail(&font, 14.0, query, 90.0);
+        assert!(query.ends_with(tail));
+        assert!(tail.ends_with("café 😀"));
+        assert!(tail.len() < query.len());
+        assert!(Canvas::text_width(&font, 14.0, tail) <= 90.0);
+    }
+
+    #[test]
+    fn clear_button_uses_logical_coordinates_and_needs_a_query() {
+        assert!(clear_button_at(640, "zed", 608.0, HEAD as f64 / 2.0));
+        assert!(!clear_button_at(640, "", 608.0, HEAD as f64 / 2.0));
+        assert!(!clear_button_at(640, "zed", 595.0, HEAD as f64 / 2.0));
+        assert!(!clear_button_at(640, "zed", 620.0, HEAD as f64 / 2.0));
+        assert!(!clear_button_at(640, "zed", 608.0, HEAD as f64));
+        assert!(!clear_button_at(640, "zed", f64::NAN, 20.0));
+    }
+
+    #[test]
+    fn launcher_metrics_match_the_ported_layout() {
+        let cfg = crate::config::Config::default();
+        assert_eq!((cfg.width, cfg.max_rows, cfg.font_size), (600, 6, 14.0));
+        assert_eq!(
+            (HEAD, ROW, HDR, ICON, LIST_PAD),
+            (57.0, 50.0, 28.0, 24.0, 8.0)
+        );
+        assert_eq!((INPUT_X, INPUT_RIGHT), (49.7, 90.0));
+        assert_eq!(panel_height(&[], 6), 123);
+        let plain = vec![app("a"); 6];
+        assert_eq!(viewport(&plain, 6), 300.0);
+        assert_eq!(panel_height(&plain, 6), 373);
+        assert_eq!(viewport(&sectioned(6), 6), 356.0);
+        assert_eq!(panel_height(&sectioned(6), 6), 429);
+        for scale in 1..=4 {
+            assert_eq!(icon_px(scale), 24 * scale);
+        }
+    }
+    #[test]
+    fn list_hit_tests_exclude_headers_and_partial_rows() {
+        let items = sectioned(3);
+        let vp = viewport(&items, 3);
+        assert_eq!(vp, 206.0);
+        for (y, expected) in [
+            (-1.0, None),
+            (0.0, None),
+            (27.99, None),
+            (28.0, Some(0)),
+            (77.99, Some(0)),
+            (78.0, None),
+            (105.99, None),
+            (106.0, Some(1)),
+            (155.99, Some(1)),
+            (156.0, Some(2)),
+            (205.99, Some(2)),
+            (206.0, None),
+        ] {
+            assert_eq!(item_at(&items, 0, vp, y), expected, "y={y}");
+        }
+        assert!(slots(&items, 0, HDR + ROW - 0.1).is_empty());
+        let one = slots(&items, 0, HDR + ROW);
+        assert_eq!(one.len(), 2);
+        assert_eq!(one[0].header, "Best Match");
+        assert_eq!(one[1].item, Some(0));
+        assert_eq!(item_at(&items, 0, HDR + ROW, HDR + ROW), None);
+        assert!(slots(&[], 0, 200.0).is_empty());
+        assert_eq!(item_at(&[], 0, 200.0, 1.0), None);
+    }
+    #[test]
     fn height_follows_rows() {
         let two: Vec<Item> = (0..2).map(|i| app(&format!("a{i}"))).collect();
         let eight: Vec<Item> = (0..8).map(|i| app(&format!("a{i}"))).collect();
@@ -986,6 +1500,27 @@ mod tests {
         assert_eq!(top, max_top(&items, vp));
         assert_eq!(item_at(&items, 0, vp, 5.0), None);
         assert_eq!(item_at(&items, 0, vp, HDR + 5.0), Some(0));
+    }
+    #[test]
+    fn theme_icon_shows_palette_samples() {
+        let th = Theme {
+            bg_alpha: 1.0,
+            text_alpha: 1.0,
+            select_alpha: 1.0,
+            border_alpha: 1.0,
+            ..crate::config::theme("nord")
+        };
+        let mut cv = Canvas::new(24, 24);
+        theme_icon(&mut cv, 0.0, 0.0, 24.0, &th);
+        // The canvas is premultiplied BGR; every alpha is 1 here, so channels are exact.
+        let px = |x: usize, y: usize| {
+            let o = (y * 24 + x) * 4;
+            [cv.buf[o + 2], cv.buf[o + 1], cv.buf[o]]
+        };
+        assert_eq!(px(7, 7), th.text, "title colour square");
+        assert_eq!(px(18, 7), lighten(th.select, 0.1), "selection square");
+        assert_eq!(px(12, 17), th.border, "border bar");
+        assert_eq!(px(1, 12), lighten(th.bg, 0.05), "window background");
     }
     #[test]
     fn rrect_clips_to_canvas() {

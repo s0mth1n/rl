@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Config {
     pub theme: String,
+    pub link: Vec<Link>,
+    pub script_dirs: Vec<String>,
     /// Output name to open on, such as "DP-1". Empty means the compositor's focused output.
     pub monitor: String,
     pub max_rows: usize,
@@ -27,6 +29,8 @@ pub struct Config {
     pub file_excludes: Vec<String>,
     pub clipboard_persist: bool,
     pub single_click: bool,
+    /// Hide the panel when the keyboard focus moves away from it.
+    pub close_on_focus_loss: bool,
     /// Backspace on an empty view (emoji, clipboard, settings) steps back one level.
     pub pop_on_backspace: bool,
     /// "navigate_back" steps back one level per Escape, "close_window" hides at once.
@@ -49,6 +53,8 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             theme: "default".into(),
+            link: Vec::new(),
+            script_dirs: Vec::new(),
             monitor: String::new(),
             max_rows: 6,
             width: 600,
@@ -66,6 +72,7 @@ impl Default for Config {
             file_excludes: vec![],
             clipboard_persist: true,
             single_click: true,
+            close_on_focus_loss: true,
             pop_on_backspace: true,
             escape_key_behavior: "navigate_back".into(),
             colors: Colors::default(),
@@ -248,7 +255,8 @@ fn parse_theme(source: &str) -> Option<Theme> {
     })
 }
 
-pub fn theme(name: &str) -> Theme {
+/// Theme name with aliases resolved, or "default" for an unknown name.
+pub fn canonical(name: &str) -> &'static str {
     let name = match name {
         "dark" => "default",
         "light" => "catppuccin-latte",
@@ -256,6 +264,15 @@ pub fn theme(name: &str) -> Theme {
         "catppuccin" => "catppuccin-mocha",
         other => other,
     };
+    THEMES
+        .iter()
+        .copied()
+        .find(|t| *t == name)
+        .unwrap_or("default")
+}
+
+pub fn theme(name: &str) -> Theme {
+    let name = canonical(name);
     static LOADED: std::sync::OnceLock<[Theme; 15]> = std::sync::OnceLock::new();
     let Some(index) = THEMES[1..].iter().position(|candidate| *candidate == name) else {
         return Theme::default();
@@ -370,6 +387,17 @@ mod tests {
         assert_eq!(theme("light"), theme("catppuccin-latte"));
         assert_eq!(theme("gruvbox"), theme("gruvbox-dark"));
         assert_eq!(theme("catppuccin"), theme("catppuccin-mocha"));
+    }
+
+    #[test]
+    fn canonical_resolves_aliases_and_unknown_names() {
+        assert_eq!(canonical("dark"), "default");
+        assert_eq!(canonical("light"), "catppuccin-latte");
+        assert_eq!(canonical("gruvbox"), "gruvbox-dark");
+        assert_eq!(canonical("catppuccin"), "catppuccin-mocha");
+        assert_eq!(canonical("nord"), "nord");
+        assert_eq!(canonical("bogus"), "default");
+        assert_eq!(canonical("default"), "default");
     }
 
     #[test]
@@ -497,4 +525,20 @@ mod tests {
         assert_eq!(rgba("#00000000"), Some(Rgba::new([0; 3], 0.0)));
         assert_eq!(rgba("#FFFFFFFF"), Some(Rgba::new([255; 3], 1.0)));
     }
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
+pub struct Link {
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub alias: String,
+    #[serde(default)]
+    pub icon: String,
+    /// Name of the desktop app that opens the link; empty uses the default opener.
+    #[serde(default)]
+    pub app: String,
+    /// Unix seconds when the link was created; 0 for links from before this was tracked.
+    #[serde(default)]
+    pub created: u64,
 }

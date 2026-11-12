@@ -14,7 +14,7 @@ cargo run --release --example render -- --output settings.png --view settings
 cargo run --release --example render -- --output exclusions.png --view settings-apps
 ```
 
-Options: `--view launcher|emoji|clipboard|settings|settings-apps`, `--query`,
+Options: `--view launcher|emoji|clipboard|settings|settings-apps|scripts|script-output`, `--query`,
 `--theme` (a name from `zl themes`), `--scale 1..4`, `--width 400..1200`,
 `--rows 1..20`, `--selected`, `--top`, `--font`, `--emoji-font`, `--output`.
 The default font is `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf`.
@@ -47,3 +47,13 @@ A canvas render does not verify compositor scaling, placement, blur, focus,
 keyboard/pointer events or launch/copy behavior. Comparing fixtures with a hero
 that has different text and icons measures those differences too, not just
 layout. A low error is not proof of functional parity.
+
+`--actions true` renders the selected row's action panel. `--details true`
+renders its details. `--view quicklinks` supplies two local fixture links,
+including a fixed creation timestamp. The launcher's config supports `[[link]]`
+with `name`, `url`, optional `alias`, `icon`, `app`, and `created` (epoch seconds).
+Static links open through the configured app name or `xdg-open`. Keyword links
+support `{}`, `{query}`, and `{argument}` with URL-encoded input. Dynamic/named
+placeholders and create/edit forms are not restored by this foundation port.
+The scripts and script-output views are fixed synthetic fixtures. They neither
+scan nor run scripts from the host.

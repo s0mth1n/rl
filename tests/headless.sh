@@ -38,6 +38,9 @@ trap 'exit 143' TERM
 export WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1
 unset DISPLAY WAYLAND_SOCKET WLR_DRM_DEVICES
 unset WAYLAND_DISPLAY SWAYSOCK I3SOCK HYPRLAND_INSTANCE_SIGNATURE NIRI_SOCKET
+mkdir -p "$XDG_CONFIG_HOME/zl"
+# The virtual keyboard helper leaves the seat between runs, which would hide the panel.
+printf 'close_on_focus_loss = false\n' > "$XDG_CONFIG_HOME/zl/config.toml"
 printf 'output HEADLESS-1 resolution 1280x800 scale %s bg #20242c solid_color\ndefault_border none\n' "${SCALE:-1}" > "$run/sway.conf"
 sway -c "$run/sway.conf" >"$OUT/sway.log" 2>&1 & sw=$!
 record_test_pid "$sw"

@@ -1,5 +1,5 @@
 //! Applications, emoji and clipboard rows for the basic launcher.
-use crate::{clip, config::Config};
+use crate::{clip, config, config::Config};
 
 #[derive(Clone, Debug)]
 pub struct App {
@@ -12,17 +12,33 @@ pub struct App {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     App(usize),
+    Web(String),
+    Details,
     Clip(String),
     ClipImg(u64),
     View(String),
     Setting(String),
     Open(String),
+    /// Move this exact path to the trash. Only reachable from the confirm view.
+    Trash(String),
     /// A row that only informs, such as "No files found".
     Nothing,
     Exclude(String),
+    Theme(String),
     ClearClip,
     PinToggle(String),
     ResetRank(String),
+    SetToneFor(String, usize),
+    EmojiReset(String),
+    AppArg(usize, String),
+    AppForce(usize, Option<String>),
+    Script(usize),
+    ScriptToggle(String),
+    ScriptSamples,
+    ScriptEdit(String),
+    ScriptDelete(String),
+    ScriptOutput,
+    ScriptSubmit,
 }
 #[derive(Clone, Debug)]
 pub struct Item {
@@ -96,11 +112,142 @@ pub struct Search<'a> {
     pub cfg: &'a Config,
     pub apps: &'a [App],
     pub files: &'a [String],
+    pub scripts: &'a [crate::scripts::Script],
     pub history: &'a clip::History,
 }
+pub const CONFIRM_TRASH: &str = "confirm trash ";
+
+/// The query that asks before moving `path` to the trash. The path is JSON encoded so any
+/// byte sequence a file name can hold (quotes, tabs, newlines, trailing spaces) survives the trim in `run`.
+pub fn confirm_trash_query(path: &str) -> String {
+    format!(
+        "{CONFIRM_TRASH}{}",
+        serde_json::to_string(path).unwrap_or_default()
+    )
+}
+
+/// The path inside a confirm query, `None` for anything else.
+pub fn confirm_trash_path(query: &str) -> Option<String> {
+    serde_json::from_str(query.trim().strip_prefix(CONFIRM_TRASH)?).ok()
+}
+
 impl Search<'_> {
     pub fn run(&self, query: &str) -> Vec<Item> {
         let q = query.trim();
+        if q.starts_with(CONFIRM_TRASH) {
+            let Some(path) = confirm_trash_path(q) else {
+                return Vec::new();
+            };
+            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+            let mk = |title: String, sub: String, action| Item {
+                title,
+                sub,
+                tag: "Confirm",
+                icon: None,
+                action,
+                best: false,
+            };
+            return vec![
+                mk(
+                    format!("Move \"{name}\" to the trash"),
+                    path.clone(),
+                    Action::Trash(path),
+                ),
+                mk(
+                    "Cancel".into(),
+                    "Keep the file".into(),
+                    Action::View("/".into()),
+                ),
+            ];
+        }
+        let scripts = self.scripts;
+        let off = crate::scripts::disabled();
+        if let Some(rest) = q.strip_prefix("confirm script-run ") {
+            let mut parts = rest.splitn(3, '\t');
+            if let (Some(index), Some(name), arg) = (parts.next(), parts.next(), parts.next()) {
+                if let Ok(index) = index.parse::<usize>() {
+                    return vec![Item {
+                        title: name.into(),
+                        sub: "Run this script? Enter to confirm, Escape to cancel".into(),
+                        tag: "Script",
+                        icon: None,
+                        action: Action::AppForce(
+                            index,
+                            arg.filter(|v| !v.is_empty()).map(str::to_string),
+                        ),
+                        best: false,
+                    }];
+                }
+            }
+        }
+        if let Some(rest) = q.strip_prefix("confirm script-del ") {
+            return vec![Item {
+                title: "Delete script?".into(),
+                sub: rest.into(),
+                tag: "Script",
+                icon: None,
+                action: Action::ScriptDelete(rest.into()),
+                best: false,
+            }];
+        }
+        if q == "scripts" || q.starts_with("scripts ") {
+            return crate::scripts::script_items(
+                self.cfg,
+                scripts,
+                q.strip_prefix("scripts").unwrap_or("").trim(),
+            );
+        }
+        // A script that takes an argument also takes it inline: "Name value" runs with
+        // "value"; a dropdown script offers its options once the name is typed in full.
+        if q.contains(' ') {
+            let mut best: Option<(usize, &crate::scripts::Script, &str)> = None;
+            for (i, a) in scripts.iter().enumerate() {
+                if a.arg.is_empty() || off.contains(&format!("cmd:{}", a.name)) {
+                    continue;
+                }
+                let nl = a.name.len();
+                let ok = q
+                    .get(..nl)
+                    .map(|p| p.eq_ignore_ascii_case(&a.name))
+                    .unwrap_or(false)
+                    && q.get(nl..nl + 1) == Some(" ");
+                if ok
+                    && best
+                        .as_ref()
+                        .map(|(_, b, _)| b.name.len() < nl)
+                        .unwrap_or(true)
+                {
+                    best = Some((i, a, q[nl + 1..].trim()));
+                }
+            }
+            if let Some((i, a, rest)) = best {
+                if !a.arg_opts.is_empty() {
+                    return a
+                        .arg_opts
+                        .iter()
+                        .filter(|o| rest.is_empty() || fuzzy(rest, o).is_some())
+                        .map(|o| Item {
+                            best: false,
+                            title: format!("{}: {o}", a.name),
+                            sub: a.comment.clone(),
+                            tag: "Script",
+                            icon: None,
+                            action: Action::AppArg(i, o.clone()),
+                        })
+                        .collect();
+                }
+                if !rest.is_empty() {
+                    return vec![Item {
+                        best: false,
+                        title: format!("Run {} with \"{}\"", a.name, rest),
+                        sub: a.comment.clone(),
+                        tag: "Script",
+                        icon: None,
+                        action: Action::AppArg(i, rest.to_string()),
+                    }];
+                }
+            }
+        }
         if q == "settings" {
             return crate::settings::rows(self.cfg);
         }
@@ -135,37 +282,48 @@ impl Search<'_> {
         if let Some(filter) = q.strip_prefix(':') {
             return emoji_items(filter.trim());
         }
+        if let Some(filter) = q.strip_prefix('#') {
+            return theme_items(self.cfg, filter.trim());
+        }
         if let Some(filter) = q.strip_prefix(';') {
-            let mut rows: Vec<_> = self
+            let now = clip::now();
+            let mut dated: Vec<_> = self
                 .history
                 .entries
                 .iter()
                 .filter(|c| filter.trim().is_empty() || fuzzy(filter.trim(), &c.text).is_some())
-                .map(|c| Item {
-                    title: c
-                        .text
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .chars()
-                        .take(100)
-                        .collect(),
-                    sub: "Copy text to clipboard".into(),
-                    tag: "Clipboard",
-                    icon: None,
-                    action: Action::Clip(c.text.clone()),
-                    best: false,
+                .map(|c| {
+                    (
+                        c.at,
+                        Item {
+                            title: clip::preview(&c.text),
+                            sub: clip::timestamp(c.at, now),
+                            tag: "Clipboard",
+                            icon: None,
+                            action: Action::Clip(c.text.clone()),
+                            best: false,
+                        },
+                    )
                 })
                 .collect();
             if filter.trim().is_empty() {
-                rows.extend(self.history.images.iter().map(|i| Item {
-                    title: format!("Image {} x {}", i.w, i.h),
-                    sub: "Copy PNG to clipboard".into(),
-                    tag: "Clipboard",
-                    icon: None,
-                    action: Action::ClipImg(i.id),
-                    best: false,
+                dated.extend(self.history.images.iter().map(|i| {
+                    (
+                        i.at,
+                        Item {
+                            title: format!("Image {} x {}", i.w, i.h),
+                            sub: clip::timestamp(i.at, now),
+                            tag: "Clipboard",
+                            icon: None,
+                            action: Action::ClipImg(i.id),
+                            best: false,
+                        },
+                    )
                 }));
+            }
+            dated.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+            let mut rows: Vec<_> = dated.into_iter().map(|(_, item)| item).collect();
+            if filter.trim().is_empty() {
                 rows.push(Item {
                     title: "Clear clipboard history".into(),
                     sub: "Remove saved text and images".into(),
@@ -177,7 +335,73 @@ impl Search<'_> {
             }
             return rows;
         }
+        if q == "quicklinks" || q.starts_with("quicklinks ") {
+            let rest = q[10..].trim();
+            let mut out: Vec<Item> = self
+                .cfg
+                .link
+                .iter()
+                .filter(|l| {
+                    rest.is_empty()
+                        || fuzzy(rest, &l.name).is_some()
+                        || fuzzy(rest, &l.alias).is_some()
+                })
+                .map(link_item)
+                .collect();
+            out.sort_by_cached_key(|it| it.title.to_lowercase());
+            return out;
+        }
+        if let Some((key, rest)) = q.split_once(' ') {
+            if let Some(l) = self.cfg.link.iter().find(|l| {
+                !l.alias.is_empty()
+                    && l.alias.eq_ignore_ascii_case(key)
+                    && link_fill(&l.url, "").is_some()
+            }) {
+                if !rest.trim().is_empty() {
+                    let mut it = link_item(l);
+                    let url = link_fill(&l.url, rest.trim()).unwrap();
+                    it.sub = url.clone();
+                    it.action = Action::Web(url);
+                    return vec![it];
+                }
+            }
+        }
         let mut scored = Vec::new();
+        for l in &self.cfg.link {
+            if let Some(score) = if q.is_empty() {
+                Some(0)
+            } else {
+                fuzzy(q, &l.name)
+                    .into_iter()
+                    .chain(fuzzy(q, &l.alias))
+                    .max()
+            } {
+                scored.push((score, link_item(l)));
+            }
+        }
+        for (i, a) in scripts
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| !off.contains(&format!("cmd:{}", a.name)))
+        {
+            if let Some(score) = if q.is_empty() {
+                Some(0)
+            } else {
+                fuzzy(q, &format!("{} {}", a.name, a.keywords))
+            } {
+                scored.push((
+                    score,
+                    Item {
+                        title: a.name.clone(),
+                        sub: a.comment.clone(),
+                        tag: "Script",
+                        icon: Some(a.icon.clone()),
+                        action: Action::Script(i),
+                        best: false,
+                    },
+                ));
+            }
+        }
         for (i, a) in self
             .apps
             .iter()
@@ -202,16 +426,38 @@ impl Search<'_> {
                 ));
             }
         }
-        for (title, sub, view) in [
-            ("Search Files", "System files", "/"),
-            ("Emoji Picker", "Search emoji by name", ":"),
-            ("Clipboard History", "Saved text and images", ";"),
+        for (title, sub, view, icon) in [
+            // Icon names follow zlaunch's submenu items; icons.rs falls back
+            // to embedded strokes when no icon theme provides them.
+            ("Search Files", "System files", "/", "folder"),
+            (
+                "Search Quicklinks",
+                "Find saved websites",
+                "quicklinks",
+                "globe",
+            ),
+            (
+                "Manage Scripts",
+                "Enable, edit and delete script commands",
+                "scripts",
+                "utilities-terminal",
+            ),
+            ("Emoji Picker", "Search emoji by name", ":", "smiley"),
+            (
+                "Clipboard History",
+                "Saved text and images",
+                ";",
+                "clipboard",
+            ),
+            ("Themes", "Browse and apply themes", "#", "palette"),
             (
                 "Settings",
                 "Appearance, clipboard and excluded applications",
                 "settings",
+                "settings",
             ),
         ] {
+            let (title, sub, view, icon) = (title, sub, view, icon);
             if let Some(score) = if q.is_empty() {
                 Some(0)
             } else {
@@ -223,7 +469,7 @@ impl Search<'_> {
                         title: title.into(),
                         sub: sub.into(),
                         tag: "Basic",
-                        icon: None,
+                        icon: Some(icon.into()),
                         action: Action::View(view.into()),
                         best: false,
                     },
@@ -503,6 +749,12 @@ impl FileIndex {
     pub fn clear(&mut self) {
         self.0 = None;
     }
+    /// Drop entries that no longer exist, such as a file just moved to the trash.
+    pub fn retain(&mut self, f: impl FnMut(&String) -> bool) {
+        if let Some(v) = self.0.as_mut() {
+            v.retain(f);
+        }
+    }
     pub fn files(&self) -> &[String] {
         self.0.as_deref().unwrap_or(&[])
     }
@@ -649,33 +901,117 @@ pub fn fuzzy(q: &str, s: &str) -> Option<i32> {
     Some(score - (s.len() as i32 / 8))
 }
 
+pub const TONES: [&str; 6] = [
+    "Default",
+    "Light",
+    "Medium-light",
+    "Medium",
+    "Medium-dark",
+    "Dark",
+];
+
+pub fn emoji_base(e: &'static emojis::Emoji) -> &'static emojis::Emoji {
+    e.with_skin_tone(emojis::SkinTone::Default).unwrap_or(e)
+}
+
+pub fn emoji_with_tone(e: &'static emojis::Emoji, pick: usize) -> &'static emojis::Emoji {
+    let e = emoji_base(e);
+    let tone = match pick {
+        1 => emojis::SkinTone::Light,
+        2 => emojis::SkinTone::MediumLight,
+        3 => emojis::SkinTone::Medium,
+        4 => emojis::SkinTone::MediumDark,
+        5 => emojis::SkinTone::Dark,
+        _ => emojis::SkinTone::Default,
+    };
+    e.with_skin_tone(tone).unwrap_or(e)
+}
+
+/// The theme picker is a `#` query, optionally followed by a name filter.
+pub fn theme_view(query: &str) -> bool {
+    query.trim_start().starts_with('#')
+}
+
+/// Picker rows for every bundled theme: the configured one first, then alphabetical,
+/// like zlaunch's theme mode. `Action::Theme` previews the row's theme while selected.
+pub fn theme_items(cfg: &Config, q: &str) -> Vec<Item> {
+    let current = config::canonical(&cfg.theme);
+    let mut names = config::THEMES.to_vec();
+    names.sort_unstable();
+    names.sort_by_key(|name| *name != current);
+    let q = q.to_lowercase();
+    names
+        .into_iter()
+        .filter(|name| name.contains(&q) || "bundled".contains(&q))
+        .map(|name| Item {
+            title: name.into(),
+            sub: "bundled".into(),
+            tag: "Theme",
+            icon: Some(format!("theme:{name}")),
+            action: Action::Theme(name.into()),
+            best: false,
+        })
+        .collect()
+}
+
 pub fn emoji_items(q: &str) -> Vec<Item> {
+    let tones = crate::hist::emoji_tones();
+    let frequencies = crate::hist::emoji_freq();
     let mut v: Vec<(i32, &'static emojis::Emoji)> = Vec::new();
     for e in emojis::iter().filter(|e| e.skin_tone().is_none_or(|t| t == emojis::SkinTone::Default))
     {
-        if q.is_empty() {
-            v.push((0, e));
-            continue;
-        }
-        let best = std::iter::once(e.name())
-            .chain(e.shortcodes())
-            .filter_map(|n| fuzzy(q, n))
-            .max();
-        if let Some(s) = best {
-            v.push((s, e));
+        let score = if q.is_empty() {
+            Some(0)
+        } else {
+            std::iter::once(e.name())
+                .chain(e.shortcodes())
+                .filter_map(|n| fuzzy(q, n))
+                .max()
+                .or_else(|| {
+                    emojis::get(q)
+                        .filter(|found| emoji_base(found) == e)
+                        .map(|_| 1000)
+                })
+        };
+        if let Some(score) = score {
+            let used = frequencies
+                .iter()
+                .filter(|(sequence, _)| emojis::get(sequence).is_some_and(|f| emoji_base(f) == e))
+                .fold(0u32, |sum, (_, n)| sum.saturating_add(*n));
+            v.push((
+                score + if q.is_empty() { 0 } else { used.min(10) as i32 },
+                e,
+            ));
         }
     }
-    if !q.is_empty() {
+    if q.is_empty() {
+        let mut preferred: Vec<_> = crate::hist::emoji_recent()
+            .iter()
+            .filter_map(|sequence| emojis::get(sequence))
+            .map(emoji_base)
+            .collect();
+        preferred.extend(
+            frequencies
+                .iter()
+                .take(8)
+                .filter_map(|(sequence, _)| emojis::get(sequence))
+                .map(emoji_base),
+        );
+        v.sort_by_key(|(_, e)| preferred.iter().position(|p| p == e).unwrap_or(usize::MAX));
+    } else {
         v.sort_by_key(|a| std::cmp::Reverse(a.0));
     }
     v.into_iter()
-        .map(|(_, e)| Item {
-            title: e.name().to_string(),
-            sub: format!(":{}:", e.shortcode().unwrap_or("")),
-            tag: "Emoji",
-            icon: Some(format!("emoji:{}", e.as_str())),
-            action: Action::Clip(e.as_str().to_string()),
-            best: false,
+        .map(|(_, base)| {
+            let e = emoji_with_tone(base, tones.get(base.name()).copied().unwrap_or(0));
+            Item {
+                title: base.name().to_string(),
+                sub: format!(":{}:", base.shortcode().unwrap_or("")),
+                tag: "Emoji",
+                icon: Some(format!("emoji:{}", e.as_str())),
+                action: Action::Clip(e.as_str().to_string()),
+                best: false,
+            }
         })
         .collect()
 }
@@ -683,6 +1019,83 @@ pub fn emoji_items(q: &str) -> Vec<Item> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn emoji_tones_recents_and_reset_round_trip() {
+        let _env = crate::testutil::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("XDG_STATE_HOME");
+        std::env::set_var("XDG_STATE_HOME", dir.path());
+        assert_eq!(crate::hist::emoji_tone("waving hand"), None);
+        assert!(crate::hist::emoji_tone_set("waving hand", 5));
+        assert!(crate::hist::emoji_tone_set("waving hand", 2));
+        assert_eq!(
+            std::fs::read_to_string(crate::hist::emoji_tone_path()).unwrap(),
+            "waving hand\t2\n"
+        );
+        assert!(!crate::hist::emoji_tone_set("bad\nname", 2));
+        assert!(!crate::hist::emoji_tone_set("waving hand", 6));
+        let hand = emoji_items("waving hand").remove(0);
+        assert_eq!(hand.title, "waving hand");
+        assert_eq!(hand.action, Action::Clip("👋🏼".into()));
+        assert_eq!(hand.icon.as_deref(), Some("emoji:👋🏼"));
+        assert_eq!(emoji_items("😀")[0].action, Action::Clip("😀".into()));
+        crate::hist::emoji_add("👋🏿");
+        crate::hist::emoji_add("😀");
+        crate::hist::emoji_add("👋🏼");
+        assert_eq!(crate::hist::emoji_recent(), vec!["👋🏼", "😀", "👋🏿"]);
+        let browse = emoji_items("");
+        assert_eq!(browse[0].title, "waving hand");
+        assert_eq!(browse[1].action, Action::Clip("😀".into()));
+        assert_eq!(
+            browse.iter().filter(|it| it.title == "waving hand").count(),
+            1
+        );
+        let actions = actions_for(&hand, false, &Config::default());
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|it| matches!(it.action, Action::SetToneFor(..)))
+                .count(),
+            6
+        );
+        assert!(actions.iter().any(
+            |it| it.action == Action::SetToneFor("waving hand".into(), 2) && it.sub == "Current"
+        ));
+        crate::hist::emoji_reset("👋🏼");
+        assert_eq!(crate::hist::emoji_tone("waving hand"), None);
+        assert_eq!(crate::hist::emoji_recent(), vec!["😀"]);
+        assert_eq!(crate::hist::emoji_freq(), vec![("😀".into(), 1)]);
+        assert_eq!(
+            emoji_items("waving hand")[0].action,
+            Action::Clip("👋".into())
+        );
+        match previous {
+            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+    }
+
+    #[test]
+    fn emoji_tone_changes_only_supported_sequences() {
+        let wave = emojis::get("👋").unwrap();
+        let variants = ["👋", "👋🏻", "👋🏼", "👋🏽", "👋🏾", "👋🏿"];
+        assert_eq!(TONES.len(), variants.len());
+        for (pick, sequence) in variants.iter().enumerate() {
+            let e = emoji_with_tone(wave, pick);
+            assert_eq!(e.as_str(), *sequence);
+            assert_eq!(emoji_base(e).name(), "waving hand");
+        }
+        assert_eq!(
+            emoji_with_tone(emojis::get("👋🏿").unwrap(), 0).as_str(),
+            "👋"
+        );
+        assert_eq!(emoji_with_tone(wave, 99).as_str(), "👋");
+        let family = emojis::get("👨‍👩‍👧").unwrap();
+        assert_eq!(emoji_with_tone(family, 5).as_str(), "👨‍👩‍👧");
+        let flag = emojis::get("🇮🇳").unwrap();
+        assert_eq!(emoji_with_tone(flag, 3).as_str(), "🇮🇳");
+    }
+
     #[test]
     fn emoji_picker_is_not_limited_to_eighty_results() {
         let all = emoji_items("");
@@ -769,7 +1182,7 @@ mod tests {
         }
     }
     #[test]
-    fn root_has_only_apps_and_four_basic_views() {
+    fn root_has_apps_and_basic_views() {
         let cfg = Config::default();
         let apps = vec![app("Browser")];
         let history = clip::History::new(10);
@@ -777,6 +1190,7 @@ mod tests {
             cfg: &cfg,
             apps: &apps,
             files: &[],
+            scripts: &[],
             history: &history,
         };
         let rows = search.run("");
@@ -785,8 +1199,11 @@ mod tests {
             vec![
                 "Browser",
                 "Search Files",
+                "Search Quicklinks",
+                "Manage Scripts",
                 "Emoji Picker",
                 "Clipboard History",
+                "Themes",
                 "Settings"
             ]
         );
@@ -798,7 +1215,6 @@ mod tests {
             "quicklinks",
             "currency",
             "windows",
-            "scripts",
         ] {
             assert!(search.run(query).is_empty(), "{query}");
         }
@@ -815,6 +1231,7 @@ mod tests {
             cfg: &cfg,
             apps: &apps,
             files: &[],
+            scripts: &[],
             history: &history,
         };
         assert!(search.run("Browser").is_empty());
@@ -833,6 +1250,7 @@ mod tests {
             cfg: &cfg,
             apps: &[],
             files: &[],
+            scripts: &[],
             history: &history,
         };
         let emoji = search.run(":grinning");
@@ -857,6 +1275,7 @@ mod tests {
             cfg: &cfg,
             apps: &apps,
             files: &[],
+            scripts: &[],
             history: &history,
         };
         assert_eq!(
@@ -883,6 +1302,7 @@ mod tests {
             cfg: &cfg,
             apps: &apps,
             files: &[],
+            scripts: &[],
             history: &history,
         };
         assert_eq!(
@@ -917,6 +1337,7 @@ mod tests {
             cfg: &cfg,
             apps: &apps,
             files: &[],
+            scripts: &[],
             history: &history,
         };
         let actions = search
@@ -932,6 +1353,75 @@ mod tests {
         assert_eq!(rows[0].action, Action::Exclude("Code".into()));
     }
     #[test]
+    fn clipboard_rows_interleave_types_by_timestamp_with_stable_ties() {
+        let cfg = Config::default();
+        let mut history = clip::History::new(4);
+        history.entries = vec![
+            clip::Clip {
+                text: "new text".into(),
+                at: 30,
+            },
+            clip::Clip {
+                text: "tied text".into(),
+                at: 20,
+            },
+            clip::Clip {
+                text: "old text".into(),
+                at: 10,
+            },
+        ];
+        history.images = vec![
+            clip::Img {
+                id: 1,
+                png: Vec::new(),
+                w: 1,
+                h: 1,
+                at: 40,
+            },
+            clip::Img {
+                id: 2,
+                png: Vec::new(),
+                w: 1,
+                h: 1,
+                at: 20,
+            },
+        ];
+        let search = Search {
+            cfg: &cfg,
+            apps: &[],
+            scripts: &[],
+            history: &history,
+            files: &[],
+        };
+        assert_eq!(
+            search
+                .run(";")
+                .into_iter()
+                .map(|r| r.action)
+                .collect::<Vec<_>>(),
+            vec![
+                Action::ClipImg(1),
+                Action::Clip("new text".into()),
+                Action::Clip("tied text".into()),
+                Action::ClipImg(2),
+                Action::Clip("old text".into()),
+                Action::ClearClip,
+            ]
+        );
+        assert_eq!(
+            search
+                .run(";text")
+                .into_iter()
+                .map(|r| r.action)
+                .collect::<Vec<_>>(),
+            vec![
+                Action::Clip("new text".into()),
+                Action::Clip("tied text".into()),
+                Action::Clip("old text".into()),
+            ]
+        );
+    }
+    #[test]
     fn clipboard_filter_keeps_full_multiline_text_and_omits_clear() {
         let cfg = Config::default();
         let mut history = clip::History::new(3);
@@ -940,15 +1430,64 @@ mod tests {
             cfg: &cfg,
             apps: &[],
             files: &[],
+            scripts: &[],
             history: &history,
         };
         let rows = search.run("; needle");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].title, "first line");
+        assert_eq!(rows[0].title, "first line needle λ");
         assert_eq!(rows[0].action, Action::Clip("first line\nneedle\tλ".into()));
         let rows = search.run(";");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].action, Action::ClearClip);
+    }
+    #[test]
+    fn theme_picker_pins_the_current_theme_then_alphabetical() {
+        let cfg = Config {
+            theme: "nord".into(),
+            ..Config::default()
+        };
+        let history = clip::History::new(10);
+        let search = Search {
+            cfg: &cfg,
+            apps: &[],
+            files: &[],
+            scripts: &[],
+            history: &history,
+        };
+        let rows = search.run("#");
+        assert_eq!(rows.len(), config::THEMES.len());
+        assert_eq!(rows[0].title, "nord");
+        assert_eq!(rows[0].action, Action::Theme("nord".into()));
+        assert_eq!(rows[0].icon.as_deref(), Some("theme:nord"));
+        assert_eq!(rows[0].sub, "bundled");
+        let rest: Vec<_> = rows[1..].iter().map(|r| r.title.as_str()).collect();
+        let mut sorted = rest.clone();
+        sorted.sort_unstable();
+        assert_eq!(rest, sorted);
+        assert!(rest.contains(&"default"));
+        // Aliases pin the canonical theme.
+        let cfg = Config {
+            theme: "dark".into(),
+            ..Config::default()
+        };
+        let search = Search {
+            cfg: &cfg,
+            apps: &[],
+            files: &[],
+            scripts: &[],
+            history: &history,
+        };
+        assert_eq!(search.run("#")[0].title, "default");
+        // The filter narrows by name, keeping the pinned order.
+        let rows = search.run("#catppuccin");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].title, "catppuccin-latte");
+        assert!(search.run("#zzzz").is_empty());
+        assert!(theme_view("#nord"));
+        assert!(theme_view(" #"));
+        assert!(!theme_view("settings"));
+        assert!(!theme_view(""));
     }
     #[test]
     fn desktop_entry_uses_only_main_application_section() {
@@ -1023,7 +1562,8 @@ pub fn actions_for(it: &Item, pinned: bool, _cfg: &Config) -> Vec<Item> {
         best: false,
     };
     let verb = match it.tag {
-        "Clipboard" | "Emoji" => "Copy",
+        "Clipboard" | "Emoji" | "Output" => "Copy",
+        "Script" => "Run",
         _ => "Open",
     };
     let mut v = vec![mk(verb, &it.title, it.action.clone())];
@@ -1040,7 +1580,26 @@ pub fn actions_for(it: &Item, pinned: bool, _cfg: &Config) -> Vec<Item> {
             Action::Clip(cps),
         ));
     }
-    if matches!(it.tag, "Application" | "Basic" | "Emoji" | "Clipboard") {
+    if let (Action::Open(p), "File") = (&it.action, it.tag) {
+        if it.title != ".." {
+            v.push(mk("Copy path", p, Action::Clip(p.clone())));
+            v.push(mk(
+                "Move to trash",
+                "Asks first",
+                Action::View(confirm_trash_query(p)),
+            ));
+        }
+    }
+    if let Action::Web(url) = &it.action {
+        v.push(mk("Copy link", url, Action::Clip(url.clone())));
+    }
+    if matches!(it.action, Action::App(_) | Action::Web(_)) {
+        v.push(mk("Show details", "Ctrl+O", Action::Details));
+    }
+    if matches!(
+        it.tag,
+        "Application" | "Basic" | "Emoji" | "Clipboard" | "Link" | "Script"
+    ) {
         v.push(mk(
             if pinned { "Unpin" } else { "Pin" },
             "Shown first in search",
@@ -1049,10 +1608,61 @@ pub fn actions_for(it: &Item, pinned: bool, _cfg: &Config) -> Vec<Item> {
         v.push(mk(
             "Reset ranking",
             "Forget recents and usage counts",
-            Action::ResetRank(key_of(it)),
+            if it.tag == "Emoji" {
+                if let Action::Clip(sequence) = &it.action {
+                    Action::EmojiReset(sequence.clone())
+                } else {
+                    Action::ResetRank(key_of(it))
+                }
+            } else {
+                Action::ResetRank(key_of(it))
+            },
         ));
     }
+    if it.tag == "Emoji" {
+        if let Action::Clip(sequence) = &it.action {
+            if let Some(e) =
+                emojis::get(sequence).filter(|e| e.with_skin_tone(emojis::SkinTone::Dark).is_some())
+            {
+                let name = emoji_base(e).name();
+                let current = crate::hist::emoji_tone(name).unwrap_or(0);
+                for (tone, label) in TONES.iter().enumerate() {
+                    v.push(mk(
+                        &format!("Skin tone: {label}"),
+                        if current == tone {
+                            "Current"
+                        } else {
+                            "Only this emoji"
+                        },
+                        Action::SetToneFor(name.into(), tone),
+                    ));
+                }
+            }
+        }
+    }
     v
+}
+
+/// Commands tried in order to move `path` to the trash. The path is a single argument after `--`, never
+/// passed through a shell.
+pub fn trash_commands(path: &str) -> Vec<(&'static str, Vec<String>)> {
+    vec![
+        ("gio", vec!["trash".into(), "--".into(), path.into()]),
+        ("trash-put", vec!["--".into(), path.into()]),
+    ]
+}
+
+/// Move `path` to the trash with gio, or trash-put when gio is missing or fails.
+pub fn trash(path: &str) -> bool {
+    trash_commands(path).into_iter().any(|(cmd, args)| {
+        std::process::Command::new(cmd)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
 }
 
 #[cfg(test)]
@@ -1077,10 +1687,7 @@ mod action_tests {
             Action::PinToggle("Emoji:waving hand".into())
         );
         assert_eq!(actions_for(&it, true, &Config::default())[3].title, "Unpin");
-        assert_eq!(
-            actions[4].action,
-            Action::ResetRank("Emoji:waving hand".into())
-        );
+        assert_eq!(actions[4].action, Action::EmojiReset("👋".into()));
     }
 }
 
@@ -1188,6 +1795,7 @@ mod file_tests {
             cfg: &cfg,
             apps: &[],
             files: &files,
+            scripts: &[],
             history: &history,
         };
         let r = s.run("/notes");
@@ -1196,5 +1804,302 @@ mod file_tests {
         assert_eq!(r[0].action, Action::Open("/h/notes.md".into()));
         assert_eq!(s.run("/o").len(), 3);
         assert_eq!(file_items(&[], "x", 0)[0].title, "No files found");
+    }
+}
+
+#[cfg(test)]
+mod trash_tests {
+    use super::*;
+
+    const NASTY: &[&str] = &[
+        "/h/plain.txt",
+        "/h/it's \"quoted\".txt",
+        "/h/$HOME and `id` $(id).txt",
+        "/h/tab\there.txt",
+        "/h/new\nline.txt",
+        "/h/trailing space ",
+        "/h/back\\slash\\n.txt",
+        "/h/-leading-dash",
+        "/h/emoji 👍🏽 é.txt",
+    ];
+
+    fn file_item(p: &str) -> Item {
+        Item {
+            title: p.rsplit('/').next().unwrap().into(),
+            sub: String::new(),
+            tag: "File",
+            icon: None,
+            action: Action::Open(p.into()),
+            best: false,
+        }
+    }
+
+    #[test]
+    fn confirm_query_round_trips_exact_paths() {
+        for p in NASTY {
+            let q = confirm_trash_query(p);
+            assert!(!q.contains('\n') && !q.contains('\t'), "{q:?}");
+            assert_eq!(confirm_trash_path(&q).as_deref(), Some(*p));
+            // The trim in Search::run must not eat the end of the path.
+            assert_eq!(confirm_trash_path(q.trim()).as_deref(), Some(*p));
+        }
+        assert_eq!(confirm_trash_path("/h/file"), None);
+        assert_eq!(confirm_trash_path("confirm trash not json"), None);
+    }
+
+    #[test]
+    fn confirm_view_trashes_the_exact_path_or_cancels() {
+        let cfg = Config::default();
+        let history = clip::History::new(1);
+        let search = Search {
+            cfg: &cfg,
+            apps: &[],
+            files: &[],
+            scripts: &[],
+            history: &history,
+        };
+        for p in NASTY {
+            let rows = search.run(&confirm_trash_query(p));
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].action, Action::Trash((*p).into()));
+            assert_eq!(rows[1].action, Action::View("/".into()));
+            assert_eq!(rows[0].sub, *p);
+        }
+        assert!(search.run("confirm trash {broken").is_empty());
+    }
+
+    #[test]
+    fn file_rows_offer_copy_path_and_trash_but_parent_row_does_not() {
+        let cfg = Config::default();
+        for p in NASTY {
+            let acts = actions_for(&file_item(p), false, &cfg);
+            let titles: Vec<_> = acts.iter().map(|a| a.title.as_str()).collect();
+            assert_eq!(titles, ["Open", "Copy path", "Move to trash"]);
+            assert_eq!(acts[1].action, Action::Clip((*p).into()));
+            assert_eq!(acts[2].action, Action::View(confirm_trash_query(p)));
+        }
+        let mut up = file_item("/h");
+        up.title = "..".into();
+        assert_eq!(actions_for(&up, false, &cfg).len(), 1);
+    }
+
+    #[test]
+    fn trash_commands_pass_the_path_as_one_argument() {
+        for p in NASTY {
+            let cmds = trash_commands(p);
+            assert_eq!(cmds[0].0, "gio");
+            assert_eq!(cmds[0].1, ["trash", "--", p]);
+            assert_eq!(cmds[1].1, ["--", p]);
+        }
+    }
+
+    #[test]
+    fn trash_runs_the_command_with_the_untouched_path() {
+        let _env = crate::testutil::ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("zl-trash-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("args");
+        // A stand-in gio that records each argument on its own line, NUL separated.
+        let script = dir.join("gio");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\0' \"$a\" >> '{}'; done\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let old = std::env::var_os("PATH");
+        std::env::set_var("PATH", &dir);
+        let mut ok = true;
+        for p in NASTY {
+            let _ = std::fs::remove_file(&log);
+            ok &= trash(p);
+            let got = std::fs::read(&log).unwrap();
+            let args: Vec<&[u8]> = got.split(|b| *b == 0).filter(|a| !a.is_empty()).collect();
+            assert_eq!(args, [&b"trash"[..], b"--", p.as_bytes()], "{p:?}");
+        }
+        match old {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(ok);
+    }
+
+    #[test]
+    fn missing_trash_tools_report_failure() {
+        let _env = crate::testutil::ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os("PATH");
+        std::env::set_var("PATH", "/nonexistent-zl-bin");
+        let failed = !trash("/h/file");
+        match old {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        assert!(failed);
+    }
+}
+
+pub fn exec_open(exec: &str, url: &str) -> String {
+    let q = format!("'{}'", url.replace('\'', "'\\''"));
+    let mut out: Vec<String> = Vec::new();
+    let mut used = false;
+    for tok in exec.split_whitespace() {
+        if tok.starts_with('%') && tok.len() == 2 {
+            if matches!(tok, "%u" | "%U" | "%f" | "%F") {
+                out.push(q.clone());
+                used = true;
+            }
+        } else {
+            out.push(tok.to_string());
+        }
+    }
+    if !used {
+        out.push(q);
+    }
+    out.join(" ")
+}
+
+pub fn link_fill(url: &str, arg: &str) -> Option<String> {
+    for p in ["{}", "{query}", "{argument}"] {
+        if url.contains(p) {
+            return Some(url.replace(p, &urlencode(arg)));
+        }
+    }
+    None
+}
+
+pub fn urlencode(s: &str) -> String {
+    let mut o = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                o.push(b as char)
+            }
+            b' ' => o.push('+'),
+            _ => o.push_str(&format!("%{b:02X}")),
+        }
+    }
+    o
+}
+
+fn link_item(l: &crate::config::Link) -> Item {
+    Item {
+        title: l.name.clone(),
+        sub: l.url.clone(),
+        tag: "Link",
+        icon: if l.icon.is_empty() {
+            None
+        } else {
+            Some(l.icon.clone())
+        },
+        action: Action::Web(l.url.clone()),
+        best: false,
+    }
+}
+
+#[cfg(test)]
+mod quicklink_tests {
+    use super::*;
+    #[test]
+    fn quicklinks_search_alias_and_fill_preserve_saved_title() {
+        let cfg = Config {
+            link: vec![crate::config::Link {
+                name: "Documentation".into(),
+                url: "https://example.invalid/?q={query}".into(),
+                alias: "docs".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let history = clip::History::new(0);
+        let search = Search {
+            cfg: &cfg,
+            apps: &[],
+            files: &[],
+            scripts: &[],
+            history: &history,
+        };
+        assert_eq!(search.run("quicklinks")[0].title, "Documentation");
+        assert_eq!(search.run("quicklinks docs").len(), 1);
+        let result = search.run("docs rust & unicode 👋");
+        assert_eq!(result[0].title, "Documentation");
+        assert_eq!(
+            result[0].action,
+            Action::Web("https://example.invalid/?q=rust+%26+unicode+%F0%9F%91%8B".into())
+        );
+        assert_eq!(link_fill("https://example.invalid", "anything"), None);
+        assert_eq!(
+            exec_open("browser %u", "https://x.invalid/a'b"),
+            "browser 'https://x.invalid/a'\\''b'"
+        );
+    }
+}
+
+/// History only breaks equal match scores while a query is typed.
+pub fn rank_history(items: &mut [Item], query: &str, cfg: &Config, hist: &crate::hist::Hist) {
+    if query.starts_with([':', ';']) || query.starts_with("settings") {
+        return;
+    }
+    let q = query.trim();
+    items.sort_by_key(|it| {
+        let key = key_of(it);
+        let score = if q.is_empty() {
+            0
+        } else {
+            let name = fuzzy(q, &it.title);
+            let alias = cfg
+                .link
+                .iter()
+                .find(|l| l.name == it.title)
+                .and_then(|l| fuzzy(q, &l.alias));
+            name.into_iter().chain(alias).max().unwrap_or(0)
+        };
+        (
+            std::cmp::Reverse(score),
+            hist.pin_order(&key).unwrap_or(usize::MAX),
+            std::cmp::Reverse(hist.bonus(&key)),
+        )
+    });
+}
+
+#[cfg(test)]
+mod history_order_tests {
+    use super::*;
+    #[test]
+    fn frequent_weak_match_cannot_outrank_tight_match() {
+        let cfg = Config::default();
+        let history = clip::History::new(0);
+        let apps = vec![
+            App {
+                name: "Firefox".into(),
+                exec: "true".into(),
+                comment: String::new(),
+                icon: String::new(),
+                terminal: false,
+            },
+            App {
+                name: "Friendly Image Reader".into(),
+                exec: "true".into(),
+                comment: String::new(),
+                icon: String::new(),
+                terminal: false,
+            },
+        ];
+        let mut rows = Search {
+            cfg: &cfg,
+            apps: &apps,
+            files: &[],
+            scripts: &[],
+            history: &history,
+        }
+        .run("fire");
+        let h = crate::hist::test_hist("Application:Friendly Image Reader", 100);
+        rank_history(&mut rows, "fire", &cfg, &h);
+        assert_eq!(rows[0].title, "Firefox");
+        assert!(rows.len() > 1);
     }
 }
