@@ -6,7 +6,7 @@ P="$here/target/release/examples/vptr"
 set -euo pipefail
 source "$here/tests/session.bash"
 start_test_keyboard
-type_query() { "$Z" show; sleep .15; printf 'k ctrl-u\nt %s\ns 0.25\nk home\ns 0.1\n' "$1" | send_test_keys; }
+type_query() { "$Z" hide; "$Z" show; sleep .15; printf 't %s\ns 0.25\n' "$1" | send_test_keys; }
 shot() {
     sleep .3
     grim "$OUT/$1.png"
@@ -23,7 +23,7 @@ sleep .4
 type_query 'clip'
 printf 'k enter\ns 0.3\n' | send_test_keys
 shot clipview
-check_text clipview 'Clear clipboard history'   # empty clipboard sub-view
+check_text clipview 'No clipboard history'   # empty clipboard sub-view
 CLIP_TOP=$(python3 - "$OUT/clipview.png" <<'PY'
 import sys
 from PIL import Image
@@ -47,7 +47,7 @@ echo 'PASS back arrow restores the combined view'
 # Direct prefix entry shows no arrow; clicking the prefix zone keeps the view.
 type_query ';'
 shot clipdirect
-check_text clipdirect 'Clear clipboard history'
+check_text clipdirect 'No clipboard history'
 CLIP_TOP=$(python3 - "$OUT/clipdirect.png" <<'PY'
 import sys
 from PIL import Image
@@ -63,7 +63,7 @@ PY
 )
 printf 'm %s %s\np\nr\ns 0.4\n' "$BACK_X" "$(( CLIP_TOP + 28 ))" | "$P"
 shot clipstill
-check_text clipstill 'Clear clipboard history'  # still the clipboard view: no arrow
+check_text clipstill 'No clipboard history'  # still the clipboard view: no arrow
 echo 'PASS direct sub-view has no back arrow'
 
 # The theme picker entered directly shows its own prefix icon.
