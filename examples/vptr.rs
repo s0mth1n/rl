@@ -134,10 +134,19 @@ fn main() {
             }
             ["a", dy] => {
                 // scroll wheel: positive scrolls down
+                // Like a real wheel: axis_source(Wheel), one discrete step, then the value.
+                let value: f64 = dy.parse().unwrap();
+                ptr.axis_source(wayland_client::protocol::wl_pointer::AxisSource::Wheel);
+                ptr.axis_discrete(
+                    t,
+                    wayland_client::protocol::wl_pointer::Axis::VerticalScroll,
+                    value,
+                    if value < 0.0 { -1 } else { 1 },
+                );
                 ptr.axis(
                     t,
                     wayland_client::protocol::wl_pointer::Axis::VerticalScroll,
-                    dy.parse().unwrap(),
+                    value,
                 );
                 ptr.frame();
             }
