@@ -1,0 +1,19 @@
+name: Basic CI
+on: [push, pull_request]
+jobs:
+  basic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: System packages
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev pkg-config fontconfig fonts-dejavu-core fonts-noto-color-emoji sway grim wl-clipboard tesseract-ocr python3-pil
+      - run: cargo fmt --check
+      - run: cargo test --release
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo build --release --examples && cargo build --release
+      - name: Basic headless scenario
+        run: timeout --kill-after=5s 3m bash tests/headless.sh bash tests/basic.sh
