@@ -4,6 +4,8 @@ mod actions_ui;
 #[allow(dead_code)]
 #[path = "../src/dates.rs"]
 mod dates;
+#[path = "../src/details.rs"]
+mod details;
 #[allow(dead_code)]
 #[path = "../src/hist.rs"]
 mod hist;
@@ -14,8 +16,12 @@ mod clip;
 mod config;
 #[path = "../src/icons.rs"]
 mod icons;
+#[path = "../src/input.rs"]
+mod input;
 #[path = "../src/items.rs"]
 mod items;
+#[path = "../src/scripts.rs"]
+mod scripts;
 #[path = "../src/settings.rs"]
 mod settings;
 #[cfg(test)]
@@ -85,6 +91,7 @@ fn main() {
         cfg: &cfg,
         apps: &apps,
         files: &[],
+        scripts: &[],
         history: &history,
     };
     let queries = [
@@ -107,6 +114,7 @@ fn main() {
     let h = ui::panel_height(&rows, 8);
     let view = ui::View {
         query: "firefox",
+        input: None,
         items: &rows,
         sel: 0,
         top: 0,
@@ -117,6 +125,8 @@ fn main() {
         scale: 1,
         font_size: 15.0,
         icons: &cache,
+        back: false,
+        show_scrollbar: true,
     };
     let mut samples = Vec::new();
     let mut last = ui::Canvas::new(640, h);

@@ -22,3 +22,31 @@ stop_test_pids() {
         kill "-$signal" "$pid" 2>/dev/null || true
     done < "$RL_TEST_PIDFILE"
 }
+
+start_test_keyboard() {
+    local fifo="$XDG_RUNTIME_DIR/test-keyboard.fifo"
+    mkfifo "$fifo"
+    exec {RL_TEST_KEYBOARD_FD}<>"$fifo"
+    "$here/target/release/examples/vkbd" <"$fifo" &
+    RL_TEST_KEYBOARD_PID=$!
+    record_test_pid "$RL_TEST_KEYBOARD_PID"
+    printf 's 0.1\n' | send_test_keys
+}
+
+send_test_keys() {
+    local ack
+    ack=$(mktemp "$XDG_RUNTIME_DIR/keyboard-ack.XXXXXX")
+    rm "$ack"
+    cat >&"$RL_TEST_KEYBOARD_FD"
+    printf 'a %s\n' "$ack" >&"$RL_TEST_KEYBOARD_FD"
+    for _ in $(seq 1000); do
+        if [ -f "$ack" ]; then
+            rm "$ack"
+            return 0
+        fi
+        kill -0 "$RL_TEST_KEYBOARD_PID" 2>/dev/null || return 1
+        sleep .02
+    done
+    echo 'FAIL virtual keyboard command timed out' >&2
+    return 1
+}

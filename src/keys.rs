@@ -6,11 +6,13 @@ pub struct KeyIn<'a> {
     pub sym: u32,
     pub utf8: &'a str,
     pub ctrl: bool,
+    pub shift: bool,
 }
 
 /// What the key handler may read and change.
 pub struct KeyState<'a> {
     pub query: &'a mut String,
+    pub edit: &'a mut crate::input::Edit,
     pub sel: &'a mut usize,
     pub len: usize,
     pub rows: usize,
@@ -37,6 +39,9 @@ pub enum Effect {
     Step(String, i32),
     /// Delete the highlighted clipboard entry.
     DeleteClip,
+    Copy(String),
+    Cut(String),
+    Paste,
 }
 
 impl Effect {
@@ -48,7 +53,7 @@ impl Effect {
 /// Where Backspace goes from a view with nothing typed in it, `None` when the query is not a bare view root.
 pub fn view_root_parent(q: &str) -> Option<&'static str> {
     match q.trim_end() {
-        ":" | ";" | "settings" => Some(""),
+        ":" | ";" | "#" | "settings" | "quicklinks" => Some(""),
         "settings apps" => Some("settings"),
         _ => None,
     }
@@ -73,7 +78,79 @@ pub fn pop_word(s: &mut String) {
     s.truncate(t);
 }
 
+fn pop_input_word(query: &mut String) {
+    if let Some(filter) = query.strip_prefix('#') {
+        let mut filter = filter.to_string();
+        pop_word(&mut filter);
+        query.truncate(1);
+        query.push_str(&filter);
+    } else {
+        pop_word(query);
+    }
+}
+
 pub fn handle(st: &mut KeyState, key: &KeyIn) -> Effect {
+    st.edit.sync(st.query);
+    if st.query.starts_with('#') {
+        st.edit.caret = st.edit.caret.max(1);
+        st.edit.anchor = st.edit.anchor.map(|at| at.max(1));
+    }
+    let editing = match key.sym {
+        k::KEY_z | k::KEY_y if key.ctrl => {
+            st.edit.history(st.query, key.sym == k::KEY_y || key.shift);
+            Some(Effect::Edited)
+        }
+        k::KEY_a if key.ctrl => {
+            st.edit.select_all(st.query);
+            Some(Effect::Moved)
+        }
+        k::KEY_c | k::KEY_x if key.ctrl => {
+            let text = st
+                .edit
+                .range()
+                .map(|r| st.query[r].to_string())
+                .unwrap_or_default();
+            if key.sym == k::KEY_x {
+                Some(Effect::Cut(text))
+            } else {
+                Some(Effect::Copy(text))
+            }
+        }
+        k::KEY_v if key.ctrl => Some(Effect::Paste),
+        k::KEY_Home | k::KEY_End => {
+            st.edit.move_to(
+                st.query,
+                if key.sym == k::KEY_Home {
+                    0
+                } else {
+                    st.query.len()
+                },
+                key.shift,
+            );
+            Some(Effect::Moved)
+        }
+        k::KEY_Left | k::KEY_Right if !matches!(st.selected, Some(Action::Setting(_))) => {
+            st.edit
+                .step(st.query, key.sym == k::KEY_Right, key.ctrl, key.shift);
+            Some(Effect::Moved)
+        }
+        k::KEY_BackSpace
+            if !st.query.starts_with("confirm trash ")
+                && !(key.shift && st.query.starts_with(';'))
+                && (view_root_parent(st.query).is_none() || st.edit.range().is_some()) =>
+        {
+            st.edit.delete(st.query, false, key.ctrl);
+            Some(Effect::Edited)
+        }
+        k::KEY_Delete if !key.shift => {
+            st.edit.delete(st.query, true, key.ctrl);
+            Some(Effect::Edited)
+        }
+        _ => None,
+    };
+    if let Some(effect) = editing {
+        return effect;
+    }
     let last = st.len.saturating_sub(1);
     let go = |sel: &mut usize, d: isize| {
         if st.len > 0 {
@@ -91,7 +168,13 @@ pub fn handle(st: &mut KeyState, key: &KeyIn) -> Effect {
     match key.sym {
         k::KEY_Escape => {
             // A view (emoji, clipboard, settings) steps back to the main list; the main list hides at once.
-            let in_view = st.query.starts_with([':', ';']) || st.query.starts_with("settings");
+            if st.query.starts_with("confirm trash ") {
+                *st.query = "/".into();
+                return Effect::Edited;
+            }
+            let in_view = st.query.starts_with([':', ';', '#'])
+                || st.query.starts_with("settings")
+                || st.query.starts_with("quicklinks");
             if in_view && !st.close_on_escape {
                 st.query.clear();
                 Effect::Edited
@@ -100,9 +183,15 @@ pub fn handle(st: &mut KeyState, key: &KeyIn) -> Effect {
             }
         }
         k::KEY_Return | k::KEY_KP_Enter => Effect::Activate,
+        k::KEY_Delete | k::KEY_BackSpace if key.shift && st.query.starts_with(';') => {
+            Effect::DeleteClip
+        }
         k::KEY_BackSpace => {
             if key.ctrl {
-                pop_word(st.query);
+                pop_input_word(st.query);
+                Effect::Edited
+            } else if st.query.starts_with("confirm trash ") {
+                *st.query = "/".into();
                 Effect::Edited
             } else if let Some(back) = view_root_parent(st.query) {
                 if st.pop_on_backspace {
@@ -125,17 +214,12 @@ pub fn handle(st: &mut KeyState, key: &KeyIn) -> Effect {
                 crate::ui::emoji_vertical(*st.sel, st.len, st.columns, key.sym == k::KEY_Down);
             Effect::Moved
         }
-        k::KEY_Right | k::KEY_Left if st.grid => {
-            *st.sel = crate::ui::emoji_horizontal(*st.sel, st.len, key.sym == k::KEY_Right);
-            Effect::Moved
-        }
         k::KEY_Left | k::KEY_Right => match st.selected {
             Some(Action::Setting(name)) => {
                 Effect::Step(name.clone(), if key.sym == k::KEY_Left { -1 } else { 1 })
             }
             _ => Effect::Ignore,
         },
-        k::KEY_Delete if st.query.starts_with(';') => Effect::DeleteClip,
         k::KEY_Down | k::KEY_Tab => wrap(st.sel, 1),
         k::KEY_Up | k::KEY_ISO_Left_Tab => wrap(st.sel, -1),
         k::KEY_Page_Down => go(st.sel, (st.rows * st.columns) as isize),
@@ -150,11 +234,11 @@ pub fn handle(st: &mut KeyState, key: &KeyIn) -> Effect {
         }
         _ if key.ctrl => match key.utf8 {
             "\u{15}" => {
-                st.query.clear();
+                st.query.truncate(usize::from(st.query.starts_with('#')));
                 Effect::Edited
             }
             "\u{17}" => {
-                pop_word(st.query);
+                pop_input_word(st.query);
                 Effect::Edited
             }
             "\u{e}" | "\u{a}" => wrap(st.sel, 1),
@@ -165,7 +249,7 @@ pub fn handle(st: &mut KeyState, key: &KeyIn) -> Effect {
         },
         _ => {
             if !key.utf8.is_empty() && !key.utf8.chars().any(|c| c.is_control()) {
-                st.query.push_str(key.utf8);
+                st.edit.replace(st.query, key.utf8);
                 Effect::Edited
             } else {
                 Effect::Ignore
@@ -187,6 +271,8 @@ mod tests {
         columns: usize,
         grid: bool,
         selected: Option<Action>,
+        shift: bool,
+        edit: crate::input::Edit,
     }
     impl Rig {
         fn new(query: &str, len: usize) -> Self {
@@ -199,11 +285,14 @@ mod tests {
                 columns: 1,
                 grid: false,
                 selected: None,
+                shift: false,
+                edit: crate::input::Edit::default(),
             }
         }
         fn press(&mut self, sym: u32, utf8: &str, ctrl: bool) -> Effect {
             let mut st = KeyState {
                 query: &mut self.query,
+                edit: &mut self.edit,
                 sel: &mut self.sel,
                 len: self.len,
                 rows: 8,
@@ -213,13 +302,46 @@ mod tests {
                 close_on_escape: self.close,
                 selected: self.selected.as_ref(),
             };
-            handle(&mut st, &KeyIn { sym, utf8, ctrl })
+            handle(
+                &mut st,
+                &KeyIn {
+                    sym,
+                    utf8,
+                    ctrl,
+                    shift: self.shift,
+                },
+            )
         }
         fn typ(&mut self, s: &str) {
             for c in s.chars() {
                 assert_eq!(self.press(c as u32, &c.to_string(), false), Effect::Edited);
             }
         }
+    }
+
+    #[test]
+    fn caret_selection_copy_cut_and_paste_effects() {
+        let mut r = Rig::new("café test", 1);
+        r.press(k::KEY_Home, "", false);
+        r.press(k::KEY_Right, "", false);
+        r.shift = true;
+        r.press(k::KEY_Right, "", true);
+        assert_eq!(&r.query[r.edit.range().unwrap()], "afé");
+        assert_eq!(r.press(k::KEY_c, "\u{3}", true), Effect::Copy("afé".into()));
+        assert_eq!(r.press(k::KEY_x, "\u{18}", true), Effect::Cut("afé".into()));
+        assert_eq!(r.query, "café test");
+        assert_eq!(r.press(k::KEY_v, "\u{16}", true), Effect::Paste);
+        r.shift = false;
+        r.press(k::KEY_a, "\u{1}", true);
+        r.typ("new");
+        assert_eq!(r.query, "new");
+        r.press(k::KEY_Home, "", false);
+        r.press(k::KEY_Delete, "", false);
+        assert_eq!(r.query, "ew");
+        r.query = ";sample".into();
+        r.shift = true;
+        assert_eq!(r.press(k::KEY_BackSpace, "", false), Effect::DeleteClip);
+        assert_eq!(r.query, ";sample");
     }
 
     #[test]
@@ -247,6 +369,20 @@ mod tests {
         let mut r = Rig::new("abc", 1);
         r.press(k::KEY_u, "\u{15}", true);
         assert_eq!(r.query, "");
+    }
+    #[test]
+    fn clearing_theme_filter_keeps_the_picker_mode() {
+        for (sym, utf8, ctrl) in [
+            (k::KEY_u, "\u{15}", true),
+            (k::KEY_w, "\u{17}", true),
+            (k::KEY_BackSpace, "", true),
+        ] {
+            let mut r = Rig::new("#nord", 1);
+            r.press(sym, utf8, ctrl);
+            assert_eq!(r.query, "#");
+            r.press(sym, utf8, ctrl);
+            assert_eq!(r.query, "#");
+        }
     }
     #[test]
     fn backspace_removes_a_whole_emoji() {
@@ -277,15 +413,15 @@ mod tests {
         r.press(k::KEY_Page_Down, "", false);
         assert_eq!(r.sel, 8);
         r.press(k::KEY_End, "", false);
-        assert_eq!(r.sel, 19);
+        assert_eq!(r.sel, 8);
         r.press(k::KEY_Page_Down, "", false);
-        assert_eq!(r.sel, 19);
+        assert_eq!(r.sel, 16);
         r.press(k::KEY_Home, "", false);
-        assert_eq!(r.sel, 0);
+        assert_eq!(r.edit.caret, 0);
         r.press(k::KEY_n, "\u{e}", true);
-        assert_eq!(r.sel, 1);
+        assert_eq!(r.sel, 17);
         r.press(k::KEY_p, "\u{10}", true);
-        assert_eq!(r.sel, 0);
+        assert_eq!(r.sel, 16);
         let mut empty = Rig::new("", 0);
         assert_eq!(empty.press(k::KEY_End, "", false), Effect::Moved);
         assert_eq!(empty.sel, 0);
@@ -296,6 +432,9 @@ mod tests {
         assert_eq!(r.press(k::KEY_Escape, "", false), Effect::Edited);
         assert_eq!(r.query, "");
         assert_eq!(r.press(k::KEY_Escape, "", false), Effect::Hide);
+        let mut r = Rig::new("#nord", 1);
+        assert_eq!(r.press(k::KEY_Escape, "", false), Effect::Edited);
+        assert_eq!(r.query, "");
         let mut r = Rig::new("fire", 1);
         assert_eq!(r.press(k::KEY_Escape, "", false), Effect::Hide);
         let mut r = Rig::new(";", 1);
@@ -323,16 +462,24 @@ mod tests {
         let mut r = Rig::new(":", 100);
         r.grid = true;
         r.columns = 8;
-        r.press(k::KEY_Right, "", false);
+        r.press(k::KEY_Tab, "", false);
         assert_eq!(r.sel, 1);
         r.press(k::KEY_Down, "", false);
         assert_eq!(r.sel, 9);
         r.press(k::KEY_Up, "", false);
         assert_eq!(r.sel, 1);
-        r.press(k::KEY_Left, "", false);
+        r.press(k::KEY_ISO_Left_Tab, "", false);
         assert_eq!(r.sel, 0);
         r.press(k::KEY_Page_Down, "", false);
         assert_eq!(r.sel, 64);
+    }
+    #[test]
+    fn escape_and_backspace_leave_the_trash_confirm_for_the_file_list() {
+        for key in [k::KEY_Escape, k::KEY_BackSpace] {
+            let mut r = Rig::new("confirm trash \"/h/a\"", 2);
+            assert_eq!(r.press(key, "", false), Effect::Edited);
+            assert_eq!(r.query, "/");
+        }
     }
     #[test]
     fn ctrl_comma_opens_settings() {
@@ -343,7 +490,7 @@ mod tests {
     #[test]
     fn left_right_step_only_settings_rows() {
         let mut r = Rig::new("settings", 2);
-        assert_eq!(r.press(k::KEY_Left, "", false), Effect::Ignore);
+        assert_eq!(r.press(k::KEY_Left, "", false), Effect::Moved);
         r.selected = Some(Action::Setting("width".into()));
         assert_eq!(
             r.press(k::KEY_Left, "", false),
@@ -357,10 +504,14 @@ mod tests {
     #[test]
     fn delete_removes_clipboard_entries_only_in_history() {
         let mut r = Rig::new(";", 2);
+        r.shift = true;
         assert_eq!(r.press(k::KEY_Delete, "", false), Effect::DeleteClip);
-        assert_eq!(r.press(k::KEY_x, "\u{18}", true), Effect::DeleteClip);
+        assert_eq!(
+            r.press(k::KEY_x, "\u{18}", true),
+            Effect::Cut(String::new())
+        );
         let mut r = Rig::new("fire", 2);
-        assert_eq!(r.press(k::KEY_Delete, "", false), Effect::Ignore);
+        assert_eq!(r.press(k::KEY_Delete, "", false), Effect::Edited);
     }
     #[test]
     fn only_edits_and_moves_repeat() {

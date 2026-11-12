@@ -111,6 +111,33 @@ pub fn png_size(d: &[u8]) -> Option<(u32, u32)> {
     }
 }
 
+pub fn timestamp(at: u64, now: u64) -> String {
+    let Some(age) = now.checked_sub(at) else {
+        return "Earlier".into();
+    };
+    match age {
+        0..60 => "Just now".into(),
+        60..3600 => {
+            let minutes = age / 60;
+            format!("{minutes} min{} ago", if minutes > 1 { "s" } else { "" })
+        }
+        3600..86400 => {
+            let hours = age / 3600;
+            format!("{hours} hour{} ago", if hours > 1 { "s" } else { "" })
+        }
+        _ => "Earlier".into(),
+    }
+}
+
+pub fn preview(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(100)
+        .collect()
+}
+
 pub struct Img {
     pub id: u64,
     pub png: Vec<u8>,
@@ -334,7 +361,10 @@ impl History {
                         (at.parse(), id.parse(), w.parse(), hh.parse())
                     {
                         if let Ok(png) = std::fs::read(d.join(format!("{id}.png"))) {
-                            if png.len() <= MAX_IMAGE {
+                            if png.len() <= MAX_IMAGE
+                                && png_size(&png) == Some((w, hh))
+                                && fnv(&png) == id
+                            {
                                 h.images.push(Img {
                                     id,
                                     png,
@@ -377,6 +407,58 @@ mod tests {
     fn v(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
     }
+    #[test]
+    fn timestamps_follow_clipboard_age() {
+        for (age, expected) in [
+            (0, "Just now"),
+            (59, "Just now"),
+            (60, "1 min ago"),
+            (120, "2 mins ago"),
+            (3599, "59 mins ago"),
+            (3600, "1 hour ago"),
+            (7200, "2 hours ago"),
+            (86399, "23 hours ago"),
+            (86400, "Earlier"),
+        ] {
+            assert_eq!(timestamp(100000 - age, 100000), expected);
+        }
+        assert_eq!(timestamp(100001, 100000), "Earlier");
+        assert_eq!(
+            preview("  two\nlines\twith   space"),
+            "two lines with space"
+        );
+        assert_eq!(preview(&"é".repeat(101)), "é".repeat(100));
+    }
+
+    #[test]
+    fn removing_one_copy_keeps_the_others() {
+        let mut history = History::new(4);
+        history.push("first");
+        history.push("second");
+        assert!(history.remove(&crate::items::Action::Clip("first".into())));
+        assert_eq!(texts(&history), v(&["second"]));
+        assert!(!history.remove(&crate::items::Action::Clip("missing".into())));
+        assert_eq!(texts(&history), v(&["second"]));
+        history.images.push(Img {
+            id: 1,
+            png: vec![],
+            w: 1,
+            h: 1,
+            at: 0,
+        });
+        history.images.push(Img {
+            id: 2,
+            png: vec![],
+            w: 1,
+            h: 1,
+            at: 0,
+        });
+        assert!(history.remove(&crate::items::Action::ClipImg(1)));
+        assert_eq!(history.images.iter().map(|i| i.id).collect::<Vec<_>>(), [2]);
+        assert!(!history.remove(&crate::items::Action::ClipImg(3)));
+        assert_eq!(history.images.len(), 1);
+    }
+
     #[test]
     fn mime_choice() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();
@@ -596,6 +678,61 @@ mod tests {
         let loaded = History::load_from(d.path(), 2);
         assert!(loaded.entries.is_empty());
         assert!(loaded.images.is_empty());
+    }
+    #[test]
+    fn deleting_one_entry_keeps_other_entries_and_persists_the_change() {
+        use crate::items::Action;
+        let d = tempfile::tempdir().unwrap();
+        let mut h = History::new(3);
+        assert!(h.push("first"));
+        assert!(h.push("second"));
+        assert!(h.push_image(&png(1, 1)));
+        assert!(h.push_image(&png(2, 1)));
+        let image_ids = h.images.iter().map(|i| i.id).collect::<Vec<_>>();
+        h.save_to(d.path());
+        assert!(h.remove(&Action::Clip("first".into())));
+        assert_eq!(texts(&h), v(&["second"]));
+        assert!(!h.remove(&Action::Clip("first".into())));
+        assert_eq!(h.images.iter().map(|i| i.id).collect::<Vec<_>>(), image_ids);
+        assert!(h.remove(&Action::ClipImg(image_ids[0])));
+        assert!(!h.remove(&Action::ClipImg(image_ids[0])));
+        assert_eq!(
+            h.images.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![image_ids[1]]
+        );
+        h.save_to(d.path());
+        assert!(!d.path().join(format!("{}.png", image_ids[0])).exists());
+        assert!(d.path().join(format!("{}.png", image_ids[1])).is_file());
+        let loaded = History::load_from(d.path(), 3);
+        assert_eq!(loaded.entries, h.entries);
+        assert_eq!(
+            loaded.images.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![image_ids[1]]
+        );
+        assert_eq!(loaded.images[0].png, h.images[0].png);
+    }
+    #[test]
+    fn non_clipboard_actions_cannot_remove_history() {
+        use crate::items::Action;
+        let mut h = History::new(1);
+        assert!(h.push("kept"));
+        assert!(h.push_image(&png(1, 1)));
+        let before = h.entries.clone();
+        let image = h.images[0].id;
+        for action in [
+            Action::App(0),
+            Action::View(";".into()),
+            Action::Setting("theme".into()),
+            Action::Exclude("kept".into()),
+            Action::ClearClip,
+            Action::ClipImg(u64::MAX),
+            Action::Clip("missing".into()),
+        ] {
+            assert!(!h.remove(&action), "{action:?}");
+            assert_eq!(h.entries, before);
+            assert_eq!(h.images.len(), 1);
+            assert_eq!(h.images[0].id, image);
+        }
     }
     #[test]
     fn index_escaping_round_trips_unicode_and_literal_backslashes() {

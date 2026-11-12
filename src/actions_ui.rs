@@ -14,6 +14,7 @@ pub struct PanelView<'a> {
 }
 
 pub const PANEL_HEAD: f32 = 24.0;
+pub const MIN_VIEWPORT: f32 = PANEL_HEAD + PANEL_FOOT + 3.0 * ROW + 8.0;
 /// Room below the action rows for the filter box and its margins.
 pub const PANEL_FOOT: f32 = 36.0;
 
@@ -31,8 +32,10 @@ pub struct PanelGeom {
 
 pub fn panel_layout(w: f32, list_h: f32, n: usize, sel: usize, s: f32) -> PanelGeom {
     let pw = (w * 0.46).min(380.0 * s);
-    let max_h = (list_h * s - 8.0 * s).max(ROW * s * 2.0);
-    let cap = (((max_h - (PANEL_HEAD + PANEL_FOOT) * s) / (ROW * s)).floor() as usize).max(1);
+    let max_h = (list_h * s - 8.0 * s).max(0.0);
+    let cap = ((max_h - (PANEL_HEAD + PANEL_FOOT) * s) / (ROW * s))
+        .max(0.0)
+        .floor() as usize;
     let rows = n.min(cap);
     let ph = ((PANEL_HEAD + PANEL_FOOT) * s + rows as f32 * ROW * s).min(max_h);
     let px = w - pw - 6.0 * s;
@@ -181,6 +184,11 @@ mod tests {
         assert_eq!(g.off + g.cap, 30);
         assert!(g.x >= 0.0 && g.x + g.w <= 640.0);
         assert!(g.y >= HEAD && g.y + g.h <= HEAD + 400.0);
+        let short = panel_layout(600.0, ROW, 10, 9, 1.0);
+        assert!(short.y >= HEAD && short.y + short.h <= HEAD + ROW);
+        let active = panel_layout(600.0, MIN_VIEWPORT, 10, 9, 1.0);
+        assert!(active.cap >= 3);
+        assert!(active.y + active.h <= HEAD + MIN_VIEWPORT);
         let empty = panel_layout(640.0, 400.0, 0, 0, 1.0);
         assert_eq!((empty.cap, empty.off), (0, 0));
     }
