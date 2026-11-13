@@ -19,7 +19,10 @@ fn directory_mtimes() -> BTreeMap<PathBuf, (u64, u32)> {
         .into_iter()
         .filter_map(|base| {
             let dir = base.join("applications");
-            directory_signature(&dir).map(|signature| (dir, signature))
+            // Keyed by the resolved path: Nix store directories all carry the same
+            // fixed mtime, so a rebuilt profile only shows as a new target path.
+            directory_signature(&dir)
+                .map(|signature| (dir.canonicalize().unwrap_or(dir), signature))
         })
         .collect()
 }
@@ -81,7 +84,13 @@ fn load_at(
         .ok()
         .and_then(|data| serde_json::from_slice::<Cache>(&data).ok())
     {
-        if cache.version == 1 && cache.dir_mtimes == dir_mtimes {
+        if cache.version == 2
+            && cache.dir_mtimes == dir_mtimes
+            && cache
+                .entries
+                .iter()
+                .all(|a| !a.icon.starts_with('/') || Path::new(&a.icon).exists())
+        {
             return cache.entries;
         }
     }
@@ -93,7 +102,7 @@ fn load_at(
         }
     }
     let cache = Cache {
-        version: 1,
+        version: 2,
         entries,
         dir_mtimes,
     };
@@ -200,6 +209,32 @@ fn in_place_desktop_edit_changes_the_directory_signature() {
 #[cfg(test)]
 mod icon_tests {
     use super::*;
+
+    #[test]
+    fn cached_icon_path_that_vanished_forces_a_rescan() {
+        let root = tempfile::tempdir().unwrap();
+        let icon = root.path().join("gone.svg");
+        std::fs::write(&icon, "x").unwrap();
+        let app = App {
+            name: "Icon".into(),
+            comment: String::new(),
+            exec: "true".into(),
+            icon: icon.to_string_lossy().into(),
+            terminal: false,
+        };
+        let path = root.path().join("apps.json");
+        load_at(&path, BTreeMap::new(), || vec![app.clone()]);
+        std::fs::remove_file(&icon).unwrap();
+        let fresh = App {
+            icon: String::new(),
+            ..app
+        };
+        assert_eq!(
+            load_at(&path, BTreeMap::new(), || vec![fresh.clone()]),
+            [fresh]
+        );
+    }
+
     #[test]
     fn resolved_absolute_icon_survives_cache_hit() {
         let root = tempfile::tempdir().unwrap();

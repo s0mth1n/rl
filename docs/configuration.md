@@ -14,7 +14,7 @@ store_passwords = false
 [font]
 font_family = "DejaVu Sans"
 mono_font_family = "DejaVu Sans Mono"
-font_size = 14.0
+font_size = 16.0
 ```
 
 Font settings are optional. Theme font settings override the global table at startup;

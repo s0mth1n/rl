@@ -1054,7 +1054,7 @@ impl Config {
     }
 
     pub fn startup_font_size(&self) -> f32 {
-        self.startup_fonts().font_size.unwrap_or(14.0)
+        self.startup_fonts().font_size.unwrap_or(16.0)
     }
 
     pub fn font_file(&self, bold: bool) -> Option<String> {
@@ -1265,7 +1265,7 @@ mod save_tests {
                 "{value}"
             );
             let config: Config = toml::from_str(&format!("[font]\nfont_size = {value}")).unwrap();
-            assert_eq!(config.startup_font_size(), 14.0, "{value}");
+            assert_eq!(config.startup_font_size(), 16.0, "{value}");
         }
         for value in ["nan", "inf", "0", "-1", "1025", "1e30"] {
             assert!(
@@ -1555,7 +1555,7 @@ mod tests {
         );
         cfg.theme = "missing".into();
         assert_eq!(cfg.startup_fonts(), cfg.font);
-        assert_eq!(Config::default().startup_font_size(), 14.0);
+        assert_eq!(Config::default().startup_font_size(), 16.0);
         assert!(toml::from_str::<Config>("font = 'old-path.ttf'").is_err());
         match old {
             Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),

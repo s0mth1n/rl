@@ -5,7 +5,7 @@ use crate::items::Action;
 use crate::ui::{
     Canvas, View, CLIP_TOP, HEAD, INPUT_DIM, INPUT_FG, LIST_PAD, SEPARATOR, SEPARATOR_ALPHA,
 };
-use rusttype::{Font, Scale};
+use rusttype::Font;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -233,7 +233,7 @@ fn wrap(font: &Font, size: f32, text: &str, width: f32, max_lines: usize) -> Vec
     if width <= 0.0 || max_lines == 0 {
         return Vec::new();
     }
-    let scale = Scale::uniform(size);
+    let scale = crate::ui::em_scale(font, size);
     let mut lines = Vec::new();
     let mut line = String::new();
     let mut used = 0.0;
@@ -293,7 +293,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
     let w = v.w as f32 * s;
     let h = v.h as f32 * s;
     let split = w * 0.5;
-    let fs = v.font_size * s;
+    let fs = v.font_size * 0.875 * s;
     cv.rrect(
         0.0,
         0.0,
@@ -468,7 +468,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
             + (box_h - (m.item_title_line_height + m.layout_item_description_height) * s) / 2.0;
         cv.text(
             font,
-            fs.min(14.0 * s),
+            fs,
             tx,
             text_top,
             &item.title,
@@ -538,7 +538,7 @@ fn draw_preview(
     let (x, y, pw, ph) = area;
     let s = v.scale as f32;
     let th = v.theme;
-    let fs = v.font_size * s;
+    let fs = v.font_size * 0.875 * s;
     let action = v.items.get(v.sel).map(|item| &item.action);
     if let Some(Action::ClipImg(id, _)) = action {
         if let Some(image) = history
@@ -604,13 +604,13 @@ fn draw_preview(
             return;
         }
         let line_h = 20.0 * s;
-        for (row, line) in wrap(font, fs.min(14.0 * s), text, pw, (ph / line_h) as usize)
+        for (row, line) in wrap(font, fs, text, pw, (ph / line_h) as usize)
             .iter()
             .enumerate()
         {
             cv.text(
                 font,
-                fs.min(14.0 * s),
+                fs,
                 x,
                 y + row as f32 * line_h,
                 line,

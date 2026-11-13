@@ -4,6 +4,26 @@ use crate::icons::{Cache, Icon};
 use crate::items::{Action, Item};
 use rusttype::{point, Font, Scale};
 
+/// Glyph scale for a CSS-style font size. rusttype's `Scale::uniform(n)` makes
+/// ascent-to-descent span n pixels, which draws the em about 15% smaller than
+/// the same size in a toolkit (zlaunch's GPUI uses the em). Scale by units per
+/// em instead so 14 px here is 14 px there.
+pub fn em_scale(font: &Font, size: f32) -> Scale {
+    let v = font.v_metrics_unscaled();
+    let span = v.ascent - v.descent;
+    let upem = f32::from(font.units_per_em());
+    if span > 0.0 && upem > 0.0 {
+        Scale::uniform(size * span / upem)
+    } else {
+        Scale::uniform(size)
+    }
+}
+
+/// zlaunch's rem is the configured font size, 16 by default: text_sm is 0.875 rem
+/// (14 px) and text_xs 0.75 rem (12 px).
+pub const DEFAULT_REM: f32 = 16.0;
+
+
 // Layout metrics follow zlaunch (MIT, see NOTICE): 600x400 panel, 12 px corner
 // radius, 1 px border, 57 px header (12 + 32 input + 12 + 1 separator), 8 px
 // list padding, 50 px rows, 24 px icons, 14 px titles and input text.
@@ -48,6 +68,20 @@ pub struct Canvas {
 
 #[allow(clippy::too_many_arguments)]
 impl Canvas {
+    /// A canvas that reuses `buf`'s allocation, cleared to transparent.
+    pub fn with_buffer(mut buf: Vec<u8>, w: u32, h: u32) -> Self {
+        buf.clear();
+        buf.resize((w * h * 4) as usize, 0);
+        Canvas {
+            w,
+            h,
+            buf,
+            clip_y: i32::MAX,
+            clip_top: 0,
+        }
+    }
+
+    #[allow(dead_code)]
     pub fn new(w: u32, h: u32) -> Self {
         Canvas {
             w,
@@ -91,6 +125,38 @@ impl Canvas {
         self.buf[o + 1] = (c[1] as f32 * a + self.buf[o + 1] as f32 * k) as u8;
         self.buf[o + 2] = (c[0] as f32 * a + self.buf[o + 2] as f32 * k) as u8;
         self.buf[o + 3] = (255.0 * a + self.buf[o + 3] as f32 * k) as u8;
+    }
+
+    /// Same arithmetic as `blend` for the pixels `x0..x1` of row `y`, with the
+    /// bounds and clip tests done once for the row.
+    fn blend_span(&mut self, y: i32, x0: i32, x1: i32, c: Rgb, a: f32) {
+        if y < 0 || y >= self.h as i32 || y >= self.clip_y || y < self.clip_top || a <= 0.0 {
+            return;
+        }
+        let (x0, x1) = (x0.max(0), x1.min(self.w as i32));
+        if x0 >= x1 {
+            return;
+        }
+        let k = 1.0 - a;
+        let start = ((y as u32 * self.w + x0 as u32) * 4) as usize;
+        let end = ((y as u32 * self.w + x1 as u32) * 4) as usize;
+        // One table per channel: the same float expression as `blend`, evaluated
+        // once per possible old byte instead of once per pixel.
+        let channel = |add: f32| -> [u8; 256] {
+            std::array::from_fn(|old| (add * a + old as f32 * k) as u8)
+        };
+        let lut = [
+            channel(c[2] as f32),
+            channel(c[1] as f32),
+            channel(c[0] as f32),
+            channel(255.0),
+        ];
+        for px in self.buf[start..end].as_chunks_mut::<4>().0 {
+            px[0] = lut[0][px[0] as usize];
+            px[1] = lut[1][px[1] as usize];
+            px[2] = lut[2][px[2] as usize];
+            px[3] = lut[3][px[3] as usize];
+        }
     }
 
     /// Gaussian box shadow like CSS/gpui: `blur` is the CSS blur radius (sigma = blur / 2),
@@ -210,13 +276,38 @@ impl Canvas {
             ((x + w).ceil() as i32).min(self.w as i32),
             ((y + h).ceil() as i32).min(self.h as i32),
         );
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let inside = |px: i32| {
+            let fx = px as f32 + 0.5 - x;
+            r >= 0.5 && fx >= r && fx <= w - r
+        };
+        // Columns whose centre is inside the straight part, found once per
+        // rectangle and then painted as a span instead of pixel by pixel.
+        let mut lo = ((x + r - 0.5).ceil() as i32).clamp(x0, x1);
+        let mut hi = (((x + w - r - 0.5).floor() as i32) + 1).clamp(x0, x1);
+        while lo > x0 && inside(lo - 1) {
+            lo -= 1;
+        }
+        while lo < hi && !inside(lo) {
+            lo += 1;
+        }
+        while hi < x1 && inside(hi) {
+            hi += 1;
+        }
+        while hi > lo && !inside(hi - 1) {
+            hi -= 1;
+        }
         for py in y0..y1 {
-            for px in x0..x1 {
-                let (fx, fy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
-                if r >= 0.5 && fx >= r && fx <= w - r && fy >= r && fy <= h - r {
-                    self.blend(px, py, c, alpha);
-                    continue;
-                }
+            let fy = py as f32 + 0.5 - y;
+            let straight = lo < hi && fy >= r && fy <= h - r;
+            if straight {
+                self.blend_span(py, lo, hi, c, alpha);
+            }
+            let (left_end, right_start) = if straight { (lo, hi) } else { (x1, x1) };
+            for px in (x0..left_end).chain(right_start..x1) {
+                let fx = px as f32 + 0.5 - x;
                 let dx = (r - fx).max(fx - (w - r)).max(0.0);
                 let dy = (r - fy).max(fy - (h - r)).max(0.0);
                 let d = (dx * dx + dy * dy).sqrt();
@@ -380,7 +471,7 @@ impl Canvas {
     }
 
     pub fn text_width(font: &Font, size: f32, s: &str) -> f32 {
-        let sc = Scale::uniform(size);
+        let sc = em_scale(font, size);
         font.layout(s, sc, point(0.0, 0.0)).last().map_or(0.0, |g| {
             g.position().x + g.unpositioned().h_metrics().advance_width
         })
@@ -400,7 +491,7 @@ impl Canvas {
         alpha: f32,
         max_w: f32,
     ) -> f32 {
-        let sc = Scale::uniform(size);
+        let sc = em_scale(font, size);
         let asc = font.v_metrics(sc).ascent;
         let mut text = s.to_string();
         if Self::text_width(font, size, &text) > max_w {
@@ -797,7 +888,7 @@ fn text_lh(
     alpha: f32,
     max_w: f32,
 ) {
-    let vm = font.v_metrics(Scale::uniform(size));
+    let vm = font.v_metrics(em_scale(font, size));
     let gap = (lh - (vm.ascent - vm.descent)) / 2.0;
     cv.text(font, size, x, y + gap, s, c, alpha, max_w);
 }
@@ -914,9 +1005,10 @@ fn draw_emojis(cv: &mut Canvas, font: &Font, v: &View) {
     if v.items.is_empty() {
         // zlaunch's render_empty: the message is centred in a 200px-high box
         // at the top of the list area, in empty_state_color.
-        let es = v.font_size * s;
+        let sm = v.font_size * 0.875;
+        let es = sm * s;
         let tw = Canvas::text_width(font, es, "No emojis found");
-        let lh = (v.font_size * (1.0 + 5.0_f32.sqrt()) / 2.0).round() * s;
+        let lh = (sm * (1.0 + 5.0_f32.sqrt()) / 2.0).round() * s;
         text_lh(
             cv,
             font,
@@ -1030,7 +1122,7 @@ fn input_tail<'a>(font: &Font, size: f32, query: &'a str, max_w: f32) -> &'a str
     for ((index, _), glyph) in
         query
             .char_indices()
-            .zip(font.layout(query, Scale::uniform(size), point(0.0, 0.0)))
+            .zip(font.layout(query, em_scale(font, size), point(0.0, 0.0)))
     {
         if glyph.position().x >= width - max_w {
             return &query[index..];
@@ -1051,7 +1143,7 @@ fn input_glyphs<'a>(
     text: &'a str,
 ) -> impl Iterator<Item = (usize, f32)> + 'a {
     text.char_indices()
-        .zip(font.layout(text, Scale::uniform(size), point(0.0, 0.0)))
+        .zip(font.layout(text, em_scale(font, size), point(0.0, 0.0)))
         .map(|((i, ch), glyph)| {
             (
                 i + ch.len_utf8(),
@@ -1139,8 +1231,8 @@ pub fn draw_input_with_placeholder(
 ) {
     let s = v.scale as f32;
     let w = v.w as f32 * s;
-    let fs = 16.0 * s;
-    let y = (HEAD * s - fs) / 2.0;
+    let fs = 14.0 * (v.font_size / DEFAULT_REM) * s;
+    let y = (HEAD - 16.0) / 2.0 * s;
     // Menu-entered sub-views show a back arrow; the theme picker entered
     // directly shows a palette, as zlaunch's theme mode does.
     let prefix_icon = if v.back {
@@ -1248,7 +1340,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
         return;
     }
     if v.items.is_empty() {
-        let es = v.font_size * s;
+        let es = v.font_size * 0.875 * s;
         let label = if crate::items::theme_view(v.view_query()) {
             "No themes found"
         } else {
@@ -1268,7 +1360,9 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
         );
         return;
     }
-    let title_px = 14.0 * s;
+    let rem = v.font_size / DEFAULT_REM;
+    let title_px = 14.0 * rem * s;
+    let small_px = 12.0 * rem * s;
     let m = th.metrics;
     // Clip rows at the viewport bottom so a partial row is cut mid-row,
     // like zlaunch's overflow-hidden vlist.
@@ -1281,7 +1375,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
             text_lh(
                 cv,
                 v.bold_font.unwrap_or(font),
-                12.0 * s,
+                small_px,
                 (1.0 + m.item_margin_x + m.item_padding_x) * s,
                 y + m.section_header_margin_top * s,
                 16.0 * s,
@@ -1325,7 +1419,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
             text_lh(
                 cv,
                 font,
-                14.0 * s,
+                title_px,
                 ix + 6.0 * s,
                 iy,
                 icon_size,
@@ -1370,12 +1464,12 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
                 pb.alpha,
             );
             let initial = "?";
-            let iw = Canvas::text_width(font, 14.0 * s, initial);
+            let iw = Canvas::text_width(font, title_px, initial);
             let pc = th.icon_placeholder_color;
             text_lh(
                 cv,
                 font,
-                14.0 * s,
+                title_px,
                 ix + icon_size / 2.0 - iw / 2.0,
                 iy,
                 icon_size,
@@ -1395,11 +1489,11 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
         if selected {
             let label = action_label(&it.action);
             let kw = enter_key(cv, font, s, right, y + layout.row / 2.0 * s, th);
-            let lw = Canvas::text_width(font, 12.0 * s, label);
+            let lw = Canvas::text_width(font, small_px, label);
             text_lh(
                 cv,
                 font,
-                12.0 * s,
+                small_px,
                 right - kw - 8.0 * s - lw,
                 y + (layout.row - 16.0) / 2.0 * s,
                 16.0 * s,
@@ -1459,7 +1553,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
             text_lh(
                 cv,
                 font,
-                12.0 * s,
+                small_px,
                 tx,
                 y + ((layout.row - m.item_content_height) / 2.0 + m.item_title_line_height) * s,
                 m.layout_item_description_height * s,
@@ -2269,7 +2363,7 @@ mod tests {
         let cfg = crate::config::Config::default();
         assert_eq!(
             (cfg.width, cfg.max_rows, cfg.startup_font_size()),
-            (600, 6, 14.0)
+            (600, 6, 16.0)
         );
         assert_eq!(
             (HEAD, ROW, HDR, ICON, LIST_PAD),
@@ -2356,7 +2450,7 @@ mod tests {
                 w: 600,
                 h: PANEL_HEIGHT,
                 scale: 1,
-                font_size: 14.0,
+                font_size: 16.0,
                 mono_font_family: None,
                 icons: &icons,
                 bold_font: None,
@@ -2396,7 +2490,7 @@ mod tests {
                 w: 600,
                 h: 400,
                 scale: 1,
-                font_size: 14.0,
+                font_size: 16.0,
                 mono_font_family: None,
                 icons: &icons,
                 bold_font: None,
@@ -2443,7 +2537,7 @@ mod tests {
                 w: 600,
                 h: 400,
                 scale,
-                font_size: 14.0,
+                font_size: 16.0,
                 mono_font_family: None,
                 icons: &icons,
                 bold_font: None,
@@ -2498,7 +2592,7 @@ mod tests {
                 w: 640,
                 h: PANEL_HEIGHT,
                 scale: 1,
-                font_size: 14.0,
+                font_size: 16.0,
                 mono_font_family: None,
                 icons: &icons,
                 bold_font: None,
@@ -2554,7 +2648,7 @@ mod tests {
                     w: 640,
                     h: PANEL_HEIGHT,
                     scale: 1,
-                    font_size: 14.0,
+                    font_size: 16.0,
                     mono_font_family: None,
                     icons: &icons,
                     bold_font: bf,

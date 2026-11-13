@@ -14,7 +14,149 @@ pub fn data_dirs() -> Vec<PathBuf> {
             .filter(|d| !d.is_empty())
             .map(PathBuf::from),
     );
+    // NixOS keeps system and user packages here. A daemon started with a short
+    // XDG_DATA_DIRS (a compositor autostart entry, a bare service) would otherwise
+    // miss every icon and desktop file that lives only in these profiles.
+    let user = std::env::var("USER").unwrap_or_default();
+    let mut nix = vec![
+        PathBuf::from(&home).join("../.nix-profile/share"),
+        PathBuf::from("/run/current-system/sw/share"),
+        PathBuf::from("/nix/var/nix/profiles/default/share"),
+    ];
+    if let Ok(profile_home) = std::env::var("HOME") {
+        nix.push(PathBuf::from(profile_home).join(".nix-profile/share"));
+    }
+    if !user.is_empty() {
+        nix.push(PathBuf::from(format!("/etc/profiles/per-user/{user}/share")));
+    }
+    for dir in nix {
+        let dir = dir.components().collect::<PathBuf>();
+        if dir.parent().is_some() && !v.contains(&dir) && dir.is_dir() {
+            v.push(dir);
+        }
+    }
     v
+}
+
+/// Last-resort icon search for names the theme index misses: `pixmaps` in every
+/// data dir (the reference lookup only reads /usr/share/pixmaps, which NixOS lacks)
+/// and the `apps` folders of every installed theme, whatever its index says.
+fn scan_data_dirs(name: &str) -> Option<PathBuf> {
+    scan_dirs(name, &data_dirs())
+}
+
+fn scan_dirs(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let file = |dir: &Path| -> Option<PathBuf> {
+        ["svg", "png"]
+            .iter()
+            .map(|ext| dir.join(format!("{name}.{ext}")))
+            .find(|path| path.is_file())
+    };
+    for base in dirs {
+        if let Some(path) = file(&base.join("pixmaps")) {
+            return Some(path);
+        }
+    }
+    let mut best: Option<(u32, PathBuf)> = None;
+    for base in dirs {
+        let mut roots = vec![base.join("icons")];
+        if base.ends_with(".local/share") {
+            roots.push(base.join("../.icons"));
+        }
+        for root in roots {
+            let Ok(themes) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            for theme in themes.flatten() {
+                let Ok(inner) = std::fs::read_dir(theme.path()) else {
+                    continue;
+                };
+                for first in inner.flatten() {
+                    // `48x48/apps`, `scalable/apps`, and Breeze's `apps/48`.
+                    let first_name = first.file_name().to_string_lossy().into_owned();
+                    let mut candidates = vec![first.path().join("apps")];
+                    if first_name == "apps" {
+                        candidates = std::fs::read_dir(first.path())
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                            .map(|e| e.path())
+                            .collect();
+                    }
+                    for dir in candidates {
+                        if let Some(path) = file(&dir) {
+                            let size = dir
+                                .parent()
+                                .and_then(|p| p.file_name())
+                                .or_else(|| dir.file_name())
+                                .and_then(|n| n.to_str())
+                                .and_then(|n| {
+                                    n.split('x').next()?.parse::<u32>().ok()
+                                })
+                                .unwrap_or(if path.extension().is_some_and(|e| e == "svg") {
+                                    4096
+                                } else {
+                                    0
+                                });
+                            let score = if path.extension().is_some_and(|e| e == "svg") {
+                                10_000
+                            } else {
+                                size.min(256)
+                            };
+                            if best.as_ref().is_none_or(|(s, _)| score > *s) {
+                                best = Some((score, path));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// Icon named by the desktop entry a window class belongs to: `<class>.desktop`
+/// or an entry whose StartupWMClass equals the class.
+fn desktop_entry_icon(app_id: &str) -> Option<String> {
+    desktop_entry_icon_in(app_id, &data_dirs())
+}
+
+fn desktop_entry_icon_in(app_id: &str, dirs: &[PathBuf]) -> Option<String> {
+    let lower = app_id.to_lowercase();
+    for base in dirs {
+        let Ok(files) = std::fs::read_dir(base.join("applications")) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().is_none_or(|e| e != "desktop") {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut icon = None;
+            let mut class_matches = false;
+            for line in text.lines() {
+                if let Some(v) = line.strip_prefix("Icon=") {
+                    icon.get_or_insert_with(|| v.trim().to_string());
+                } else if let Some(v) = line.strip_prefix("StartupWMClass=") {
+                    class_matches = v.trim().to_lowercase() == lower;
+                }
+                if line.starts_with('[') && !line.starts_with("[Desktop Entry]") {
+                    break;
+                }
+            }
+            if (stem == lower || class_matches) && icon.as_ref().is_some_and(|i| !i.is_empty()) {
+                return icon;
+            }
+        }
+    }
+    None
 }
 
 pub struct Icon {
@@ -125,7 +267,10 @@ pub fn find(name: &str, themes: &[String]) -> Option<PathBuf> {
             return Some(path);
         }
     }
-    freedesktop_icons::lookup(name).with_size(64).find()
+    freedesktop_icons::lookup(name)
+        .with_size(64)
+        .find()
+        .or_else(|| scan_data_dirs(name))
 }
 
 pub fn find_window(name: &str, themes: &[String]) -> Option<PathBuf> {
@@ -139,7 +284,10 @@ pub fn find_window(name: &str, themes: &[String]) -> Option<PathBuf> {
             return Some(path);
         }
     }
-    None
+    // Windows of apps whose class is not an icon name (Electron apps, KDE's
+    // org.kde.* classes): use the icon of the matching desktop entry.
+    desktop_entry_icon(name)
+        .and_then(|icon| find(&icon, themes))
 }
 
 /// Decode a PNG or SVG file to `size` x `size` premultiplied pixels.
@@ -782,6 +930,66 @@ mod resolver_tests {
             String::from_utf8_lossy(&result.stdout),
             String::from_utf8_lossy(&result.stderr)
         );
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+
+    #[test]
+    fn pixmaps_and_unindexed_theme_folders_are_searched_in_every_data_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let share = root.path().join("profile/share");
+        std::fs::create_dir_all(share.join("pixmaps")).unwrap();
+        std::fs::write(share.join("pixmaps/legacy-app.png"), b"x").unwrap();
+        // Breeze layout (apps/48) in a theme with no index.theme.
+        std::fs::create_dir_all(share.join("icons/breeze/apps/48")).unwrap();
+        std::fs::write(share.join("icons/breeze/apps/48/org.kde.plasma.emojier.svg"), b"x")
+            .unwrap();
+        std::fs::create_dir_all(share.join("icons/other/64x64/apps")).unwrap();
+        std::fs::write(share.join("icons/other/64x64/apps/claude-desktop.png"), b"x").unwrap();
+        let dirs = [root.path().join("empty"), share.clone()];
+        assert_eq!(
+            scan_dirs("legacy-app", &dirs),
+            Some(share.join("pixmaps/legacy-app.png"))
+        );
+        assert_eq!(
+            scan_dirs("org.kde.plasma.emojier", &dirs),
+            Some(share.join("icons/breeze/apps/48/org.kde.plasma.emojier.svg"))
+        );
+        assert_eq!(
+            scan_dirs("claude-desktop", &dirs),
+            Some(share.join("icons/other/64x64/apps/claude-desktop.png"))
+        );
+        assert_eq!(scan_dirs("nothing-here", &dirs), None);
+    }
+
+    #[test]
+    fn window_class_finds_its_desktop_entry_icon() {
+        let root = tempfile::tempdir().unwrap();
+        let apps = root.path().join("applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        std::fs::write(
+            apps.join("claude-desktop.desktop"),
+            "[Desktop Entry]\nName=Claude\nIcon=claude-icon\nStartupWMClass=Claude\n",
+        )
+        .unwrap();
+        std::fs::write(
+            apps.join("org.kde.systemmonitor.desktop"),
+            "[Desktop Entry]\nName=Monitor\nIcon=utilities-system-monitor\n",
+        )
+        .unwrap();
+        let dirs = [root.path().to_path_buf()];
+        assert_eq!(
+            desktop_entry_icon_in("Claude", &dirs).as_deref(),
+            Some("claude-icon")
+        );
+        assert_eq!(
+            desktop_entry_icon_in("org.kde.SystemMonitor", &dirs).as_deref(),
+            Some("utilities-system-monitor")
+        );
+        assert_eq!(desktop_entry_icon_in("unknown", &dirs), None);
     }
 }
 

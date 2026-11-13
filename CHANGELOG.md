@@ -16,6 +16,14 @@ the project uses semantic versioning.
 - Installer offers distro packages for build/runtime dependencies, verifies fonts
   and Rust, and points NixOS/immutable systems to their native setup.
 - The Wayland connection error now says what to check.
+- Text now draws at the same pixel sizes as zlaunch (14 px titles and input, 12 px
+  descriptions and headers); the default `font_size` is 16, as zlaunch's rem.
+- Repaints are batched per event burst and reuse one pixel buffer, so fast scrolling
+  and key repeat no longer queue frames.
+- Icons missing from the theme index are found in pixmaps and theme folders of every
+  data dir, including NixOS profiles; windows fall back to their desktop entry's icon.
+- The application cache follows Nix profile rebuilds and drops entries whose icon
+  file is gone.
 - README rewritten for users; development notes moved to docs/development.md.
 
 ## [0.1.0]
