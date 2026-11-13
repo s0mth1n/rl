@@ -26,7 +26,7 @@ impl Hist {
     }
     pub fn load() -> Hist {
         let mut h = Hist::default();
-        if let Ok(s) = std::fs::read_to_string(Self::path()) {
+        if let Ok(s) = crate::state_io::read_to_string(Self::path()) {
             for l in s.lines() {
                 let mut p = l.splitn(3, '\t');
                 if let (Some(c), Some(t), Some(k)) = (p.next(), p.next(), p.next()) {
@@ -37,7 +37,7 @@ impl Hist {
             }
         }
         let pins_path = Self::path().with_file_name("pins");
-        match std::fs::read_to_string(&pins_path) {
+        match crate::state_io::read_to_string(&pins_path) {
             Ok(s) => {
                 h.pins = s
                     .lines()
@@ -45,13 +45,15 @@ impl Hist {
                     .map(String::from)
                     .collect();
             }
-            Err(_) => {
+            Err(error) => {
                 // No pins file yet: seed the default favorite, like vicinae ships clipboard:history.
                 h.pins = vec![SEED_PIN.to_string()];
-                if let Some(d) = pins_path.parent() {
-                    let _ = std::fs::create_dir_all(d);
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    if let Some(d) = pins_path.parent() {
+                        let _ = std::fs::create_dir_all(d);
+                    }
+                    let _ = crate::state_io::write(&pins_path, format!("{SEED_PIN}\n"));
                 }
-                let _ = std::fs::write(&pins_path, format!("{SEED_PIN}\n"));
             }
         }
         h
@@ -78,7 +80,7 @@ impl Hist {
             .filter(|k| !k.contains('\n'))
             .map(|k| format!("{k}\n"))
             .collect();
-        let _ = std::fs::write(&p, body);
+        let _ = crate::state_io::write(&p, body);
     }
     /// Pin or unpin a result. Returns true when it is now pinned.
     pub fn toggle_pin(&mut self, key: &str) -> bool {
@@ -129,7 +131,7 @@ impl Hist {
             .map(|(k, (c, t))| format!("{c}\t{t}\t{k}\n"))
             .collect();
         let tmp = p.with_extension("tmp");
-        if std::fs::write(&tmp, body).is_ok() {
+        if crate::state_io::write(&tmp, body).is_ok() {
             let _ = std::fs::rename(&tmp, &p);
         }
     }
@@ -141,7 +143,7 @@ pub fn file_path() -> std::path::PathBuf {
 }
 
 pub fn file_recent() -> Vec<String> {
-    std::fs::read_to_string(file_path())
+    crate::state_io::read_to_string(file_path())
         .unwrap_or_default()
         .lines()
         .filter(|l| !l.is_empty())
@@ -158,7 +160,7 @@ pub fn file_add(p: &str) {
     if let Some(d) = f.parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    let _ = std::fs::write(f, v.join("\n") + "\n");
+    let _ = crate::state_io::write(f, v.join("\n") + "\n");
 }
 
 /// Recently launched apps: one name per line, newest first.
@@ -167,7 +169,7 @@ pub fn app_path() -> std::path::PathBuf {
 }
 
 pub fn app_recent() -> Vec<String> {
-    std::fs::read_to_string(app_path())
+    crate::state_io::read_to_string(app_path())
         .unwrap_or_default()
         .lines()
         .filter(|l| !l.is_empty())
@@ -184,7 +186,7 @@ pub fn app_add(name: &str) {
     if let Some(d) = f.parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    let _ = std::fs::write(f, v.join("\n") + "\n");
+    let _ = crate::state_io::write(f, v.join("\n") + "\n");
 }
 
 /// Calculator history: one "expression = result" line per copied answer, newest last.
@@ -219,7 +221,7 @@ fn calc_line_is_pinned(line: &str, h: &Hist) -> bool {
 
 pub fn calc_add(expr: &str, result: &str) {
     let p = calc_path();
-    let mut lines: Vec<String> = std::fs::read_to_string(&p)
+    let mut lines: Vec<String> = crate::state_io::read_to_string(&p)
         .unwrap_or_default()
         .lines()
         .map(String::from)
@@ -246,12 +248,12 @@ pub fn calc_add(expr: &str, result: &str) {
     if let Some(d) = p.parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    let _ = std::fs::write(p, lines.join("\n") + "\n");
+    let _ = crate::state_io::write(p, lines.join("\n") + "\n");
 }
 
 pub fn calc_del(expr: &str, result: &str) {
     let p = calc_path();
-    let lines: Vec<String> = std::fs::read_to_string(&p)
+    let lines: Vec<String> = crate::state_io::read_to_string(&p)
         .unwrap_or_default()
         .lines()
         .filter(|l| {
@@ -262,7 +264,7 @@ pub fn calc_del(expr: &str, result: &str) {
         })
         .map(String::from)
         .collect();
-    let _ = std::fs::write(
+    let _ = crate::state_io::write(
         p,
         lines.join("\n") + if lines.is_empty() { "" } else { "\n" },
     );
@@ -271,18 +273,18 @@ pub fn calc_del(expr: &str, result: &str) {
 pub fn calc_clear() {
     // Pinned entries survive, like pinned clipboard entries do.
     let h = Hist::load();
-    let kept: String = std::fs::read_to_string(calc_path())
+    let kept: String = crate::state_io::read_to_string(calc_path())
         .unwrap_or_default()
         .lines()
         .filter(|l| calc_line_is_pinned(l, &h))
         .map(|l| format!("{l}\n"))
         .collect();
-    let _ = std::fs::write(calc_path(), kept);
+    let _ = crate::state_io::write(calc_path(), kept);
 }
 
 /// Newest first: (expression, result, unix seconds when known).
 pub fn calc_list() -> Vec<(String, String, Option<u64>)> {
-    std::fs::read_to_string(calc_path())
+    crate::state_io::read_to_string(calc_path())
         .unwrap_or_default()
         .lines()
         .rev()
@@ -297,7 +299,7 @@ pub fn calc_list() -> Vec<(String, String, Option<u64>)> {
 /// Recent search queries, newest first, one per line. Used by Up-arrow recall in the empty search.
 pub fn queries() -> Vec<String> {
     let p = Hist::path().with_file_name("queries");
-    std::fs::read_to_string(p)
+    crate::state_io::read_to_string(p)
         .map(|s| {
             s.lines()
                 .filter(|l| !l.is_empty())
@@ -329,18 +331,7 @@ pub fn add_query(q: &str) {
         let _ = std::fs::create_dir_all(d);
     }
     let body: String = v.iter().map(|x| format!("{x}\n")).collect();
-    use std::os::unix::fs::OpenOptionsExt;
-    if std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&p)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, body.as_bytes()))
-        .is_err()
-    {
-        let _ = std::fs::write(&p, body);
-    }
+    let _ = crate::state_io::write(&p, body);
 }
 
 #[cfg(test)]

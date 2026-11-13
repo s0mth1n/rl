@@ -31,6 +31,8 @@ mod items;
 mod scorer;
 #[path = "../src/scroll.rs"]
 mod scroll;
+#[path = "../src/state_io.rs"]
+mod state_io;
 #[path = "../src/system_actions.rs"]
 mod system_actions;
 #[cfg(test)]

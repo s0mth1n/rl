@@ -83,42 +83,18 @@ pub fn evaluate_expression(input: &str) -> Result<CalculatorItem, String> {
 
 /// Format a number for display with thousand separators.
 fn format_display(value: &str) -> String {
-    // Convert to f64, else return the original string
-    let Ok(number) = value.parse::<f64>() else {
-        return value.to_string();
-    };
-    if number.fract() == 0.0 {
-        if number.abs() < 1e15 {
-            // Integer display with thousand separators
-            return format_with_separators(number as i64);
+    if let Some((integer, fraction)) = value.split_once('.') {
+        if !fraction.is_empty() && fraction.bytes().all(|b| b.is_ascii_digit()) {
+            if let Some(integer) = separate_exact_integer(integer) {
+                return format!("{integer}.{fraction}");
+            }
         }
-        // Past 2^53 an f64 cannot hold the integer exactly and an i64
-        // overflows outright, so dress up fend's exact digits instead.
-        return separate_exact_integer(value).unwrap_or_else(|| value.to_string());
+        return value.to_string();
     }
-    // Decimal display
-    let formatted = format!("{:.10}", number);
-    let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
-
-    // Add thousand separators to the integer part
-    if let Some(dot_pos) = trimmed.find('.') {
-        let (int_part, dec_part) = trimmed.split_at(dot_pos);
-        let int_val: i64 = int_part.parse().unwrap_or(0);
-        // "-0" parses to 0, which would drop the sign of proper fractions.
-        let sign = if int_val == 0 && number.is_sign_negative() {
-            "-"
-        } else {
-            ""
-        };
-        format!("{}{}{}", sign, format_with_separators(int_val), dec_part)
-    } else {
-        // The fraction rounded away at ten decimal places; fend's own
-        // rendering keeps the nonzero digits.
-        value.to_string()
-    }
+    separate_exact_integer(value).unwrap_or_else(|| value.to_string())
 }
 
-/// Thousand separators for fend's exact integer strings beyond f64 precision.
+/// Thousand separators for fend's exact integer strings.
 fn separate_exact_integer(raw: &str) -> Option<String> {
     let (sign, digits) = match raw.strip_prefix('-') {
         Some(rest) => ("-", rest),
@@ -139,28 +115,6 @@ fn separate_exact_integer(raw: &str) -> Option<String> {
         sign,
         result.chars().rev().collect::<String>()
     ))
-}
-
-/// Format an integer with thousand separators.
-fn format_with_separators(value: i64) -> String {
-    let is_negative = value < 0;
-    let abs_value = value.abs();
-    let s = abs_value.to_string();
-
-    let mut result = String::new();
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(c);
-    }
-
-    let formatted: String = result.chars().rev().collect();
-    if is_negative {
-        format!("-{}", formatted)
-    } else {
-        formatted
-    }
 }
 
 #[cfg(test)]
@@ -259,5 +213,49 @@ mod big_small_tests {
         assert_eq!(result.text_for_clipboard(), "0.00000000001");
         let result = evaluate_expression("-10^-11").unwrap();
         assert_eq!(result.display_result, "-0.00000000001");
+    }
+}
+
+#[cfg(test)]
+mod exact_decimal_tests {
+    use super::{evaluate_expression, format_display};
+
+    #[test]
+    fn decimal_display_keeps_fends_exact_digits() {
+        for (input, display) in [
+            ("99999999999999.99", "99,999,999,999,999.99"),
+            ("123456789.123456789", "123,456,789.123456789"),
+            ("-99999999999999.99", "-99,999,999,999,999.99"),
+            ("-0.123456789012345", "-0.123456789012345"),
+            ("999999999999999.99", "999,999,999,999,999.99"),
+        ] {
+            let item = evaluate_expression(input).unwrap();
+            assert_eq!(item.display_result, display);
+            assert_eq!(item.text_for_clipboard(), input);
+            assert!(!item.is_error);
+        }
+    }
+
+    #[test]
+    fn decimal_formatting_leaves_nonnumbers_unchanged() {
+        for text in [
+            "approx. 0.3333333333",
+            "5000 m",
+            "0 °C",
+            "0 + i",
+            "1e100",
+            "NaN",
+            "inf",
+            "",
+            "1.",
+            ".5",
+        ] {
+            assert_eq!(format_display(text), text);
+        }
+        assert_eq!(format_display("0"), "0");
+        assert_eq!(
+            format_display("-0.0000000000000000001"),
+            "-0.0000000000000000001"
+        );
     }
 }

@@ -76,7 +76,7 @@ pub fn scan_apps(_cfg: &Config) -> Vec<App> {
             if desktop_ids.contains(&id) {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            let Ok(text) = crate::state_io::read_to_string(&path) else {
                 continue;
             };
             if let Some(app) = parse_desktop_path(&path, &text) {
