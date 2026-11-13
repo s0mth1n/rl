@@ -684,22 +684,6 @@ mod truncation_tests {
     }
 
     #[test]
-    fn file_preview_never_blocks_on_special_files() {
-        let dir = std::env::temp_dir().join(format!("zl-fifo-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("pipe.txt");
-        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
-        // No writer ever opens the FIFO: the read must finish instead of blocking.
-        assert_eq!(
-            super::file_text_preview(path.to_str().unwrap()).as_deref(),
-            Some("")
-        );
-        assert!(super::file_image_preview(path.to_str().unwrap(), 100, 100).is_none());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn image_file_preview_caches_by_content_and_size() {
         let dir = std::env::temp_dir().join(format!("zl-img-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

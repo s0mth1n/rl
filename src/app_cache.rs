@@ -77,7 +77,7 @@ fn load_at(
     dir_mtimes: BTreeMap<PathBuf, (u64, u32)>,
     scan: impl FnOnce() -> Vec<App>,
 ) -> Vec<App> {
-    if let Some(cache) = std::fs::read(path)
+    if let Some(cache) = crate::state_io::read(path, crate::state_io::MAX_STATE)
         .ok()
         .and_then(|data| serde_json::from_slice::<Cache>(&data).ok())
     {
@@ -101,7 +101,7 @@ fn load_at(
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, serde_json::to_vec_pretty(&cache)?)?;
+        crate::state_io::write(path, serde_json::to_vec_pretty(&cache)?)?;
         Ok(())
     };
     if let Err(error) = save() {

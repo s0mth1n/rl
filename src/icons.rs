@@ -63,8 +63,13 @@ pub fn phosphor(name: &str) -> Option<&'static [u8]> {
     })
 }
 
+fn read_theme_setting(path: impl AsRef<Path>) -> std::io::Result<String> {
+    String::from_utf8(crate::state_io::read(path, 1024 * 1024)?)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 fn desktop_theme(config: &Path) -> Option<String> {
-    if let Ok(source) = std::fs::read_to_string(config.join("kdeglobals")) {
+    if let Ok(source) = read_theme_setting(config.join("kdeglobals")) {
         let mut icons = false;
         for line in source.lines().map(str::trim) {
             if line.starts_with('[') {
@@ -79,7 +84,7 @@ fn desktop_theme(config: &Path) -> Option<String> {
         }
     }
     for file in ["gtk-3.0/settings.ini", "gtk-4.0/settings.ini"] {
-        if let Ok(source) = std::fs::read_to_string(config.join(file)) {
+        if let Ok(source) = read_theme_setting(config.join(file)) {
             for line in source.lines().map(str::trim) {
                 if let Some(theme) = line.strip_prefix("gtk-icon-theme-name=") {
                     return Some(theme.into());
@@ -140,7 +145,7 @@ pub fn find_window(name: &str, themes: &[String]) -> Option<PathBuf> {
 /// Decode a PNG or SVG file to `size` x `size` premultiplied pixels.
 pub fn load(path: &Path, size: u32) -> Option<Icon> {
     let ext = path.extension()?.to_str()?.to_lowercase();
-    let data = std::fs::read(path).ok()?;
+    let data = crate::state_io::read(path, 8 * 1024 * 1024).ok()?;
     if data.len() > 8 * 1024 * 1024 {
         return None;
     }

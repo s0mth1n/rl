@@ -162,7 +162,7 @@ impl Img {
         if let Some(png) = &self.png {
             return Some(png.clone());
         }
-        let png = std::fs::read(&self.path).ok()?;
+        let png = crate::state_io::read(&self.path, MAX_IMAGE).ok()?;
         if png.len() > MAX_IMAGE || png_size(&png) != Some((self.w, self.h)) || fnv(&png) != self.id
         {
             return None;
@@ -505,8 +505,7 @@ impl History {
     }
 
     pub fn save_to(&self, d: &std::path::Path) {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::PermissionsExt;
         if std::fs::create_dir_all(d).is_err() {
             return;
         }
@@ -523,24 +522,11 @@ impl History {
             s.push_str(&format!("i\t{}\t{}\t{}\t{}\n", i.at, i.id, i.w, i.h));
             let p = d.join(format!("{}.png", i.id));
             if let Some(png) = &i.png {
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&p)
-                {
-                    if file
-                        .set_permissions(std::fs::Permissions::from_mode(0o600))
-                        .is_ok()
-                    {
-                        let _ = file.write_all(png);
-                    }
-                }
-            } else if !p.exists() && i.path.is_file() {
+                let _ = crate::state_io::write(&p, png);
+            } else if !p.exists() {
                 // Stored image saved under another directory: carry the file.
-                if std::fs::copy(&i.path, &p).is_ok() {
-                    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+                if let Some(png) = i.bytes() {
+                    let _ = crate::state_io::write(&p, png);
                 }
             }
         }
@@ -559,20 +545,8 @@ impl History {
             }
         }
         let tmp = d.join("state.tmp");
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-        {
-            if file
-                .set_permissions(std::fs::Permissions::from_mode(0o600))
-                .is_ok()
-                && file.write_all(s.as_bytes()).is_ok()
-            {
-                let _ = std::fs::rename(&tmp, d.join("state"));
-            }
+        if crate::state_io::write(&tmp, s).is_ok() {
+            let _ = std::fs::rename(&tmp, d.join("state"));
         }
     }
 
@@ -583,7 +557,7 @@ impl History {
 
     pub fn load_from(d: &std::path::Path, max: usize) -> History {
         let mut h = History::new(max);
-        let Ok(s) = std::fs::read_to_string(d.join("state")) else {
+        let Ok(s) = crate::state_io::read_to_string(d.join("state")) else {
             return h;
         };
         for l in s.lines().skip(1) {
@@ -609,7 +583,7 @@ impl History {
                         // only the file's presence and size are checked here.
                         let path = d.join(format!("{id}.png"));
                         if let Ok(meta) = std::fs::metadata(&path) {
-                            if (24..=MAX_IMAGE as u64).contains(&meta.len()) {
+                            if meta.is_file() && (24..=MAX_IMAGE as u64).contains(&meta.len()) {
                                 h.images.push(Img {
                                     id,
                                     png: None,

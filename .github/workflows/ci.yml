@@ -15,5 +15,7 @@ jobs:
       - run: cargo test --release
       - run: cargo clippy --release --all-targets -- -D warnings
       - run: cargo build --release --examples && cargo build --release
+      - run: python3 tests/install-readme.py
+      - run: ZL_BIN=target/release/zl python3 tests/output-removal.py
       - name: Basic headless scenario
         run: timeout --kill-after=5s 3m bash tests/headless.sh bash tests/basic.sh

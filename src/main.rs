@@ -23,6 +23,7 @@ mod modes;
 mod scorer;
 mod scroll;
 mod socket_path;
+mod state_io;
 mod system_actions;
 #[cfg(test)]
 mod testutil;
@@ -135,6 +136,7 @@ fn panel_position(width: u32, height: u32, panel_width: u32, panel_height: u32) 
 }
 
 struct Out {
+    global_name: u32,
     obj: WlOutput,
     name: String,
     scale: u32,
@@ -571,6 +573,9 @@ impl App {
     }
 
     fn hide(&mut self) {
+        if let Some(compose) = &mut self.compose {
+            compose.reset();
+        }
         self.active_output = None;
         self.theme_catalog = None;
         self.theme_palettes.clear();
@@ -1538,6 +1543,18 @@ impl Dispatch<WlRegistry, ()> for App {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
+        if let wayland_client::protocol::wl_registry::Event::GlobalRemove { name } = ev {
+            if let Some(index) = a.outputs.iter().position(|o| o.global_name == name) {
+                let output = a.outputs.remove(index);
+                if a.active_output.as_ref() == Some(&output.obj) {
+                    a.active_output = None;
+                }
+                if output.obj.version() >= 3 {
+                    output.obj.release();
+                }
+            }
+            return;
+        }
         if let wayland_client::protocol::wl_registry::Event::Global {
             name,
             interface,
@@ -1561,6 +1578,7 @@ impl Dispatch<WlRegistry, ()> for App {
                 "wl_output" => {
                     let o: WlOutput = r.bind(name, 4.min(version), qh, ());
                     a.outputs.push(Out {
+                        global_name: name,
                         obj: o,
                         name: String::new(),
                         scale: 1,
@@ -2111,7 +2129,11 @@ fn load_font(cfg: &Config) -> Font<'static> {
     cfg.font_file(false)
         .into_iter()
         .chain(["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf".into()])
-        .find_map(|p| std::fs::read(p).ok().and_then(Font::try_from_vec))
+        .find_map(|p| {
+            crate::state_io::read(p, 256 * 1024 * 1024)
+                .ok()
+                .and_then(Font::try_from_vec)
+        })
         .unwrap_or_else(|| {
             eprintln!("zl: no usable font found");
             std::process::exit(1)
@@ -2122,7 +2144,11 @@ fn load_bold_font(cfg: &Config) -> Option<Font<'static>> {
     cfg.font_file(true)
         .into_iter()
         .chain(["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf".into()])
-        .find_map(|p| std::fs::read(p).ok().and_then(Font::try_from_vec))
+        .find_map(|p| {
+            crate::state_io::read(p, 256 * 1024 * 1024)
+                .ok()
+                .and_then(Font::try_from_vec)
+        })
 }
 
 fn main() {
@@ -2202,6 +2228,14 @@ fn main() {
 fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     launch::capture_environment();
     let cfg = Config::load();
+    // Guard against two daemons racing past the connect check: without the
+    // lock the second unlinks the first's live socket and both stay running.
+    let lock_path = format!("{}.lock", sock());
+    let Some(_daemon_lock) = socket_path::DaemonLock::acquire(std::path::Path::new(&lock_path))?
+    else {
+        eprintln!("zl: already running");
+        return Ok(());
+    };
     if UnixStream::connect(sock()).is_ok() {
         eprintln!("zl: already running");
         return Ok(());
@@ -2632,6 +2666,87 @@ mod picker_tests {
             own_source: None,
         }
     }
+    #[test]
+    fn removed_outputs_leave_no_stale_scale_or_active_reference() {
+        let _env = crate::testutil::ENV_LOCK.lock().unwrap();
+        for version in 1..=4 {
+            let (socket, _server) = std::os::unix::net::UnixStream::pair().unwrap();
+            let connection = Connection::from_socket(socket).unwrap();
+            let queue = connection.new_event_queue::<App>();
+            let qh = queue.handle();
+            let registry = connection.display().get_registry(&qh, ());
+            let live: WlOutput = registry.bind(50, version, &qh, ());
+            let removed: WlOutput = registry.bind(100, version, &qh, ());
+            let mut a = app(Config::default());
+            a.outputs = vec![
+                Out {
+                    global_name: 50,
+                    obj: live.clone(),
+                    name: "LIVE".into(),
+                    scale: 1,
+                },
+                Out {
+                    global_name: 100,
+                    obj: removed.clone(),
+                    name: "REMOVED".into(),
+                    scale: 4,
+                },
+            ];
+            a.active_output = Some(live.clone());
+            for name in [9999, 100, 100] {
+                <App as Dispatch<WlRegistry, ()>>::event(
+                    &mut a,
+                    &registry,
+                    wayland_client::protocol::wl_registry::Event::GlobalRemove { name },
+                    &(),
+                    &connection,
+                    &qh,
+                );
+                assert_eq!(a.active_output.as_ref(), Some(&live));
+            }
+            assert_eq!(a.outputs.len(), 1);
+            assert_eq!(a.outputs[0].obj, live);
+            assert_eq!(a.outputs.iter().map(|o| o.scale).max(), Some(1));
+            a.active_output = Some(live);
+            <App as Dispatch<WlRegistry, ()>>::event(
+                &mut a,
+                &registry,
+                wayland_client::protocol::wl_registry::Event::GlobalRemove { name: 50 },
+                &(),
+                &connection,
+                &qh,
+            );
+            assert!(a.outputs.is_empty());
+            assert!(a.active_output.is_none());
+        }
+    }
+
+    #[test]
+    fn hiding_cancels_partial_keyboard_compose_sequences() {
+        let _env = crate::testutil::ENV_LOCK.lock().unwrap();
+        let mut a = app(Config::default());
+        let table = xkb::compose::Table::new_from_locale(
+            &a.ctx,
+            std::ffi::OsStr::new("C.UTF-8"),
+            xkb::compose::COMPILE_NO_FLAGS,
+        )
+        .unwrap();
+        a.compose = Some(xkb::compose::State::new(
+            &table,
+            xkb::compose::STATE_NO_FLAGS,
+        ));
+        for first in [xkb::keysyms::KEY_Multi_key, xkb::keysyms::KEY_dead_acute] {
+            let compose = a.compose.as_mut().unwrap();
+            compose.feed(first.into());
+            assert_eq!(compose.status(), xkb::compose::Status::Composing);
+            a.hide();
+            let compose = a.compose.as_mut().unwrap();
+            assert_eq!(compose.status(), xkb::compose::Status::Nothing);
+            compose.feed(xkb::keysyms::KEY_e.into());
+            assert_eq!(compose.status(), xkb::compose::Status::Nothing);
+        }
+    }
+
     fn scroll_fixture(query: &str) -> App {
         let mut a = app(Config::default());
         a.query = query.into();

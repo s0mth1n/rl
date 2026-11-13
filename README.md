@@ -37,6 +37,7 @@ binary path before use.
 
 ```sh
 install -Dm755 target/release/zl ~/.local/bin/zl
+mkdir -p ~/.local/share/applications ~/.config/systemd/user
 sed "s|@BINARY@|$HOME/.local/bin/zl|" packaging/zl.desktop > ~/.local/share/applications/zl.desktop
 sed "s|@BINARY@|$HOME/.local/bin/zl|" packaging/zl.service > ~/.config/systemd/user/zl.service
 install -Dm644 packaging/zl.svg ~/.local/share/icons/hicolor/scalable/apps/zl.svg
@@ -51,7 +52,7 @@ Type to search applications. Select Emoji Picker, Clipboard History or Themes
 from the launcher, or type `:`, `;` or `#` directly.
 Use Up/Down or Tab/Shift-Tab to select and Enter to activate. Escape clears
 the current view, then closes the panel. Ctrl+A selects the query; Backspace then clears it. Home and End move the
-text caret, and Shift extends the text selection. A double click activates a row. In the emoji grid,
+text caret, and Shift extends the text selection. Click a row to activate it. In the emoji grid,
 Left/Right moves one cell and Up/Down moves one grid row, wrapping in the
 same column. Search covers the full emoji list.
 
@@ -104,6 +105,11 @@ Copies marked with password-manager/concealed MIME hints are ignored unless
 Text is capped at 16 KiB and PNG data at 4 MiB per image; text and images
 share the history limit.
 An omitted or zero `max_clipboard_history` uses 500 entries.
+PNG/SVG icon images must be regular files up to 8 MiB. KDE/GTK icon-theme settings
+are limited to 1 MiB and skip unreadable sources in the usual fallback order.
+Persistent history and application-cache reads accept only regular files up to
+64 MiB; stored PNG reads keep the 4 MiB image limit. Writes reject symlinks and
+non-regular destinations, including staging files.
 Emoji sequences copy in full; some color-font
 sequences display their first base glyph rather than a composed glyph.
 

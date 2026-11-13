@@ -55,6 +55,11 @@ for i in $(seq 40); do
 done
 [ -n "${WAYLAND_DISPLAY:-}" ] || { echo 'headless Wayland socket timed out' >&2; exit 1; }
 Z=${ZL_BIN:-$here/target/release/zl}
+# A stale binary makes a pass meaningless: fail when any source file is newer.
+if [ -n "$(find "$here/src" "$here/Cargo.toml" "$here/Cargo.lock" -newer "$Z" -print -quit 2>/dev/null)" ]; then
+    echo "stale binary: $Z is older than src/; rebuild with cargo build --release --locked --examples --bins" >&2
+    exit 1
+fi
 "$Z" >"$OUT/zl.log" 2>&1 & zd=$!
 record_test_pid "$zd"
 ready=0

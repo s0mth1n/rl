@@ -957,12 +957,38 @@ pub fn theme_fonts(name: &str) -> Option<FontConfig> {
     )
 }
 
+fn read_source(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    const MAX_SOURCE: u64 = 1024 * 1024;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_SOURCE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "config source is not a regular file up to 1 MiB",
+        ));
+    }
+    let mut text = String::new();
+    file.take(MAX_SOURCE + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_SOURCE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "config source exceeds 1 MiB",
+        ));
+    }
+    Ok(text)
+}
+
 fn custom_theme_source(name: &str) -> Option<String> {
     // A theme name is a filename stem, never a path outside the themes directory.
     if name.is_empty() || name.contains(['/', '\\']) || name == "." || name == ".." {
         return None;
     }
-    std::fs::read_to_string(
+    read_source(
         Config::path()
             .parent()?
             .join("themes")
@@ -1149,7 +1175,7 @@ impl Config {
     }
     /// Load the config. A missing file gives defaults; a broken one is reported and defaults are used.
     pub fn load() -> Config {
-        match std::fs::read_to_string(Self::path()) {
+        match read_source(Self::path()) {
             Ok(s) => match toml::from_str::<Config>(&s) {
                 Ok(mut c) => {
                     for (field, warning) in c.validation_warnings() {
@@ -1192,14 +1218,17 @@ pub fn save(cfg: &Config) -> bool {
     let temp = path.with_extension("toml.tmp");
     let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
-        .truncate(true)
         .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
         .mode(0o600)
         .open(&temp)
     else {
         return false;
     };
-    file.write_all(text.as_bytes()).is_ok() && std::fs::rename(temp, path).is_ok()
+    file.metadata().is_ok_and(|metadata| metadata.is_file())
+        && file.set_len(0).is_ok()
+        && file.write_all(text.as_bytes()).is_ok()
+        && std::fs::rename(temp, path).is_ok()
 }
 
 /// Update the selected theme and save only when a config file already exists.
