@@ -166,6 +166,10 @@ struct App {
     text_waiting: bool,
     text_snapshot: Option<ime::Snapshot>,
     caret_visible: bool,
+    /// A repaint was requested since the last one.
+    dirty: bool,
+    /// Pixel buffer kept between frames so each one reuses its memory.
+    frame: Vec<u8>,
     caret_next: Instant,
     sel: usize,
     top: usize,
@@ -624,7 +628,14 @@ impl App {
         self.configured = false;
     }
 
-    fn redraw(&mut self, qh: &QueueHandle<App>) {
+    /// Ask for a repaint. Events that arrive together (key repeat, wheel and touchpad
+    /// bursts) share one `paint` after the batch is dispatched, so a slow frame never
+    /// leaves a queue of stale ones behind it.
+    fn redraw(&mut self, _qh: &QueueHandle<App>) {
+        self.dirty = true;
+    }
+
+    fn paint(&mut self, qh: &QueueHandle<App>) {
         if !self.shown || !self.configured {
             return;
         }
@@ -693,7 +704,7 @@ impl App {
         };
         self.update_text_input(false);
         let Some(surf) = &self.surface else { return };
-        let mut cv = ui::Canvas::new(physical_w, physical_h);
+        let mut cv = ui::Canvas::with_buffer(std::mem::take(&mut self.frame), physical_w, physical_h);
         let composition = self.ime.display(&self.query, &self.edit);
         let (caret, anchor, visible) = composition.as_ref().map_or(
             (self.edit.caret, self.edit.anchor, self.caret_visible),
@@ -764,6 +775,7 @@ impl App {
         if let Some(o) = self.buffer.replace(buf) {
             o.destroy();
         }
+        self.frame = cv.buf;
     }
 
     fn configure_backdrop(&mut self, width: u32, height: u32, qh: &QueueHandle<App>) -> bool {
@@ -2276,6 +2288,8 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
         text_waiting: false,
         text_snapshot: None,
         caret_visible: true,
+        dirty: false,
+        frame: Vec::new(),
         caret_next: Instant::now(),
         sel: 0,
         top: 0,
@@ -2344,6 +2358,9 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         launch::reap(&mut app.launched);
         queue.dispatch_pending(&mut app)?;
+        if std::mem::take(&mut app.dirty) {
+            app.paint(&qh);
+        }
         queue.flush()?;
         let Some(guard) = queue.prepare_read() else {
             continue;
@@ -2613,6 +2630,8 @@ mod picker_tests {
             text_waiting: false,
             text_snapshot: None,
             caret_visible: true,
+            dirty: false,
+            frame: Vec::new(),
             caret_next: Instant::now(),
             sel: 0,
             top: 0,

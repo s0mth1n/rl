@@ -152,6 +152,48 @@ fn main() {
         samples.push(t.elapsed().as_secs_f64() * 1e6);
     }
     report("max_top_600_apps", samples);
+    // Fast scrolling through the whole 600-row list: one full-panel draw per
+    // step, as a key repeat or wheel event does, at 1x, 2x and 3x output scale.
+    for scale in [1u32, 2, 3] {
+        let mut samples = Vec::new();
+        let (pw, ph) = (600 * scale, ui::PANEL_HEIGHT * scale);
+        for i in 0..160usize {
+            let scroll_view = ui::View {
+                theme_palettes: None,
+                placeholder: None,
+                literal_prefix: false,
+                query: "",
+                input_text: None,
+                marked: None,
+                input: None,
+                items: &all_rows,
+                sel: i % all_rows.len(),
+                top: (i * 3) % (all_rows.len() - 8),
+                scroll_remainder: (i % 5) as f32 * 7.0,
+                vp: ui::LIST_VP,
+                theme: cfg.theme(),
+                w: 600,
+                h: ui::PANEL_HEIGHT,
+                scale,
+                font_size: 16.0,
+                mono_font_family: None,
+                icons: &cache,
+                bold_font: None,
+                back: false,
+                scrollbar: crate::scroll::Style::visible(),
+            };
+            let t = Instant::now();
+            let mut cv = ui::Canvas::new(pw, ph);
+            ui::draw(&mut cv, &font, &scroll_view);
+            let mut copy = vec![0u8; cv.buf.len()];
+            copy.copy_from_slice(&cv.buf);
+            black_box(&copy);
+            if i >= 10 {
+                samples.push(t.elapsed().as_secs_f64() * 1e6);
+            }
+        }
+        report(&format!("scroll_frame_scale{scale}_draw_and_copy"), samples);
+    }
     let rows = search.run("firefox");
     let h = ui::PANEL_HEIGHT;
     let view = ui::View {
