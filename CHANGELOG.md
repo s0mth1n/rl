@@ -7,10 +7,13 @@ the project uses semantic versioning.
 
 ### Added
 - `rl --version`.
+- Nix flake with a package, overlay, NixOS module and Home Manager module.
 - LICENSE, CHANGELOG and Cargo package metadata.
+- User documentation under docs/.
 
 ### Changed
 - The Wayland connection error now says what to check.
+- README rewritten for users; development notes moved to docs/development.md.
 
 ## [0.1.0]
 
