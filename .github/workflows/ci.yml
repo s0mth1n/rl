@@ -10,12 +10,13 @@ jobs:
         with:
           components: clippy, rustfmt
       - name: System packages
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev pkg-config fontconfig fonts-dejavu-core fonts-noto-color-emoji sway grim wl-clipboard tesseract-ocr python3-pil
+        run: sudo apt-get update && sudo apt-get install -y shellcheck libxkbcommon-dev pkg-config fontconfig fonts-dejavu-core fonts-noto-color-emoji sway grim wl-clipboard tesseract-ocr python3-pil
       - run: cargo fmt --check
-      - run: cargo test --release
-      - run: cargo clippy --release --all-targets -- -D warnings
-      - run: cargo build --release --examples && cargo build --release
-      - run: python3 tests/install-readme.py
+      - run: cargo test --release --locked
+      - run: cargo clippy --release --locked --all-targets -- -D warnings
+      - run: cargo build --release --locked --examples --bins
+      - run: shellcheck install.sh tests/install-sh.sh
+      - run: bash tests/install-sh.sh
       - run: ZL_BIN=target/release/zl python3 tests/output-removal.py
       - name: Basic headless scenario
         run: timeout --kill-after=5s 3m bash tests/headless.sh bash tests/basic.sh
