@@ -54,6 +54,56 @@ for i in $(seq 40); do
     sleep .2
 done
 [ -n "${WAYLAND_DISPLAY:-}" ] || { echo 'headless Wayland socket timed out' >&2; exit 1; }
+# RL_NIRI_LAUNCH=script runs the scenario against a real nested Niri instead of sway: the script
+# gets the private runtime dir and the sway socket, starts Niri on it and prints nothing.
+# Screenshots keep coming from sway, which composites the Niri window.
+if [ -n "${RL_NIRI_LAUNCH:-}" ]; then
+    export SWAY_RUNTIME=$XDG_RUNTIME_DIR SWAY_DISPLAY=$WAYLAND_DISPLAY
+    niri_runtime="$run/niri-runtime"
+    mkdir -p "$niri_runtime" "$run/bin"
+    chmod 700 "$niri_runtime"
+    "$RL_NIRI_LAUNCH" "$niri_runtime" "$SWAY_RUNTIME/$SWAY_DISPLAY" "$OUT" &
+    record_test_pid "$!"
+    for i in $(seq 100); do
+        niri_ipc=$(ls "$niri_runtime"/niri.*.sock 2>/dev/null | head -n1 || true)
+        [ -S "$niri_runtime/wayland-1" ] && [ -n "$niri_ipc" ] && break
+        sleep .2
+    done
+    [ -S "$niri_runtime/wayland-1" ] || { echo "niri did not start; see $OUT/niri.log" >&2; exit 1; }
+    printf '#!/bin/sh\nWAYLAND_DISPLAY=%s XDG_RUNTIME_DIR=%s exec %s "$@"\n' "$SWAY_RUNTIME/$SWAY_DISPLAY" "$SWAY_RUNTIME" "$(command -v grim)" > "$run/bin/grim"
+    chmod +x "$run/bin/grim"
+    export PATH="$run/bin:$PATH"
+    export XDG_RUNTIME_DIR=$niri_runtime WAYLAND_DISPLAY=wayland-1 NIRI_SOCKET=$niri_ipc
+fi
+# RL_NESTED_LAUNCH=script is the same idea for compositors without an IPC socket (labwc, ...): the
+# script gets the private runtime dir and the sway socket and starts the compositor on any wayland-N socket there.
+if [ -n "${RL_NESTED_LAUNCH:-}" ]; then
+    export SWAY_RUNTIME=$XDG_RUNTIME_DIR SWAY_DISPLAY=$WAYLAND_DISPLAY
+    nested_runtime="$run/nested-runtime"
+    mkdir -p "$nested_runtime" "$run/bin"
+    chmod 700 "$nested_runtime"
+    "$RL_NESTED_LAUNCH" "$nested_runtime" "$SWAY_RUNTIME/$SWAY_DISPLAY" "$OUT" &
+    record_test_pid "$!"
+    nested_display=
+    for i in $(seq 150); do
+        for socket in "$nested_runtime"/wayland-[0-9]*; do
+            [ -S "$socket" ] && { nested_display=${socket##*/}; break 2; }
+        done
+        sleep .2
+    done
+    [ -n "$nested_display" ] || { echo "nested compositor did not start; see $OUT/nested.log" >&2; exit 1; }
+    if [ -n "${RL_NESTED_GRIM:-}" ]; then
+        # Compositors that cannot be composited by sway (KWin virtual) provide their own screenshot command.
+        printf '#!/bin/sh\nKWIN_RT=%s exec %s "$@"\n' "$nested_runtime" "$RL_NESTED_GRIM" > "$run/bin/grim"
+    else
+        printf '#!/bin/sh\nWAYLAND_DISPLAY=%s XDG_RUNTIME_DIR=%s exec %s "$@"\n' "$SWAY_RUNTIME/$SWAY_DISPLAY" "$SWAY_RUNTIME" "$(command -v grim)" > "$run/bin/grim"
+    fi
+    chmod +x "$run/bin/grim"
+    export PATH="$run/bin:$PATH"
+    export XDG_RUNTIME_DIR=$nested_runtime WAYLAND_DISPLAY=$nested_display
+    # Hyprland publishes its instance under XDG_RUNTIME_DIR/hypr/<signature>.
+    for sig in "$nested_runtime"/hypr/*/; do [ -d "$sig" ] && export HYPRLAND_INSTANCE_SIGNATURE=$(basename "$sig"); done
+fi
 Z=${ZL_BIN:-$here/target/release/zl}
 # A stale binary makes a pass meaningless: fail when any source file is newer.
 if [ -n "$(find "$here/src" "$here/Cargo.toml" "$here/Cargo.lock" -newer "$Z" -print -quit 2>/dev/null)" ]; then
