@@ -3,16 +3,18 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: ./install.sh [--prefix DIR] [--systemd] [--yes] [--uninstall]
+Usage: ./install.sh [--prefix DIR] [--systemd] [--yes] [--skip-deps] [--uninstall]
 
 Build and install zl to ~/.local, or remove its installed files.
   --prefix DIR  Install bin/ and share/ under DIR (default: ~/.local)
   --systemd     Also install/remove the user service in $XDG_CONFIG_HOME/systemd/user
-  --yes         Skip the install confirmation; do not enable the service
+  --yes         Approve package installation and the install confirmation
+  --skip-deps   Do not install system packages; still verify dependencies
   --uninstall   Remove installed files without building; keep launcher data/config
   --help        Show this help
 
-Privilege escalation and service activation always require a separate prompt.
+Rustup, prefix-write sudo and service activation require separate prompts, even
+with --yes. The build never runs through sudo. Uninstall keeps shared dependencies.
 EOF
 }
 fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
@@ -28,6 +30,7 @@ prefix=${HOME:?HOME must be set}/.local
 systemd=false
 yes=false
 uninstall=false
+skip_deps=false
 while (($#)); do
     case "$1" in
         --prefix)
@@ -37,6 +40,7 @@ while (($#)); do
             prefix=$2; shift 2 ;;
         --systemd) systemd=true; shift ;;
         --yes) yes=true; shift ;;
+        --skip-deps) skip_deps=true; shift ;;
         --uninstall) uninstall=true; shift ;;
         --help|-h) usage; exit 0 ;;
         *) fail "Unknown option: $1 (see --help)" ;;
@@ -50,17 +54,19 @@ config=${XDG_CONFIG_HOME:-$HOME/.config}
 unit="$config/systemd/user/zl.service"
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
+printf 'zl installer\n'
+
 if ! "$yes"; then
     action=Install
     "$uninstall" && action=Uninstall
     ask "$action zl in $prefix?" || exit 1
 fi
 
-# Only the prefix writes may run as root, never the build or user service.
+# Only prefix writes use this sudo command, never the build or user service.
 writer=()
 writable=true
 for destination in "$prefix/bin/zl" "$prefix/share/applications/zl.desktop" \
-    "$prefix/share/icons/hicolor/scalable/apps/zl.svg"; do
+    "$prefix/share/icons/hicolor/scalable/apps/zl.svg" "$prefix/libexec/zl"; do
     probe=$(dirname -- "$destination")
     while [[ ! -e "$probe" ]]; do probe=$(dirname -- "$probe"); done
     [[ -d "$probe" ]] || fail "Not a directory: $probe"
@@ -84,22 +90,26 @@ if "$uninstall"; then
         fi
     fi
     "${writer[@]}" rm -f -- "$prefix/bin/zl" "$prefix/share/applications/zl.desktop" \
-        "$prefix/share/icons/hicolor/scalable/apps/zl.svg"
+        "$prefix/share/icons/hicolor/scalable/apps/zl.svg" "$prefix/libexec/zl"
     printf 'Removed zl from %s. Launcher config and history were kept.\n' "$prefix"
     exit 0
 fi
 
-need cargo 'Install Rust and Cargo from your distribution or rustup.'
-need pkg-config 'Install pkg-config (pkgconf on Alpine).'
-linker=${CC:-cc}
-command -v "$linker" >/dev/null 2>&1 || fail "C linker $linker not found. Install a C toolchain or set CC to its executable."
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
+# shellcheck source=packaging/install-deps.sh
+. "$root/packaging/install-deps.sh"
+install_dependencies
+ensure_rust
+linker=${CC:-cc}
 printf 'int main(void) { return 0; }\n' > "$work/link.c"
-"$linker" "$work/link.c" -o "$work/link" || fail 'The C toolchain could not link a program.'
-pkg-config --exists xkbcommon || fail 'xkbcommon development files missing. Install libxkbcommon-dev (Debian/Ubuntu) or libxkbcommon-dev (Alpine).'
-
-command -v fc-match >/dev/null 2>&1 || printf 'Note: fontconfig (fc-match) was not found. zl needs it at runtime to pick fonts.\n' >&2
+"$linker" "$work/link.c" -o "$work/link" || fail 'The C toolchain could not link a program. Check CC and your C development libraries.'
+if ! command -v systemctl >/dev/null 2>&1 || ! command -v loginctl >/dev/null 2>&1; then
+    warn 'No systemd/logind tools found. Built-in power/session actions need systemctl/loginctl; use compositor autostart on non-systemd systems.'
+fi
+if [[ -z "${TERMINAL:-}" ]] && ! command -v xterm >/dev/null 2>&1; then
+    warn 'Set TERMINAL to your terminal executable for Terminal=true applications, or install xterm.'
+fi
 
 printf 'Building zl...\n'
 (cd "$root" && cargo build --release --locked)
@@ -118,9 +128,21 @@ desktop=${desktop//\\/\\\\}
 escape_sed() { sed 's/[\\&|]/\\&/g'; }
 replacement=$(printf '"%s"' "$desktop" | escape_sed)
 sed "s|@BINARY@|$replacement|g" "$root/packaging/zl.desktop" > "$work/zl.desktop"
-"${writer[@]}" install -Dm755 "$target/release/zl" "$binary"
+if [[ -n "${emoji_pattern:-}" && -z "${EMOJI_FONT:-}" ]]; then
+    # shellcheck disable=SC2016
+    printf '#!/usr/bin/env bash\nif [[ -z "${EMOJI_FONT:-}" ]]; then\n    export EMOJI_FONT=%q\nfi\nexec %q "$@"\n' \
+        "$emoji_pattern" "$prefix/libexec/zl" > "$work/zl-wrapper"
+    "${writer[@]}" install -Dm755 "$target/release/zl" "$prefix/libexec/zl"
+    "${writer[@]}" install -Dm755 "$work/zl-wrapper" "$binary"
+else
+    "${writer[@]}" install -Dm755 "$target/release/zl" "$binary"
+    "${writer[@]}" rm -f -- "$prefix/libexec/zl"
+fi
 "${writer[@]}" install -Dm644 "$work/zl.desktop" "$prefix/share/applications/zl.desktop"
 "${writer[@]}" install -Dm644 "$root/packaging/zl.svg" "$prefix/share/icons/hicolor/scalable/apps/zl.svg"
+"$binary" --version
+"$binary" --help > "$work/help"
+grep -q 'Usage: zl' "$work/help" || fail 'Installed binary failed its help check.'
 
 if "$systemd"; then
     service=${binary//\\/\\\\}

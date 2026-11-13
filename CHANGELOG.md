@@ -13,6 +13,8 @@ the project uses semantic versioning.
 - Screenshots and user documentation under docs/.
 
 ### Changed
+- Installer offers distro packages for build/runtime dependencies, verifies fonts
+  and Rust, and points NixOS/immutable systems to their native setup.
 - The Wayland connection error now says what to check.
 - README rewritten for users; development notes moved to docs/development.md.
 

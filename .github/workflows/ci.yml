@@ -15,7 +15,8 @@ jobs:
       - run: cargo test --release --locked
       - run: cargo clippy --release --locked --all-targets -- -D warnings
       - run: cargo build --release --locked --examples --bins
-      - run: shellcheck install.sh tests/install-sh.sh
+      - run: shellcheck install.sh packaging/install-deps.sh tests/install-sh.sh tests/install-deps.sh
+      - run: bash tests/install-deps.sh
       - run: bash tests/install-sh.sh
       - run: ZL_BIN=target/release/zl python3 tests/output-removal.py
       - name: Basic headless scenario

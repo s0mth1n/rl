@@ -88,12 +88,45 @@ cargo build --release --locked
 ./install.sh --uninstall
 ```
 
-The script builds with cargo as your user. It asks before using sudo, and only
-for a prefix you cannot write to. It never enables the service for you:
+The script checks build tools, fontconfig, text and bitmap colour emoji fonts,
+wl-clipboard, xdg-utils and basic command-line tools. It offers to install packages
+with apt (Debian/Ubuntu), dnf (Fedora/RHEL derivatives), pacman (Arch), zypper
+(openSUSE), apk (Alpine), xbps (Void) or emerge (Gentoo). Package availability
+varies by release and enabled repositories. It does not add repositories: RHEL
+may need EPEL/CRB; Alpine needs its matching community repository.
 
-```sh
-systemctl --user enable --now zl.service
-```
+Like the NiriMod installer, it detects your distribution, shows the dependency
+step and asks before installing packages. `--yes` approves package installation
+as well as the initial confirmation. `--skip-deps` skips package installation,
+not the checks. Rust/Cargo must meet the minimum in Cargo.toml; installing or
+updating Rust with rustup always needs a separate confirmation, even with
+`--yes`. The build runs as the invoking user, never through sudo.
+
+NixOS should use the flake below. Atomic/immutable systems are detected and the
+script does not change their host packages. Prepare dependencies in the image
+or build in a matching development container. On a minimal Alpine installation,
+install Bash first (`apk add bash`), then run `bash install.sh`. Alpine also
+needs `libxkbcommon-static` for the musl Rust target; the installer includes it.
+
+Fedora's Noto package uses COLRv1, which zl does not render. When the selected
+emoji font is unsupported, the script separately offers a pinned, SHA-256-checked
+upstream bitmap font and its OFL license in your user fonts. It does not replace
+system fonts or change global fontconfig rules. A small zl wrapper selects the
+bitmap file for zl only; your `EMOJI_FONT` override wins. This download prompt is
+not skipped by `--yes`. Uninstall keeps this font with the other dependencies.
+
+The script refreshes the font cache, checks font selection, links a C test program,
+builds the locked release, and runs the installed binary's `--version` and `--help`.
+It needs a working network for package, Rust and Cargo downloads. It does not
+install or configure your compositor, terminal, browser or session manager.
+Set `TERMINAL` to your terminal executable if you do not use xterm. Built-in
+power/session actions need systemd/logind; they are not portable to OpenRC or
+runit. Do not install systemd just for this launcher.
+
+A prefix you cannot write to needs a separate sudo confirmation. `--systemd`
+installs the user unit and offers to activate it interactively; `--yes` leaves it
+disabled. Use only one autostart method. Uninstall keeps config, history, shared
+packages and Rust. Remove the user unit with `--uninstall --systemd` if installed.
 
 ### Nix
 
