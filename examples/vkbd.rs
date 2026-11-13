@@ -111,9 +111,9 @@ fn main() {
         .truncate(true)
         .open(format!("/tmp/vkbd-{}.xkb", std::process::id()))
         .unwrap();
+    // No trailing NUL: smithay (Niri) rejects a keymap string that ends in one.
     f.write_all(text.as_bytes()).unwrap();
-    f.write_all(&[0]).unwrap();
-    kb.keymap(1, f.as_fd(), text.len() as u32 + 1);
+    kb.keymap(1, f.as_fd(), text.len() as u32);
     conn.flush().unwrap();
     let _ = q.roundtrip(&mut s);
     std::thread::sleep(std::time::Duration::from_millis(400));
