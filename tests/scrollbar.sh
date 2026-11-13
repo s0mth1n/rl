@@ -12,7 +12,7 @@ pointer() { cat >&"$pointer_fd"; sleep .12; }
 shot() { grim "$OUT/$1.png"; }
 "$Z" show
 sleep .3
-printf 't #\ns .15\n' | send_test_keys
+printf 't :\ns .15\n' | send_test_keys
 shot scroll-initial
 printf 'm 700 450\n' | pointer
 printf 'a 60\na 60\na 60\n' | pointer
@@ -42,7 +42,7 @@ assert differs('idle','hover',bar), 'idle right-edge hover did not show thumb'
 assert differs('hover','track',body), 'track click did not move content'
 assert differs('track','drag',body), 'thumb drag did not move content'
 for n in imgs:
- assert imgs[n].getpixel((700,580)) == imgs['initial'].getpixel((700,580)), 'wheel/click/drag changed selected theme preview'
+ assert imgs[n].getpixel((700,580)) == imgs['initial'].getpixel((700,580)), 'wheel/click/drag changed selected row'
 print('PASS pixel wheel scroll, three-second fade, idle hover, track click and drag without changing selection')
 PY
 for socket in "$XDG_RUNTIME_DIR"/sway-ipc.*.sock; do

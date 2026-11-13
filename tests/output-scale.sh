@@ -8,7 +8,7 @@ printf 'launcher_size = [601.0, 399.0]\n' > "$XDG_CONFIG_HOME/zl/config.toml"
 WAYLAND_DEBUG=client "$Z" > "$OUT/scale-wire.log" 2>&1 & record_test_pid "$!"
 sleep .3
 swaymsg output HEADLESS-1 scale 2
-"$Z" show -m themes
+"$Z" show -m emojis
 sleep .3
 # No hide/show between scale changes: the mapped panel must follow its output.
 for factor in 1 2; do

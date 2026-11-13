@@ -146,7 +146,6 @@ struct App {
     cfg: Config,
     modes: modes::State,
     theme: config::Theme,
-    saved_theme_name: String,
     icons: icons::Cache,
     font: Font<'static>,
     font_size: f32,
@@ -197,10 +196,6 @@ struct App {
     input_click: Option<(Instant, u8, f64, f64)>,
     settings_error: Option<String>,
     hist: hist::Hist,
-    /// A picker selection is previewing a theme that is not saved yet.
-    previewing: bool,
-    theme_catalog: Option<Vec<Item>>,
-    theme_palettes: std::collections::HashMap<String, config::Theme>,
     compositor: Option<WlCompositor>,
     subcompositor: Option<WlSubcompositor>,
     viewporter: Option<WpViewporter>,
@@ -278,7 +273,7 @@ impl App {
 
     fn refresh(&mut self) {
         // Typing away the sub-view prefix also leaves the sub-view.
-        if self.origin.is_some() && !self.view_query().starts_with([':', ';', '#']) {
+        if self.origin.is_some() && !self.view_query().starts_with([':', ';']) {
             self.origin = None;
         }
         self.edit.literal_prefix = !self.modes.current().routes_prefixes();
@@ -294,40 +289,11 @@ impl App {
             windows: &self.windows,
             history: &self.clip,
         };
-        if let Some(filter) = self
-            .query
-            .strip_prefix('#')
-            .filter(|_| self.modes.current().routes_prefixes())
-        {
-            let catalog = self
-                .theme_catalog
-                .get_or_insert_with(|| items::theme_items(&self.cfg, ""));
-            if self.theme_palettes.is_empty() {
-                self.theme_palettes = catalog
-                    .iter()
-                    .filter_map(|item| {
-                        config::load_theme(&item.title).map(|theme| (item.title.clone(), theme))
-                    })
-                    .collect();
-            }
-            let filter = filter.to_lowercase();
-            self.items = catalog
-                .iter()
-                .filter(|item| {
-                    item.title.to_lowercase().contains(&filter)
-                        || item.sub.to_lowercase().contains(&filter)
-                })
-                .cloned()
-                .collect();
+        self.items = if self.modes.current().routes_prefixes() {
+            s.run(&self.query)
         } else {
-            self.theme_catalog = None;
-            self.theme_palettes.clear();
-            self.items = if self.modes.current().routes_prefixes() {
-                s.run(&self.query)
-            } else {
-                s.run_mode(&self.query, false)
-            };
-        }
+            s.run_mode(&self.query, false)
+        };
         self.sel = 0;
         self.top = 0;
         self.scroll_remainder = 0.0;
@@ -429,8 +395,14 @@ impl App {
             .map_or((self.query.as_str(), self.edit.caret), |d| {
                 (d.text.as_str(), d.caret)
             });
-        let (mut x, mut y, width, height) =
-            ui::input_cursor_rectangle(&self.font, self.view_query(), shown, caret, self.cfg.width);
+        let (mut x, mut y, width, height) = ui::input_cursor_rectangle(
+            &self.font,
+            self.view_query(),
+            shown,
+            caret,
+            self.cfg.width,
+            self.origin.is_some(),
+        );
         if self
             .backdrop
             .as_ref()
@@ -581,8 +553,6 @@ impl App {
             compose.reset();
         }
         self.active_output = None;
-        self.theme_catalog = None;
-        self.theme_palettes.clear();
         self.input_menu = None;
         self.ime.clear();
         self.text_snapshot = None;
@@ -602,11 +572,6 @@ impl App {
         self.input_click = None;
         if let Some(b) = self.backdrop.as_ref() {
             b.panel.destroy();
-        }
-        // Dismissing the panel cancels an unsaved theme preview.
-        if self.previewing {
-            self.theme = self.cfg.theme();
-            self.previewing = false;
         }
         if let Some(l) = self.layer.take() {
             l.destroy();
@@ -641,7 +606,6 @@ impl App {
         if !self.shown || !self.configured {
             return;
         }
-        self.sync_theme_preview();
         let h = self.panel_height();
         if h != self.cur_h {
             self.cur_h = h;
@@ -706,14 +670,14 @@ impl App {
         };
         self.update_text_input(false);
         let Some(surf) = &self.surface else { return };
-        let mut cv = ui::Canvas::with_buffer(std::mem::take(&mut self.frame), physical_w, physical_h);
+        let mut cv =
+            ui::Canvas::with_buffer(std::mem::take(&mut self.frame), physical_w, physical_h);
         let composition = self.ime.display(&self.query, &self.edit);
         let (caret, anchor, visible) = composition.as_ref().map_or(
             (self.edit.caret, self.edit.anchor, self.caret_visible),
             |d| (d.caret, d.anchor, !d.hidden),
         );
         let v = ui::View {
-            theme_palettes: Some(&self.theme_palettes),
             icons: &self.icons,
             query: &self.query,
             literal_prefix: !self.modes.current().routes_prefixes(),
@@ -820,47 +784,9 @@ impl App {
         true
     }
 
-    /// Live theme preview: in the picker the selected row recolours the panel, like
-    /// zlaunch's theme mode. Leaving the picker without Enter restores the saved theme.
-    fn sync_theme_preview(&mut self) {
-        let picked = if items::theme_view(self.view_query()) {
-            self.items.get(self.sel).and_then(|it| match &it.action {
-                Action::Theme(name) => Some(name.clone()),
-                _ => None,
-            })
-        } else {
-            None
-        };
-        match picked {
-            Some(name) => {
-                self.theme = self
-                    .theme_palettes
-                    .get(&name)
-                    .copied()
-                    .unwrap_or_else(|| config::theme(&name));
-                if !self.cfg.enable_transparency {
-                    self.theme.bg_alpha = 1.0;
-                }
-                self.previewing = true;
-            }
-            None if self.previewing && !items::theme_view(self.view_query()) => {
-                self.theme = self.cfg.theme();
-                self.previewing = false;
-            }
-            _ => {}
-        }
-    }
-
     fn activate(&mut self, qh: &QueueHandle<App>) {
         let picked = self.items.get(self.sel).cloned();
-        let Some(it) = picked else {
-            if items::theme_view(self.view_query()) {
-                self.query.clear();
-                self.refresh();
-                self.redraw(qh);
-            }
-            return;
-        };
+        let Some(it) = picked else { return };
         if matches!(
             it.action,
             Action::App(_) | Action::Clip(..) | Action::ClipFiles(..) | Action::ClipImg(..)
@@ -916,19 +842,10 @@ impl App {
             Action::View(view) => {
                 // Entered through the main list: remember the combined query
                 // so the back arrow returns to it, as zlaunch's sub-views do.
-                if matches!(view.as_str(), ":" | ";" | "#") {
+                if matches!(view.as_str(), ":" | ";") {
                     self.origin = Some(self.query.clone());
                 }
                 self.query = view;
-                self.refresh();
-                self.redraw(qh);
-            }
-            Action::Theme(name) => {
-                config::set_theme(&mut self.cfg, &name);
-                self.saved_theme_name = name.clone();
-                self.previewing = false;
-                self.theme = self.cfg.theme();
-                self.query.clear();
                 self.refresh();
                 self.redraw(qh);
             }
@@ -1018,10 +935,6 @@ impl App {
         if ctrl && matches!(sym, xkb::keysyms::KEY_Tab | xkb::keysyms::KEY_ISO_Left_Tab) {
             let previous = st.mod_name_is_active(xkb::MOD_NAME_SHIFT, xkb::STATE_MODS_EFFECTIVE);
             if self.modes.cycle(previous) {
-                if self.previewing {
-                    self.theme = self.cfg.theme();
-                    self.previewing = false;
-                }
                 self.query = self.modes.current().prefix().into();
                 self.origin = None;
                 self.edit = input::Edit::default();
@@ -1056,7 +969,7 @@ impl App {
         // keep returning to the list.
         let direct_view = self.origin.is_none()
             && (self.modes.current() != modes::Mode::Combined
-                || self.view_query().starts_with([':', ';', '#']));
+                || self.view_query().starts_with([':', ';']));
         let effect = keys::handle(
             &mut keys::KeyState {
                 query: &mut self.query,
@@ -1090,7 +1003,6 @@ impl App {
             keys::Effect::Edited => self.refresh(),
             keys::Effect::Moved => {
                 if self.sel != previous_selection {
-                    self.sync_theme_preview();
                     self.ensure_visible();
                 }
             }
@@ -1827,6 +1739,7 @@ impl Dispatch<WlPointer, ()> for App {
                         a.cfg.width,
                         surface_x,
                         a.edit.literal_prefix,
+                        a.origin.is_some(),
                     );
                     a.edit.move_to(&a.query, at, true);
                     a.redraw(qh);
@@ -1854,6 +1767,7 @@ impl Dispatch<WlPointer, ()> for App {
                         a.cfg.width,
                         surface_x,
                         a.edit.literal_prefix,
+                        a.origin.is_some(),
                     );
                     a.edit.move_to(&a.query, at, true);
                     a.redraw(qh);
@@ -1944,6 +1858,7 @@ impl Dispatch<WlPointer, ()> for App {
                         a.cfg.width,
                         x,
                         a.edit.literal_prefix,
+                        a.origin.is_some(),
                     );
                     let now = Instant::now();
                     let count = a
@@ -2024,6 +1939,7 @@ impl Dispatch<WlPointer, ()> for App {
                         a.cfg.width,
                         x,
                         a.edit.literal_prefix,
+                        a.origin.is_some(),
                     );
                     if !a.edit.range().is_some_and(|r| r.contains(&at)) {
                         a.edit.move_to(&a.query, at, false);
@@ -2175,14 +2091,11 @@ fn main() {
             }
             std::process::exit(code);
         }
-        cli::Cmd::ThemeCurrent => Some("theme-current".into()),
-        cli::Cmd::ThemeList => Some("theme-list".into()),
         cli::Cmd::Show(modes) => Some(format!("show {}", cli::show_modes(&modes))),
         cli::Cmd::Toggle(modes) => Some(format!("toggle {}", cli::show_modes(&modes))),
         cli::Cmd::Hide => Some("hide".into()),
         cli::Cmd::Quit => Some("quit".into()),
         cli::Cmd::Reload => Some("reload".into()),
-        cli::Cmd::ThemeSet(name) => Some(format!("theme-set {name}")),
     };
     if let Some(wire) = wire {
         match UnixStream::connect(sock()) {
@@ -2196,15 +2109,8 @@ fn main() {
                 })();
                 match result {
                     Ok(reply) if reply.starts_with("ok\n") => {
-                        let payload = &reply[3..];
                         let mut out = std::io::stdout().lock();
-                        if wire == "theme-current" {
-                            let _ = writeln!(out, "Current theme: {}", payload.trim_end());
-                        } else if wire == "theme-list" {
-                            let _ = write!(out, "Available themes:\n{payload}");
-                        } else if let Some(name) = wire.strip_prefix("theme-set ") {
-                            let _ = writeln!(out, "Theme set to '{name}'");
-                        } else if wire == "reload" {
+                        if wire == "reload" {
                             let _ = writeln!(out, "Daemon is reloading...");
                         }
                     }
@@ -2267,11 +2173,6 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     conn.display().get_registry(&qh, ());
     let mut app = App {
         theme: cfg.theme(),
-        saved_theme_name: if config::load_theme(&cfg.theme).is_some() {
-            cfg.theme.clone()
-        } else {
-            "default".into()
-        },
         icons: icons::Cache::new(&cfg.icon_theme, &cfg.emoji_font),
         font: load_font(&cfg),
         font_size: cfg.startup_font_size(),
@@ -2317,9 +2218,6 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
         input_click: None,
         settings_error: None,
         hist: hist::Hist::load(),
-        previewing: false,
-        theme_catalog: None,
-        theme_palettes: std::collections::HashMap::new(),
         modes: modes::State::new(cfg.default_modes.as_deref()),
         cfg,
         compositor: None,
@@ -2508,37 +2406,6 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         return Ok(());
                     }
-                    "theme-set" => {
-                        let ok = config::load_theme(arg).is_some() && {
-                            let ok = config::set_theme(&mut app.cfg, arg);
-                            app.saved_theme_name = arg.into();
-                            app.theme = app.cfg.theme();
-                            app.redraw(&qh);
-                            ok
-                        };
-                        let reply = if ok {
-                            "ok\n".into()
-                        } else {
-                            format!("err Theme '{arg}' not found\n")
-                        };
-                        let _ = s.write_all(reply.as_bytes());
-                    }
-                    "theme-current" => {
-                        let _ = writeln!(s, "ok\n{}", app.saved_theme_name);
-                    }
-                    "theme-list" => {
-                        let _ = s.write_all(b"ok\n");
-                        for (name, source) in config::available_themes() {
-                            let kind = if source == "bundled" {
-                                "bundled"
-                            } else {
-                                "user"
-                            };
-                            if writeln!(s, "  {name} ({kind})").is_err() {
-                                break;
-                            }
-                        }
-                    }
                     "quit" => {
                         let _ = s.write_all(b"ok\n");
                         let _ = std::fs::remove_file(sock());
@@ -2609,11 +2476,6 @@ mod picker_tests {
     fn app(cfg: Config) -> App {
         App {
             theme: cfg.theme(),
-            saved_theme_name: if config::load_theme(&cfg.theme).is_some() {
-                cfg.theme.clone()
-            } else {
-                "default".into()
-            },
             icons: icons::Cache::new(&cfg.icon_theme, &cfg.emoji_font),
             font: load_font(&cfg),
             font_size: cfg.startup_font_size(),
@@ -2658,9 +2520,6 @@ mod picker_tests {
             input_menu: None,
             input_click: None,
             settings_error: None,
-            previewing: false,
-            theme_catalog: None,
-            theme_palettes: std::collections::HashMap::new(),
             hist: hist::Hist::default(),
             modes: modes::State::new(cfg.default_modes.as_deref()),
             cfg,
@@ -2775,9 +2634,9 @@ mod picker_tests {
             .map(|i| Item {
                 title: i.to_string(),
                 sub: String::new(),
-                tag: "Theme",
+                tag: "Application",
                 icon: None,
-                action: Action::Theme("default".into()),
+                action: Action::App(i),
                 best: false,
             })
             .collect();
@@ -2787,7 +2646,7 @@ mod picker_tests {
     #[test]
     fn pixel_scroll_keeps_selection_and_remainder_and_clamps_both_ends() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();
-        let mut a = scroll_fixture("#");
+        let mut a = scroll_fixture("a");
         a.scroll_to_offset(123.5);
         assert_eq!((a.top, a.scroll_remainder, a.sel), (2, 23.5, 0));
         a.scroll_to_offset(f32::MAX);
@@ -2868,7 +2727,7 @@ mod picker_tests {
                 icon: String::new(),
                 terminal: false,
             }];
-            for query in [":foo", ";foo", "#foo"] {
+            for query in [":foo", ";foo"] {
                 a.query = query.into();
                 a.refresh();
                 assert!(a.edit.literal_prefix);
@@ -2878,7 +2737,7 @@ mod picker_tests {
                 assert!(a
                     .items
                     .iter()
-                    .all(|item| !matches!(item.action, Action::Clip(..) | Action::Theme(_))));
+                    .all(|item| !matches!(item.action, Action::Clip(..))));
                 if mode == "search" && query == ":foo" {
                     assert!(a.items.iter().any(|item| item.action
                         == Action::WebSearch("https://www.google.com/search?q=%3Afoo".into())));
@@ -2997,58 +2856,6 @@ mod picker_tests {
     }
 
     #[test]
-    fn theme_catalog_is_a_snapshot_until_the_picker_closes() {
-        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let old = std::env::var_os("XDG_CONFIG_HOME");
-        std::env::set_var("XDG_CONFIG_HOME", dir.path());
-        let themes = Config::path().parent().unwrap().join("themes");
-        std::fs::create_dir_all(&themes).unwrap();
-        std::fs::write(themes.join("custom.toml"), "window_background = '#ff0000'").unwrap();
-        let mut a = app(Config::default());
-        a.query = "#custom".into();
-        a.refresh();
-        a.sync_theme_preview();
-        assert_eq!(a.theme.bg, [255, 0, 0]);
-        std::fs::write(themes.join("custom.toml"), "window_background = '#0000ff'").unwrap();
-        std::fs::write(themes.join("new.toml"), "").unwrap();
-        a.query = "#".into();
-        a.refresh();
-        assert!(!a.items.iter().any(|item| item.title == "new"));
-        a.query = "#custom".into();
-        a.refresh();
-        a.sync_theme_preview();
-        assert_eq!(a.theme.bg, [255, 0, 0]);
-        assert_eq!(a.theme_palettes["custom"].bg, [255, 0, 0]);
-        a.hide();
-        a.refresh();
-        a.sync_theme_preview();
-        assert_eq!(a.theme.bg, [0, 0, 255]);
-        match old {
-            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-    }
-
-    #[test]
-    fn opaque_background_stays_opaque_during_cached_theme_preview() {
-        let _env = crate::testutil::ENV_LOCK.lock().unwrap();
-        let mut a = app(Config {
-            enable_transparency: false,
-            ..Config::default()
-        });
-        a.query = "#nord".into();
-        a.refresh();
-        a.sync_theme_preview();
-        assert_eq!(a.theme.bg, config::theme("nord").bg);
-        assert_eq!(a.theme.bg_alpha, 1.0);
-        a.query.clear();
-        a.refresh();
-        a.sync_theme_preview();
-        assert_eq!(a.theme.bg_alpha, 1.0);
-    }
-
-    #[test]
     fn hiding_discards_input_click_count_before_the_next_panel() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();
         let mut a = app(Config::default());
@@ -3076,50 +2883,6 @@ mod picker_tests {
     }
 
     #[test]
-    fn preview_never_changes_config_and_leaving_restores_it() {
-        let _env = crate::testutil::ENV_LOCK.lock().unwrap();
-        let cfg = Config {
-            theme: "nord".into(),
-            font: config::FontConfig {
-                font_family: Some("DejaVu Sans".into()),
-                mono_font_family: Some("DejaVu Sans Mono".into()),
-                font_size: Some(17.0),
-            },
-            ..Config::default()
-        };
-        let mut a = app(cfg);
-        a.query = "#dracula".into();
-        a.refresh();
-        a.sync_theme_preview();
-        assert_eq!(a.cfg.theme, "nord");
-        assert_eq!(a.font_size, 17.0);
-        assert_eq!(a.mono_font_family.as_deref(), Some("DejaVu Sans Mono"));
-        assert_eq!(a.theme, config::theme("dracula"));
-        assert!(a.previewing);
-        a.query = "#not-a-theme".into();
-        a.refresh();
-        a.sync_theme_preview();
-        assert!(a.items.is_empty());
-        assert_eq!(a.theme, config::theme("dracula"));
-        a.query.clear();
-        a.refresh();
-        a.sync_theme_preview();
-        assert_eq!(a.theme, config::theme("nord"));
-        assert!(!a.previewing);
-        a.query = "#catppuccin".into();
-        a.refresh();
-        a.sync_theme_preview();
-        assert_eq!(a.theme, config::theme("catppuccin-latte"));
-        a.sel = 1;
-        a.sync_theme_preview();
-        assert_eq!(a.theme, config::theme("catppuccin-mocha"));
-        a.hide();
-        assert_eq!(a.theme, config::theme("nord"));
-        assert_eq!(a.cfg.theme, "nord");
-        assert!(!a.previewing);
-    }
-
-    #[test]
     fn manifest_drops_dependencies_nothing_uses() {
         // llm, tokio, futures, anyhow and pulldown-cmark were inherited from the
         // zlaunch port but no rl source file references them.
@@ -3142,7 +2905,7 @@ mod picker_tests {
         // Calculator, actions and windows modes exist; the README must not deny them.
         assert!(!readme.contains("file search, calculator, currency conversion"));
         assert!(readme.contains("emojis, calculator, clipboard, actions,"));
-        assert!(readme.contains("search, themes and windows."));
+        assert!(readme.contains("search,\nwindows."));
         // Images share the history limit with text; there is no eight-image cap.
         assert!(!readme.contains("at most eight images"));
         // The single_click key is ignored, not an activation switch.

@@ -66,9 +66,3 @@ printf 'm %s %s\np\nr\ns 0.4\n' "$BACK_X" "$(( CLIP_TOP + 28 ))" | "$P"
 shot clipstill
 check_text clipstill 'No clipboard history'  # still the clipboard view: no arrow
 echo 'PASS direct sub-view has no back arrow'
-
-# The theme picker entered directly shows its own prefix icon.
-type_query '#'
-shot themes
-check_text themes 'Search themes'
-echo 'PASS theme picker view'

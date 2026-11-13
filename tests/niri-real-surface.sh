@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Niri-specific surface behavior on a real nested Niri (see RL_NIRI_LAUNCH in headless.sh):
-# transparency over live window content, layer-rule targeting, output scale, focus return,
-# workspace switching with the panel open, and show/hide animation frames.
+# transparency over live window content, layer-rule targeting, focus return, and
+# workspace switching with the panel open.
 set -euo pipefail
 source "$here/tests/session.bash"
 start_test_keyboard
@@ -33,24 +33,6 @@ n = len(px); mean = sum(px)/n
 print(f'{mean:.2f} {(sum((p-mean)**2 for p in px)/n)**.5:.2f}')
 PY
 }
-magenta_box() {
-    python3 - "$OUT/$1.png" <<'PY'
-import sys
-from PIL import Image
-im = Image.open(sys.argv[1]).convert('RGB')
-w, h = im.size
-xs, ys = [], []
-d = im.load()
-for y in range(0, h, 2):
-    for x in range(0, w, 2):
-        r, g, b = d[x, y]
-        if r > 200 and g < 60 and b > 200:
-            xs.append(x); ys.append(y)
-print(min(xs), min(ys), max(xs), max(ys)) if xs else print('none')
-PY
-}
-mkdir -p "$XDG_CONFIG_HOME/zl/themes"
-printf 'window_background = "#ff00ffff"\n' > "$XDG_CONFIG_HOME/zl/themes/bright.toml"
 niri_config
 for title in 'Niri Surface Alpha' 'Niri Surface Beta'; do
     env LD_LIBRARY_PATH=$FOOT_LD $FOOT -T "$title" sh -c 'yes MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM' >/dev/null 2>&1 &
@@ -66,7 +48,7 @@ snap s-windows-only
 "$Z" show -m calculator; sleep .3; printf 't zzzz\ns .3\n' | send_test_keys
 snap s-transparent-default; T_ON=$(region s-transparent-default)
 "$Z" hide; sleep .3
-printf 'theme = "default"\nenable_transparency = false\n' > "$XDG_CONFIG_HOME/zl/config.toml"; restart_zl
+printf 'enable_transparency = false\n' > "$XDG_CONFIG_HOME/zl/config.toml"; restart_zl
 "$Z" show -m calculator; sleep .3; printf 't zzzz\ns .3\n' | send_test_keys
 snap s-opaque; T_OFF=$(region s-opaque)
 "$Z" hide; sleep .3
@@ -78,7 +60,7 @@ assert on > 3 and off < 1, (on, off)
 PY
 echo 'PASS transparency: window content shows through the panel; enable_transparency=false is solid'
 # Layer rule: namespace is zl, so a rule for it applies and a rule for another namespace does not.
-printf 'theme = "default"\n' > "$XDG_CONFIG_HOME/zl/config.toml"; restart_zl
+printf '' > "$XDG_CONFIG_HOME/zl/config.toml"; restart_zl
 niri_config 'layer-rule {
     match namespace="^zl$"
     opacity 0.4
@@ -101,30 +83,7 @@ assert m > o + 1 and abs(o - d) < 1.5, (m, o, d)
 PY
 echo 'PASS layer-rule namespace "zl" matches the rl panel (opacity applied only when namespace matches)'
 niri_config
-# Fractional scale and 2x: bounding box of an opaque magenta panel.
-printf 'theme = "bright"\nenable_transparency = false\n' > "$XDG_CONFIG_HOME/zl/config.toml"; restart_zl
-for scale in 1 1.5 2; do
-    niri_config "output \"winit\" {
-    scale $scale
-}"
-    "$Z" show -m calculator; sleep .4
-    snap "s-scale-$scale"
-    box=$(magenta_box "s-scale-$scale")
-    echo "scale $scale panel box: $box"
-    python3 - "$scale" $box <<'PY'
-import sys
-s = float(sys.argv[1]); x0, y0, x1, y1 = map(int, sys.argv[2:6])
-w, h = x1 - x0, y1 - y0
-# 1280x800 window, 600x400 logical panel; scale multiplies physical size, centered
-assert abs(w - 600*s) <= 12 and abs(h - 400*s) <= 12, (w, h)
-cx, cy = (x0+x1)/2, (y0+y1)/2
-assert abs(cx - 640) <= 12 and abs(cy - 400) <= 12, (cx, cy)
-PY
-    "$Z" hide; sleep .3
-done
-echo 'PASS panel is 600x400 logical and centered at output scale 1, 1.5 and 2'
-niri_config
-printf 'theme = "default"\n' > "$XDG_CONFIG_HOME/zl/config.toml"; restart_zl
+printf '' > "$XDG_CONFIG_HOME/zl/config.toml"; restart_zl
 # Focus return after hide, and with Escape.
 niri_msg action focus-window --id "$(niri_msg --json windows | python3 -c 'import json,sys; print([w["id"] for w in json.load(sys.stdin) if w["title"]=="Niri Surface Alpha"][0])')"
 sleep .5
@@ -145,48 +104,8 @@ echo "focused workspace idx after switch: $ws"
 niri_msg action focus-workspace-up; sleep 1.2
 "$Z" hide; sleep .3
 echo 'PASS panel survives a workspace switch and keeps taking input (screenshots saved)'
-# Show/hide frames: an opaque magenta panel must go from absent (window content) to fully drawn with no tinted fade steps.
-printf 'theme = "bright"\nenable_transparency = false\n' > "$XDG_CONFIG_HOME/zl/config.toml"; restart_zl
-sample() { python3 - "$1" <<'PY'
-import sys
-from PIL import Image
-print(Image.open(sys.argv[1]).convert('RGB').getpixel((640, 215)))
-PY
-}
-for phase in show hide; do
-    if [ "$phase" = hide ]; then "$Z" show; sleep .6; "$Z" hide; else "$Z" show; fi
-    for n in 1 2 3 4 5 6; do grim "$OUT/s-anim-$phase-$n.png"; done
-    seen=$(for n in 1 2 3 4 5 6; do sample "$OUT/s-anim-$phase-$n.png"; done | tr '\n' ' ')
-    echo "$phase frames at (640,215): $seen"
-    python3 - "$seen" <<'PY'
-import re, sys
-vals = [tuple(map(int, m)) for m in re.findall(r'\((\d+), (\d+), (\d+)\)', sys.argv[1])]
-partial = [v for v in vals if v[0] - v[1] > 20 and v[2] - v[1] > 20 and not (v[0] > 200 and v[1] < 60 and v[2] > 200)]
-assert not partial, ('intermediate fade colors', partial)
-PY
-done
-echo 'PASS show and hide have no intermediate fade frames'
-
-# Theme alpha: a translucent window_background lets window content through; more alpha means less of it.
-printf 'window_background = "#19375a40"\n' > "$XDG_CONFIG_HOME/zl/themes/glass.toml"
-printf 'window_background = "#19375af0"\n' > "$XDG_CONFIG_HOME/zl/themes/dense.toml"
-for t in glass dense; do
-    printf 'theme = "%s"\n' "$t" > "$XDG_CONFIG_HOME/zl/config.toml"; restart_zl
-    niri_config ''
-    "$Z" show -m calculator; sleep .3; printf 't zzzz\ns .3\n' | send_test_keys
-    snap s-theme-$t; eval "A_$t=\$(region s-theme-$t)"
-    "$Z" hide; sleep .3
-done
-echo "theme alpha region mean/std glass(0x40)=[$A_glass] dense(0xf0)=[$A_dense]"
-python3 - "$A_glass" "$A_dense" <<'PY'
-import sys
-g, d = (float(a.split()[1]) for a in sys.argv[1:3])
-assert g > d + 1, (g, d)
-PY
-echo 'PASS theme alpha: translucent theme shows more window content than a dense one'
-
 # Rounded corners and shadow via niri layer-rule
-printf 'theme = "default"\n' > "$XDG_CONFIG_HOME/zl/config.toml"; restart_zl
+printf '' > "$XDG_CONFIG_HOME/zl/config.toml"; restart_zl
 niri_config 'layer-rule {
     match namespace="^zl$"
     geometry-corner-radius 24

@@ -15,7 +15,6 @@ impl Mode {
             "apps" | "app" | "applications" => Self::Module(Applications),
             "emoji" | "emojis" => Self::Module(Emojis),
             "clipboard" => Self::Module(Clipboard),
-            "theme" | "themes" => Self::Module(Themes),
             "window" | "windows" => Self::Module(Windows),
             "action" | "actions" => Self::Module(Actions),
             "calc" | "calculator" => Self::Module(Calculator),
@@ -27,10 +26,7 @@ impl Mode {
     pub fn routes_prefixes(self) -> bool {
         matches!(
             self,
-            Self::Combined
-                | Self::Module(
-                    ConfigModule::Emojis | ConfigModule::Clipboard | ConfigModule::Themes
-                )
+            Self::Combined | Self::Module(ConfigModule::Emojis | ConfigModule::Clipboard)
         )
     }
 
@@ -38,7 +34,6 @@ impl Mode {
         match self {
             Self::Module(ConfigModule::Emojis) => ":",
             Self::Module(ConfigModule::Clipboard) => ";",
-            Self::Module(ConfigModule::Themes) => "#",
             _ => "",
         }
     }
@@ -52,7 +47,6 @@ impl Mode {
             Self::Module(Actions) => "Search actions...",
             Self::Module(Emojis) => "Search emojis...",
             Self::Module(Clipboard) => "Search clipboard...",
-            Self::Module(Themes) => "Search themes...",
             Self::Module(Search) => "Search the web...",
             Self::Module(Calculator) => "Calculate...",
         }

@@ -48,8 +48,6 @@ for y in range(0, h, 2):
 print(min(xs), min(ys), max(xs), max(ys)) if xs else print('none')
 PY
 }
-mkdir -p "$XDG_CONFIG_HOME/zl/themes"
-printf 'window_background = "#ff00ffff"\n' > "$XDG_CONFIG_HOME/zl/themes/bright.toml"
 niri_config
 for title in 'Niri Surface Alpha' 'Niri Surface Beta'; do
     env LD_LIBRARY_PATH=$FOOT_LD $FOOT -T "$title" sh -c 'yes MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM' >/dev/null 2>&1 &

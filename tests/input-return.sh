@@ -6,7 +6,7 @@ mkfifo "$OUT/ptr"; exec 4<>"$OUT/ptr"
 sleep .3
 "$Z" show
 sleep .3
-for view in Emoji Clipboard Themes; do
+for view in Emoji Clipboard; do
     "$Z" show
     sleep .3
     printf 'k ctrl-a\nk bs\nt %s\nk enter\n' "$view" | send_test_keys
@@ -18,7 +18,7 @@ for view in Emoji Clipboard Themes; do
     sleep .3
     grim "$OUT/$view-escape.png"
 done
-printf 't Themes\nk enter\n' | send_test_keys
+printf 't Emoji\nk enter\n' | send_test_keys
 sleep .3
 printf 'm 366 228\ns 0.2\np\ns 0.1\nr\n' >&4
 sleep .3

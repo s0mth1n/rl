@@ -4,7 +4,6 @@ Config is `$XDG_CONFIG_HOME/zl/config.toml` (normally
 `~/.config/zl/config.toml`). Restart the daemon after editing the file.
 
 ```toml
-theme = "default"
 launcher_size = [600.0, 400.0]
 enable_backdrop = true
 enable_transparency = true
@@ -17,8 +16,7 @@ mono_font_family = "DejaVu Sans Mono"
 font_size = 16.0
 ```
 
-Font settings are optional. Theme font settings override the global table at startup;
-changing the picker selection previews colors without changing the startup fonts.
+Font settings are optional and apply globally.
 
 On Hyprland, `hyprland_auto_blur` sends the layer rules that blur behind
 the panel; elsewhere it does nothing.
@@ -28,12 +26,7 @@ use defaults, and dimensions above 8192 are capped. Panels needing more than
 Unknown keys are ignored. The old monitor, width, max_rows, emoji_font,
 clipboard_history, clipboard_max, clipboard_persist, icon_theme, terminal,
 disabled_apps, single_click, close_on_focus_loss, pop_on_backspace,
-escape_key_behavior and colors keys are ignored and are not saved.
-
-Run `zl theme list` for the bundled and user themes. User themes load from
-`$XDG_CONFIG_HOME/zl/themes/{name}.toml` (normally `~/.config/zl/themes/`).
-Bundled names take precedence, with no extra aliases. Theme preview does not
-change the config until confirmed.
+escape_key_behavior, colors and theme keys are ignored and are not saved.
 
 Clipboard history is local and saved under `$XDG_STATE_HOME/zl/clipboard`
 (normally `~/.local/state/zl/clipboard`), with a private directory and files.

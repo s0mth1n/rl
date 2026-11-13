@@ -4,7 +4,7 @@ start_test_keyboard
 mkfifo "$OUT/ime.fifo"; exec 4<>"$OUT/ime.fifo"
 "$here/target/release/examples/ime" <"$OUT/ime.fifo" >"$OUT/ime.log" 2>&1 & record_test_pid $!
 sleep .3
-for mode in applications windows actions calculator search emoji clipboard themes; do
+for mode in applications windows actions calculator search emoji clipboard; do
     previous=$(grep -c 'surrounding "ab" cursor=2' "$OUT/ime.log" || true)
     "$Z" show -m "$mode"
     sleep .3

@@ -14,7 +14,7 @@ The layout and behaviour follow [zlaunch](https://github.com/zortax/zlaunch).
   password-manager content are skipped.
 - Calculator, system actions, web search (`!g`, `!d`, `!wiki`, `!yt`, or your own providers).
 - Window switching on Hyprland, KWin, Niri and MangoWM.
-- Themes, live preview, optional transparency and compositor blur.
+- Optional transparency and compositor blur.
 
 ![Search](docs/screenshots/search.png)
 
@@ -30,14 +30,12 @@ Start the daemon once from your compositor config, then bind a key to `zl toggle
 zl                    # run the daemon
 zl toggle             # show or hide the panel
 zl show -m emojis     # open straight into a mode
-zl theme list
-zl theme set NAME
 zl reload
 zl --help
 ```
 
 Modes: combined, applications, emojis, calculator, clipboard, actions, search,
-themes and windows. Combine them with commas.
+windows. Combine them with commas.
 
 Type to search. Up/Down or Tab/Shift-Tab select, Enter activates, Escape clears
 the view and then closes the panel. `:` opens emoji, `;` opens clipboard history.
@@ -158,7 +156,6 @@ Home Manager:
     enable = true;
     systemd.enable = true;
     settings = {
-      theme = "default";
       enable_transparency = true;
     };
   };
@@ -170,7 +167,6 @@ Home Manager:
 `~/.config/zl/config.toml`, read at startup. Restart the daemon after editing.
 
 ```toml
-theme = "default"
 launcher_size = [600.0, 400.0]
 enable_backdrop = true
 enable_transparency = true
@@ -178,7 +174,7 @@ max_clipboard_history = 500
 store_passwords = false
 ```
 
-Themes, fonts, web search providers, privacy notes and blur are in
+Fonts, web search providers, privacy notes and blur are in
 [docs/configuration.md](docs/configuration.md).
 
 ## Compositors
@@ -213,5 +209,5 @@ See [docs/development.md](docs/development.md). Changes are listed in
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Parts of the layout, themes and behaviour come from
+MIT, see [LICENSE](LICENSE). Parts of the layout and behaviour come from
 zlaunch (MIT), see [NOTICE](NOTICE).

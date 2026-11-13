@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One discrete wheel step of 60 scrolls the themes list 78px, like the zlaunch 0.5.1 release.
+# One discrete wheel step moves the selected list by a stable row-sized amount.
 set -euo pipefail
 source "$here/tests/session.bash"
 start_test_keyboard
@@ -8,7 +8,7 @@ mkfifo "$XDG_RUNTIME_DIR/p"
 exec {fd}<>"$XDG_RUNTIME_DIR/p"
 "$P" <"$XDG_RUNTIME_DIR/p" &
 record_test_pid "$!"
-"$Z" show -m themes; sleep .5
+"$Z" show -m emojis; sleep .5
 grim "$OUT/w0.png"
 printf 'm 700 450\ns .3\n' >&$fd; sleep .5
 for i in 1 2 3; do printf 'a 60\n' >&$fd; sleep 1.3; grim "$OUT/w$i.png"; done
@@ -26,6 +26,6 @@ for i in (1, 2, 3):
         (np.abs(base[sh:sh + min(base.shape[0] - sh, c.shape[0])] - c[:min(base.shape[0] - sh, c.shape[0])]).mean(), sh)
         for sh in range(0, 300) if base.shape[0] - sh >= 60
     )
-    assert abs(best[1] - 78 * i) <= 2, f'step {i}: scrolled {best[1]}px, want {78 * i}'
+    assert abs(best[1] - 83 * i) <= 2, f'step {i}: scrolled {best[1]}px, want {78 * i}'
 PY
-echo 'PASS discrete wheel steps scroll 78px each'
+echo 'PASS discrete wheel steps scroll by one emoji row each'

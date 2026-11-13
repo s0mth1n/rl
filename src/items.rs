@@ -22,7 +22,6 @@ pub enum Action {
     ClipFiles(String, u64),
     ClipImg(u64, u64),
     View(String),
-    Theme(String),
 }
 #[derive(Clone, Debug)]
 pub struct Item {
@@ -101,9 +100,6 @@ impl Search<'_> {
     }
 
     pub fn run_mode(&self, query: &str, route_prefixes: bool) -> Vec<Item> {
-        if let Some(filter) = query.strip_prefix('#').filter(|_| route_prefixes) {
-            return theme_items(self.cfg, filter);
-        }
         let q = query.trim();
         if let Some(filter) = q.strip_prefix(':').filter(|_| route_prefixes) {
             return emoji_items(filter.trim());
@@ -239,7 +235,6 @@ impl Search<'_> {
                 ";",
                 "clipboard",
             ),
-            ("Themes", "Browse and apply themes", "#", "palette"),
         ] {
             let (title, sub, view, icon) = (title, sub, view, icon);
             if let Some(score) = scorer.score(title, sub, q, crate::scorer::Kind::Submenu) {
@@ -339,7 +334,6 @@ fn item_module(item: &Item) -> config::ConfigModule {
         (_, "Window") => Windows,
         (Action::View(view), _) if view == ":" => Emojis,
         (Action::View(view), _) if view == ";" => Clipboard,
-        (Action::View(view), _) if view == "#" => Themes,
         _ => Actions,
     }
 }
@@ -486,39 +480,6 @@ pub fn fuzzy(q: &str, s: &str) -> Option<i32> {
         pos = i + 1;
     }
     Some(score - (s.len() as i32 / 8))
-}
-
-/// The theme picker is a `#` query, optionally followed by a name filter.
-pub fn theme_view(query: &str) -> bool {
-    query.trim_start().starts_with('#')
-}
-
-/// Picker rows for bundled and user themes: the configured one first, then alphabetical,
-/// like zlaunch's theme mode. `Action::Theme` previews the row's theme while selected.
-pub fn theme_items(cfg: &Config, q: &str) -> Vec<Item> {
-    let current = if config::load_theme(&cfg.theme).is_some() {
-        cfg.theme.as_str()
-    } else {
-        "default"
-    };
-    let mut names = config::available_themes();
-    names.retain(|(name, _)| config::load_theme(name).is_some());
-    names.sort_by_key(|(name, _)| name != current);
-    let q = q.to_lowercase();
-    names
-        .into_iter()
-        .filter(|(name, source)| {
-            name.to_lowercase().contains(&q) || source.to_lowercase().contains(&q)
-        })
-        .map(|(name, source)| Item {
-            title: name.clone(),
-            sub: source,
-            tag: "Theme",
-            icon: Some(format!("theme:{name}")),
-            action: Action::Theme(name),
-            best: false,
-        })
-        .collect()
 }
 
 pub fn emoji_items(q: &str) -> Vec<Item> {
@@ -738,7 +699,6 @@ mod tests {
                 "Suspend",
                 "Lock Screen",
                 "Log Out",
-                "Themes",
                 "Browser"
             ]
         );
@@ -800,7 +760,6 @@ mod tests {
             vec![
                 Action::App(2),
                 Action::View(";".into()),
-                Action::View("#".into()),
                 Action::App(1),
                 Action::App(0)
             ]
@@ -1016,48 +975,6 @@ mod tests {
         ));
         let rows = search.run(";");
         assert_eq!(rows.len(), 1);
-    }
-    #[test]
-    fn theme_picker_pins_the_current_theme_then_alphabetical() {
-        let _env = crate::testutil::ENV_LOCK.lock().unwrap();
-        let cfg = Config {
-            theme: "nord".into(),
-            ..Config::default()
-        };
-        let history = clip::History::new(10);
-        let search = Search {
-            cfg: &cfg,
-            apps: &[],
-            windows: &[],
-            history: &history,
-        };
-        let missing = Config {
-            theme: "no-such-theme".into(),
-            ..Config::default()
-        };
-        assert_eq!(theme_items(&missing, "")[0].title, "default");
-        let rows = search.run("#");
-        assert_eq!(rows.len(), config::THEMES.len());
-        assert_eq!(rows[0].title, "nord");
-        assert_eq!(rows[0].action, Action::Theme("nord".into()));
-        assert_eq!(rows[0].icon.as_deref(), Some("theme:nord"));
-        assert_eq!(rows[0].sub, "bundled");
-        let rest: Vec<_> = rows[1..].iter().map(|r| r.title.as_str()).collect();
-        let mut sorted = rest.clone();
-        sorted.sort_unstable();
-        assert_eq!(rest, sorted);
-        assert!(rest.contains(&"default"));
-        // The filter narrows by name, keeping the pinned order.
-        let rows = search.run("#catppuccin");
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].title, "catppuccin-latte");
-        assert!(search.run("#zzzz").is_empty());
-        assert!(search.run("#nord ").is_empty());
-        assert!(search.run("# nord").is_empty());
-        assert_eq!(search.run("#NORD")[0].title, "nord");
-        assert!(theme_view("#nord"));
-        assert!(theme_view(" #"));
-        assert!(!theme_view(""));
     }
     #[test]
     fn desktop_entry_uses_only_main_application_section() {

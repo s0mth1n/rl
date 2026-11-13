@@ -91,7 +91,7 @@ for i in $(seq 15); do printf 'rapid-%s' "$i" | wl-copy; sleep 0.05; done
 sleep .5
 type_query ';rapid'
 shot rapid
-# The default-theme list text OCRs poorly in the shared crop; read the title column only.
+# The list text OCRs poorly in the shared crop; read the title column only.
 python3 - "$OUT/rapid.png" "$OUT/rapid-list.png" <<'PY'
 import sys
 from PIL import Image
@@ -132,24 +132,6 @@ printf 'm 640 290\np\nr\ns 0.4\n' | "$P"
 shot singleclick
 check_text singleclick 'earch e'
 echo 'PASS pointer single-click activation'
-
-# A configured theme is loaded on the next daemon start.
-"$Z" quit
-sleep .2
-printf 'theme = "nord"\n' > "$XDG_CONFIG_HOME/zl/config.toml"
-"$Z" >"$OUT/theme-restart.log" 2>&1 & record_test_pid $!
-sleep .5
-type_query '#nord'
-shot nord-picker
-python3 - "$OUT/nord-picker.png" <<'PYTHEME'
-import sys
-from PIL import Image
-pixel = Image.open(sys.argv[1]).convert('RGB').getpixel((640, 450))
-expected = tuple(round(c * (179 / 255) + bg * (1 - 179 / 255))
-                 for c, bg in zip((46, 52, 64), (32, 36, 44)))
-assert all(abs(a - b) <= 2 for a, b in zip(pixel, expected)), (pixel, expected)
-PYTHEME
-echo 'PASS configured theme loads after restart'
 
 # Escape in the combined list hides immediately, even with a query.
 type_query 'abc'
