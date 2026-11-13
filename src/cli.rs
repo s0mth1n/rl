@@ -15,7 +15,8 @@ Commands:
   help    Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help  Print help
+  -h, --help     Print help
+  -V, --version  Print version
 ";
 
 const MODES_HELP: &str =
@@ -281,6 +282,7 @@ pub fn parse(args: &[String]) -> Cmd {
         },
         "help" => help_path(rest),
         "-h" | "--help" => Cmd::Print(HELP.into(), 0),
+        "-V" | "--version" => Cmd::Print(format!("zl {}\n", env!("CARGO_PKG_VERSION")), 0),
         other => usage_error(
             &format!("unrecognized subcommand '{other}'"),
             "zl [COMMAND]",
@@ -329,6 +331,15 @@ mod tests {
         assert!(matches!(p("clear-clipboard"), Cmd::Print(_, 2)));
         assert!(matches!(p("themes"), Cmd::Print(_, 2)));
         assert!(matches!(p("--help"), Cmd::Print(_, 0)));
+    }
+    #[test]
+    fn version_flag_prints_the_crate_version() {
+        for flag in ["--version", "-V"] {
+            let Cmd::Print(text, 0) = p(flag) else {
+                panic!("{flag}")
+            };
+            assert_eq!(text, format!("zl {}\n", env!("CARGO_PKG_VERSION")));
+        }
     }
     #[test]
     fn nested_help_is_local_and_never_a_theme_name() {

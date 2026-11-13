@@ -2247,7 +2247,9 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     let listener = UnixListener::bind(sock())?;
     let _socket_path = socket_path::SocketPath::new(sock())?;
     listener.set_nonblocking(true)?;
-    let conn = Connection::connect_to_env()?;
+    let conn = Connection::connect_to_env().map_err(|error| {
+        format!("cannot connect to the Wayland compositor ({error}); is WAYLAND_DISPLAY set and a compositor running?")
+    })?;
     let mut queue = conn.new_event_queue::<App>();
     let qh = queue.handle();
     conn.display().get_registry(&qh, ());

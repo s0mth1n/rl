@@ -3,6 +3,13 @@ name = "zl"
 version = "0.1.0"
 edition = "2021"
 description = "A basic Wayland app launcher, emoji picker and clipboard history"
+license = "MIT"
+repository = "https://github.com/s0mth1n/rl"
+readme = "README.md"
+rust-version = "1.91"
+keywords = ["wayland", "launcher", "emoji", "clipboard"]
+categories = ["gui"]
+publish = false
 
 [dependencies]
 fend-core = "=1.5.8"
