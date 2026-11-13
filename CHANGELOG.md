@@ -8,8 +8,9 @@ the project uses semantic versioning.
 ### Added
 - `rl --version`.
 - Nix flake with a package, overlay, NixOS module and Home Manager module.
+- `install.sh` for building from source, installing and uninstalling.
 - LICENSE, CHANGELOG and Cargo package metadata.
-- User documentation under docs/.
+- Screenshots and user documentation under docs/.
 
 ### Changed
 - The Wayland connection error now says what to check.
