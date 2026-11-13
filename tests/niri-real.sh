@@ -33,7 +33,7 @@ done
 echo 'PASS two real windows mapped in niri'
 # Every mode, as a real compositor draws it.
 "$Z" show; shot niri-combined; check_text niri-combined 'earch anything'; "$Z" hide; sleep .3
-for pair in applications:'earch applications' calculator:'alculate' actions:'earch actions' search:'earch the web' windows:'earch windows' emojis:'earch e' clipboard:'earch clip' themes:'earch themes'; do
+for pair in applications:'earch applications' calculator:'alculate' actions:'earch actions' search:'earch the web' windows:'earch windows' emojis:'earch e' clipboard:'earch clip'; do
     mode=${pair%%:*}; want=${pair#*:}
     "$Z" show -m "$mode"; shot "niri-mode-$mode"; check_text "niri-mode-$mode" "$want"; "$Z" hide; sleep .3
 done

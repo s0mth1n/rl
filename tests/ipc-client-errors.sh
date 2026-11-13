@@ -24,10 +24,10 @@ for reply, expected in [(b'err test remote failure\n', b'test remote failure'), 
                 connection.sendall(reply)
         worker = threading.Thread(target=serve)
         worker.start()
-        result = subprocess.run([os.environ['Z'], 'show', '-m', 'themes'], env={**os.environ, 'XDG_RUNTIME_DIR': directory}, capture_output=True)
+        result = subprocess.run([os.environ['Z'], 'show', '-m', 'emoji'], env={**os.environ, 'XDG_RUNTIME_DIR': directory}, capture_output=True)
         worker.join(timeout=5)
         assert not worker.is_alive()
-        assert captured == [b'show themes'], captured
+        assert captured == [b'show emojis'], captured
         assert result.returncode == 1, result
         assert expected in result.stderr, result.stderr
         assert result.stdout == b''

@@ -27,7 +27,9 @@ pub fn data_dirs() -> Vec<PathBuf> {
         nix.push(PathBuf::from(profile_home).join(".nix-profile/share"));
     }
     if !user.is_empty() {
-        nix.push(PathBuf::from(format!("/etc/profiles/per-user/{user}/share")));
+        nix.push(PathBuf::from(format!(
+            "/etc/profiles/per-user/{user}/share"
+        )));
     }
     for dir in nix {
         let dir = dir.components().collect::<PathBuf>();
@@ -90,9 +92,7 @@ fn scan_dirs(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
                                 .and_then(|p| p.file_name())
                                 .or_else(|| dir.file_name())
                                 .and_then(|n| n.to_str())
-                                .and_then(|n| {
-                                    n.split('x').next()?.parse::<u32>().ok()
-                                })
+                                .and_then(|n| n.split('x').next()?.parse::<u32>().ok())
                                 .unwrap_or(if path.extension().is_some_and(|e| e == "svg") {
                                     4096
                                 } else {
@@ -286,8 +286,7 @@ pub fn find_window(name: &str, themes: &[String]) -> Option<PathBuf> {
     }
     // Windows of apps whose class is not an icon name (Electron apps, KDE's
     // org.kde.* classes): use the icon of the matching desktop entry.
-    desktop_entry_icon(name)
-        .and_then(|icon| find(&icon, themes))
+    desktop_entry_icon(name).and_then(|icon| find(&icon, themes))
 }
 
 /// Decode a PNG or SVG file to `size` x `size` premultiplied pixels.
@@ -945,10 +944,17 @@ mod fallback_tests {
         std::fs::write(share.join("pixmaps/legacy-app.png"), b"x").unwrap();
         // Breeze layout (apps/48) in a theme with no index.theme.
         std::fs::create_dir_all(share.join("icons/breeze/apps/48")).unwrap();
-        std::fs::write(share.join("icons/breeze/apps/48/org.kde.plasma.emojier.svg"), b"x")
-            .unwrap();
+        std::fs::write(
+            share.join("icons/breeze/apps/48/org.kde.plasma.emojier.svg"),
+            b"x",
+        )
+        .unwrap();
         std::fs::create_dir_all(share.join("icons/other/64x64/apps")).unwrap();
-        std::fs::write(share.join("icons/other/64x64/apps/claude-desktop.png"), b"x").unwrap();
+        std::fs::write(
+            share.join("icons/other/64x64/apps/claude-desktop.png"),
+            b"x",
+        )
+        .unwrap();
         let dirs = [root.path().join("empty"), share.clone()];
         assert_eq!(
             scan_dirs("legacy-app", &dirs),

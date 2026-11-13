@@ -159,7 +159,6 @@ fn main() {
         let (pw, ph) = (600 * scale, ui::PANEL_HEIGHT * scale);
         for i in 0..160usize {
             let scroll_view = ui::View {
-                theme_palettes: None,
                 placeholder: None,
                 literal_prefix: false,
                 query: "",
@@ -197,7 +196,6 @@ fn main() {
     let rows = search.run("firefox");
     let h = ui::PANEL_HEIGHT;
     let view = ui::View {
-        theme_palettes: None,
         placeholder: None,
         literal_prefix: false,
         query: "firefox",

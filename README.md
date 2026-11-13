@@ -13,7 +13,7 @@ on the CPU, needs no GPU toolkit and runs as a daemon you toggle with a key.
   password-manager content are skipped.
 - Calculator, system actions, web search (`!g`, `!d`, `!wiki`, `!yt`, or your own providers).
 - Window switching on Hyprland, KWin, Niri and MangoWM.
-- Themes, live preview, optional transparency and compositor blur.
+- Optional transparency and compositor blur.
 
 ![Search](docs/screenshots/search.png)
 
@@ -29,14 +29,12 @@ Start the daemon once from your compositor config, then bind a key to `rl toggle
 rl                    # run the daemon
 rl toggle             # show or hide the panel
 rl show -m emojis     # open straight into a mode
-rl theme list
-rl theme set NAME
 rl reload
 rl --help
 ```
 
 Modes: combined, applications, emojis, calculator, clipboard, actions, search,
-themes and windows. Combine them with commas.
+windows. Combine them with commas.
 
 Type to search. Up/Down or Tab/Shift-Tab select, Enter activates, Escape clears
 the view and then closes the panel. `:` opens emoji, `;` opens clipboard history.
@@ -157,7 +155,6 @@ Home Manager:
     enable = true;
     systemd.enable = true;
     settings = {
-      theme = "default";
       enable_transparency = true;
     };
   };
@@ -169,7 +166,6 @@ Home Manager:
 `~/.config/rl/config.toml`, read at startup. Restart the daemon after editing.
 
 ```toml
-theme = "default"
 launcher_size = [600.0, 400.0]
 enable_backdrop = true
 enable_transparency = true
@@ -177,7 +173,7 @@ max_clipboard_history = 500
 store_passwords = false
 ```
 
-Themes, fonts, web search providers, privacy notes and blur are in
+Fonts, web search providers, privacy notes and blur are in
 [docs/configuration.md](docs/configuration.md).
 
 ## Compositors
@@ -212,5 +208,5 @@ See [docs/development.md](docs/development.md). Changes are listed in
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Parts of the layout, themes and behaviour come from
+MIT, see [LICENSE](LICENSE). Parts of the layout and behaviour come from
 third-party code (MIT), see [NOTICE](NOTICE).

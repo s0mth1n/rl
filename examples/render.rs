@@ -93,12 +93,6 @@ impl Options {
                 "--output" => o.output = value,
                 "--view" => o.view = value,
                 "--query" => o.query = value,
-                "--theme" => {
-                    if config::load_theme(&value).is_none() {
-                        return Err(format!("unknown theme: {value}").into());
-                    }
-                    o.cfg.theme = value;
-                }
                 "--font" => o.cfg.font_path = value,
                 "--emoji-font" => o.cfg.emoji_font = value,
                 "--scale" => o.scale = value.parse()?,
@@ -129,14 +123,13 @@ impl Options {
         }
         o.query = match o.view.as_str() {
             "launcher" => o.query,
-            "themes" => format!("#{}", o.query),
             "emoji" => format!(":{}", o.query),
             "clipboard" => format!(";{}", o.query),
-            _ => return Err("view must be launcher, themes, emoji or clipboard".into()),
+            _ => return Err("view must be launcher, emoji or clipboard".into()),
         };
         o.input()?;
-        if o.back && !o.query.starts_with([':', ';', '#']) {
-            return Err("back requires an emoji, clipboard or theme sub-view".into());
+        if o.back && !o.query.starts_with([':', ';']) {
+            return Err("back requires an emoji or clipboard sub-view".into());
         }
         Ok(o)
     }
@@ -144,7 +137,7 @@ impl Options {
     fn input(&self) -> Result<(usize, Option<usize>, bool), Box<dyn Error>> {
         let visible = self
             .query
-            .strip_prefix([':', ';', '#'])
+            .strip_prefix([':', ';'])
             .map(str::trim_start)
             .unwrap_or(&self.query);
         let prefix = self.query.len() - visible.len();
@@ -281,15 +274,7 @@ fn render(o: &Options) -> Result<(ui::Canvas, usize), Box<dyn Error>> {
     }
     .run(&o.query);
     let sel = o.selected.min(items.len().saturating_sub(1));
-    // The picker recolours the panel with the selected theme, exactly like the daemon.
-    let theme = match items.get(sel).map(|it| &it.action) {
-        Some(items::Action::Theme(name)) => {
-            let mut cfg = o.cfg.clone();
-            cfg.theme = name.clone();
-            cfg.theme()
-        }
-        _ => o.cfg.theme(),
-    };
+    let theme = o.cfg.theme();
     let layout = ui::Layout::new(&theme.metrics);
     let emoji = o.view == "emoji";
     let columns = if emoji {
@@ -331,7 +316,6 @@ fn render(o: &Options) -> Result<(ui::Canvas, usize), Box<dyn Error>> {
     }
     let mut canvas = ui::Canvas::new(o.cfg.width * o.scale, h * o.scale);
     let view = ui::View {
-        theme_palettes: None,
         placeholder: None,
         literal_prefix: false,
         query: &o.query,
@@ -405,7 +389,7 @@ mod tests {
         assert_eq!(idle.input().unwrap(), (0, None, true));
         let editing = parse(&[
             "--view",
-            "themes",
+            "emoji",
             "--query",
             "éclair",
             "--caret",
@@ -455,9 +439,9 @@ mod tests {
             }
             assert!(count > 0);
         };
-        let direct = render(&parse(&["--view", "themes", "--query", "nord"])).unwrap();
+        let direct = render(&parse(&["--view", "emoji", "--query", "smile"])).unwrap();
         let back = render(&parse(&[
-            "--view", "themes", "--query", "nord", "--back", "true",
+            "--view", "emoji", "--query", "smile", "--back", "true",
         ]))
         .unwrap();
         changed(&direct, &back, (22, 20, 39, 37));
@@ -513,7 +497,6 @@ mod tests {
             ["--rows", "0"],
             ["--width", "99999"],
             ["--view", "bogus"],
-            ["--theme", "bogus"],
         ] {
             assert!(Options::parse(args.into_iter().map(str::to_owned)).is_err());
         }
@@ -525,12 +508,5 @@ mod tests {
         )
         .unwrap();
         assert_eq!(o.query, ":smile");
-        let o = Options::parse(
-            ["--view", "themes", "--query", "nord"]
-                .into_iter()
-                .map(str::to_owned),
-        )
-        .unwrap();
-        assert_eq!(o.query, "#nord");
     }
 }

@@ -21,7 +21,6 @@ pub fn em_scale(font: &Font, size: f32) -> Scale {
 /// Base font size; titles use 0.875 em and descriptions use 0.75 em.
 pub const DEFAULT_REM: f32 = 16.0;
 
-
 // Default logical-pixel measurements for the panel and list.
 pub const HEAD: f32 = 58.0;
 #[allow(dead_code)]
@@ -34,12 +33,11 @@ pub const LIST_PAD: f32 = 8.0;
 /// Clipboard rows: 58px pitch, list origin HEAD + 5.
 pub const CLIP_ROW: f32 = 58.0;
 pub const CLIP_TOP: f32 = 5.0;
-/// Query text origin in the header; the search icon box sits at (22, 20.5), drawn by the icon code.
-pub const INPUT_X: f32 = 49.7;
+/// Query text origin in the header.
+pub const INPUT_X: f32 = 20.0;
 /// Right edge the query text must clear (room for the clear button).
 pub const INPUT_RIGHT: f32 = 90.0;
-/// Input text and caret #fafafa, placeholder and header icons #737373,
-/// constant across themes.
+/// Input text, caret, placeholder and header symbol colours.
 pub(crate) const INPUT_FG: Rgb = [250, 250, 250];
 pub(crate) const INPUT_DIM: Rgb = [115, 115, 115];
 /// Input selection fill.
@@ -135,9 +133,8 @@ impl Canvas {
         let end = ((y as u32 * self.w + x1 as u32) * 4) as usize;
         // One table per channel: the same float expression as `blend`, evaluated
         // once per possible old byte instead of once per pixel.
-        let channel = |add: f32| -> [u8; 256] {
-            std::array::from_fn(|old| (add * a + old as f32 * k) as u8)
-        };
+        let channel =
+            |add: f32| -> [u8; 256] { std::array::from_fn(|old| (add * a + old as f32 * k) as u8) };
         let lut = [
             channel(c[2] as f32),
             channel(c[1] as f32),
@@ -514,61 +511,7 @@ impl Canvas {
     }
 }
 
-fn lighten(c: Rgb, amount: f32) -> Rgb {
-    let c = c.map(|v| v as f32 / 255.0);
-    let hi = c.iter().copied().fold(0.0, f32::max);
-    let lo = c.iter().copied().fold(1.0, f32::min);
-    let light = (hi + lo) / 2.0;
-    let next = (light + amount).min(1.0);
-    let chroma = hi - lo;
-    if chroma == 0.0 {
-        return [(next * 255.0).round() as u8; 3];
-    }
-    let saturation = chroma / (1.0 - (2.0 * light - 1.0).abs());
-    let new_chroma = (1.0 - (2.0 * next - 1.0).abs()) * saturation;
-    c.map(|v| (((v - lo) / chroma * new_chroma + next - new_chroma / 2.0) * 255.0).round() as u8)
-}
-
-/// Theme preview icon: the window background holding
-/// the title, selection and border colours.
-fn theme_icon(cv: &mut Canvas, x: f32, y: f32, size: f32, th: &Theme) {
-    let inner = size * 0.35;
-    let gap = size * 0.08;
-    let pad = size * 0.15;
-    let r = size * 0.12;
-    cv.rrect(
-        x,
-        y,
-        size,
-        size,
-        size / 4.0,
-        lighten(th.bg, 0.05),
-        th.bg_alpha,
-    );
-    cv.rrect(x + pad, y + pad, inner, inner, r, th.text, th.text_alpha);
-    cv.rrect(
-        x + pad + inner + gap,
-        y + pad,
-        inner,
-        inner,
-        r,
-        lighten(th.select, 0.1),
-        th.select_alpha,
-    );
-    let bar_y = y + pad + inner + gap;
-    cv.rrect(
-        x + pad,
-        bar_y,
-        size - 2.0 * pad,
-        y + size - pad - bar_y,
-        r,
-        th.border,
-        th.border_alpha,
-    );
-}
-
 pub struct View<'a> {
-    pub theme_palettes: Option<&'a std::collections::HashMap<String, Theme>>,
     pub query: &'a str,
     pub literal_prefix: bool,
     pub placeholder: Option<&'a str>,
@@ -863,7 +806,6 @@ fn action_label(a: &Action) -> &'static str {
         Action::Window(_) => "Switch",
         Action::Clip(..) | Action::ClipFiles(..) | Action::ClipImg(..) => "Copy",
         Action::View(_) => "→",
-        Action::Theme(_) => "Apply",
     }
 }
 
@@ -1152,6 +1094,7 @@ pub fn input_at_mode(
     width: u32,
     x: f64,
     literal: bool,
+    back: bool,
 ) -> usize {
     let shown = input_visible_text(if literal { "" } else { query }, query);
     let prefix = query.len() - shown.len();
@@ -1161,9 +1104,9 @@ pub fn input_at_mode(
         16.0,
         shown,
         caret,
-        (width as f32 - INPUT_X - INPUT_RIGHT).max(0.0),
+        (width as f32 - input_x(back) - INPUT_RIGHT).max(0.0),
     );
-    let x = x as f32 - INPUT_X;
+    let x = x as f32 - input_x(back);
     let mut previous = 0.0;
     let mut index = 0;
     for (end, next) in input_glyphs(font, 16.0, &shown[start..]) {
@@ -1179,10 +1122,16 @@ pub fn input_at_mode(
 fn input_visible_text<'a>(query: &str, text: &'a str) -> &'a str {
     if query.starts_with([':', ';']) {
         text[1..].trim_start()
-    } else if query.starts_with('#') {
-        &text[1..]
     } else {
         text
+    }
+}
+
+fn input_x(back: bool) -> f32 {
+    if back {
+        49.7
+    } else {
+        INPUT_X
     }
 }
 
@@ -1192,6 +1141,7 @@ pub fn input_cursor_rectangle(
     text: &str,
     caret: usize,
     width: u32,
+    back: bool,
 ) -> (i32, i32, i32, i32) {
     let shown = input_visible_text(query, text);
     let prefix = text.len() - shown.len();
@@ -1201,9 +1151,9 @@ pub fn input_cursor_rectangle(
         16.0,
         shown,
         caret,
-        (width as f32 - INPUT_X - INPUT_RIGHT).max(0.0),
+        (width as f32 - input_x(back) - INPUT_RIGHT).max(0.0),
     );
-    let x = INPUT_X + Canvas::text_width(font, 16.0, &shown[start..caret]);
+    let x = input_x(back) + Canvas::text_width(font, 16.0, &shown[start..caret]);
     (
         x.round() as i32,
         ((HEAD - 16.0) / 2.0).round() as i32,
@@ -1226,36 +1176,22 @@ pub fn draw_input_with_placeholder(
     let w = v.w as f32 * s;
     let fs = 14.0 * (v.font_size / DEFAULT_REM) * s;
     let y = (HEAD - 16.0) / 2.0 * s;
-    // Menu-entered sub-views show a back arrow; the theme picker entered
-    // directly shows a palette.
-    let prefix_icon = if v.back {
-        crate::icons::BACK
-    } else if v.view_query().trim_start().starts_with('#') {
-        crate::icons::PALETTE
-    } else {
-        match v.placeholder {
-            Some("Search windows...") => crate::icons::DASHBOARD,
-            Some("Search actions...") => crate::icons::MODE_ACTIONS,
-            Some("Search the web...") => crate::icons::MODE_SEARCH,
-            _ => crate::icons::SEARCH,
+    if v.back {
+        if let Some(icon) = v.icons.get(crate::icons::BACK, 16 * v.scale) {
+            cv.symbol(
+                (22.0 * s) as i32,
+                ((HEAD - 16.0) * 0.5 * s) as i32,
+                icon,
+                INPUT_DIM,
+                1.0,
+            );
         }
-    };
-    if let Some(icon) = v.icons.get(prefix_icon, 16 * v.scale) {
-        cv.symbol(
-            (22.0 * s) as i32,
-            ((HEAD - 16.0) * 0.5 * s) as i32,
-            icon,
-            INPUT_DIM,
-            1.0,
-        );
     }
-    let x = INPUT_X * s;
+    let x = input_x(v.back) * s;
     let max_w = (w - x - INPUT_RIGHT * s).max(0.0);
     let input_text = v.input_text.unwrap_or(v.query);
     let placeholder = if v.view_query().starts_with(':') {
         "Search emojis..."
-    } else if v.view_query().starts_with('#') {
-        "Search themes..."
     } else if v.view_query().starts_with(';') {
         "Search clipboard..."
     } else {
@@ -1334,11 +1270,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
     }
     if v.items.is_empty() {
         let es = v.font_size * 0.875 * s;
-        let label = if crate::items::theme_view(v.view_query()) {
-            "No themes found"
-        } else {
-            "No items found"
-        };
+        let label = "No items found";
         let tw = Canvas::text_width(font, es, label);
         let ec = th.empty_state_color;
         cv.text(
@@ -1421,13 +1353,6 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
                 color.alpha,
                 icon_size,
             );
-        } else if let Some(name) = icon_name.and_then(|n| n.strip_prefix("theme:")) {
-            let palette = v
-                .theme_palettes
-                .and_then(|palettes| palettes.get(name))
-                .copied()
-                .unwrap_or_else(|| crate::config::theme(name));
-            theme_icon(cv, ix, iy, icon_size, &palette);
         } else if let Some(ic) = icon_name.and_then(|n| v.icons.get(n, icon_px(th, v.scale))) {
             if ic.symbol {
                 let pb = th.icon_placeholder_background;
@@ -1676,7 +1601,6 @@ mod tests {
             &mut cv,
             font,
             &View {
-                theme_palettes: None,
                 literal_prefix: false,
                 query: "a",
                 placeholder: None,
@@ -1733,7 +1657,10 @@ mod tests {
         )
         .unwrap();
         let text = format!("e{}", "\u{301}".repeat(10000));
-        assert_eq!(input_at_mode(&font, &text, 0, 600, 400.0, true), text.len());
+        assert_eq!(
+            input_at_mode(&font, &text, 0, 600, 400.0, true, false),
+            text.len()
+        );
     }
 
     #[test]
@@ -1776,13 +1703,13 @@ mod tests {
         let text = "WWWWWWWWWW";
         let x = INPUT_X + Canvas::text_width(&font, 16.0, &text[..5]);
         assert_eq!(
-            input_at_mode(&font, text, text.len(), 600, x as f64, true),
+            input_at_mode(&font, text, text.len(), 600, x as f64, true, false),
             5
         );
-        let theme = "#  WWWWWWWWWW";
+        let query = ":  WWWWWWWWWW";
         assert_eq!(
-            input_at_mode(&font, theme, theme.len(), 600, INPUT_X as f64, false),
-            1
+            input_at_mode(&font, query, query.len(), 600, INPUT_X as f64, false, false),
+            3
         );
     }
 
@@ -1884,17 +1811,16 @@ mod tests {
         let cv = drawn(&font, &items, 0, Theme::default());
         // Separator: white at 0.1 opacity.
         assert_eq!(px(&cv, 500, 57), [34, 34, 34, 185]);
-        // magnifier at (22, 20.5) and, with a non-empty query, CircleX right
-        assert!(lit(&cv, 22, 38, 20, 37) > 5, "magnifier icon drawn");
+        // Non-empty text still shows CircleX.
         assert!(lit(&cv, 600, 616, 20, 37) > 5, "clear button drawn");
         // query text and caret are solid #fafafa, not the theme's dimmed text
         // or accent: 250 over the 10-gray panel at full coverage
         assert!(
-            has_solid(&cv, 50, 62, 20, 40, [250, 250, 250, 255]),
+            has_solid(&cv, 21, 34, 20, 40, [250, 250, 250, 255]),
             "query"
         );
         assert!(
-            has_solid(&cv, 54, 70, 21, 40, [250, 250, 250, 255]),
+            has_solid(&cv, 25, 40, 21, 40, [250, 250, 250, 255]),
             "caret"
         );
 
@@ -1908,7 +1834,6 @@ mod tests {
             &mut cv,
             &font,
             &View {
-                theme_palettes: None,
                 literal_prefix: false,
                 query: "",
                 placeholder: None,
@@ -1933,11 +1858,37 @@ mod tests {
             },
         );
         assert!(
-            has_solid(&cv, 50, 220, 20, 40, [115, 115, 115, 255]),
+            has_solid(&cv, 21, 220, 20, 40, [115, 115, 115, 255]),
             "placeholder"
         );
         assert_eq!(lit(&cv, 600, 616, 20, 37), 0, "no clear button");
-        assert!(lit(&cv, 22, 38, 20, 37) > 5, "magnifier still drawn");
+
+        let empty_input = View {
+            literal_prefix: false,
+            query: "",
+            placeholder: Some(""),
+            input_text: None,
+            marked: None,
+            input: Some((0, None, false)),
+            back: false,
+            scrollbar: crate::scroll::Style::visible(),
+            items: &items,
+            sel: 0,
+            top: 0,
+            scroll_remainder: 0.0,
+            vp,
+            theme: Theme::default(),
+            w: 640,
+            h,
+            scale: 1,
+            font_size: 15.0,
+            mono_font_family: None,
+            icons: &icons,
+            bold_font: None,
+        };
+        let mut empty = Canvas::new(640, h);
+        draw_input_with_placeholder(&mut empty, &font, &empty_input, Some(""));
+        assert_eq!(lit(&empty, 22, 38, 20, 37), 0, "no prefix icon");
 
         // selection: constant #1d4ed8
         let mut icons = Cache::new("", "");
@@ -1949,7 +1900,6 @@ mod tests {
             &mut cv,
             &font,
             &View {
-                theme_palettes: None,
                 literal_prefix: false,
                 query: "a",
                 placeholder: None,
@@ -1974,7 +1924,7 @@ mod tests {
             },
         );
         assert!(
-            has_solid(&cv, 50, 62, 20, 40, [73, 31, 17, 255]),
+            has_solid(&cv, 21, 34, 20, 40, [73, 31, 17, 255]),
             "selection"
         );
     }
@@ -2103,35 +2053,6 @@ mod tests {
             over(255, 0.2, bg[3]),
         ];
         assert_eq!(px(&cv, 480, 140), want);
-    }
-
-    #[test]
-    fn every_bundled_theme_renders_with_its_own_alpha() {
-        let Some(font) = test_font() else {
-            eprintln!("skip: DejaVu Sans not installed");
-            return;
-        };
-        let items: Vec<Item> = (0..3).map(|i| app(&format!("a{i}"))).collect();
-        for name in crate::config::THEMES {
-            let th = crate::config::theme(name);
-            let cv = drawn(&font, &items, 0, th);
-            let ba = th.bg_alpha;
-            let panel = [
-                (th.bg[2] as f32 * ba) as u8,
-                (th.bg[1] as f32 * ba) as u8,
-                (th.bg[0] as f32 * ba) as u8,
-                (255.0 * ba) as u8,
-            ];
-            assert_eq!(px(&cv, 500, 30), panel, "{name} panel");
-            let sa = th.select_alpha;
-            let selected = [
-                over(th.select[2], sa, panel[0]),
-                over(th.select[1], sa, panel[1]),
-                over(th.select[0], sa, panel[2]),
-                over(255, sa, panel[3]),
-            ];
-            assert_eq!(px(&cv, 480, 90), selected, "{name} selected row");
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2362,7 +2283,7 @@ mod tests {
             (HEAD, ROW, HDR, ICON, LIST_PAD),
             (58.0, 50.0, 28.0, 24.0, 8.0)
         );
-        assert_eq!((INPUT_X, INPUT_RIGHT), (49.7, 90.0));
+        assert_eq!((INPUT_X, INPUT_RIGHT), (20.0, 90.0));
         // The default launcher_size fixes every panel at 600x400.
         assert_eq!(PANEL_HEIGHT, 400);
         assert_eq!(LIST_VP, 326.0);
@@ -2427,7 +2348,6 @@ mod tests {
             &mut cv,
             &font,
             &View {
-                theme_palettes: None,
                 literal_prefix: false,
                 query: "a",
                 placeholder: None,
@@ -2467,7 +2387,6 @@ mod tests {
             let items = [item];
             let mut cv = Canvas::new(600, 400);
             let view = View {
-                theme_palettes: None,
                 literal_prefix: false,
                 query: ":",
                 placeholder: None,
@@ -2514,7 +2433,6 @@ mod tests {
             let s = scale as f32;
             let mut cv = Canvas::new(600 * scale, 400 * scale);
             let view = View {
-                theme_palettes: None,
                 literal_prefix: false,
                 query: ":missing",
                 placeholder: None,
@@ -2569,7 +2487,6 @@ mod tests {
             &mut cv,
             &font,
             &View {
-                theme_palettes: None,
                 literal_prefix: false,
                 query: ":smile",
                 placeholder: None,
@@ -2625,7 +2542,6 @@ mod tests {
                 &mut cv,
                 &font,
                 &View {
-                    theme_palettes: None,
                     literal_prefix: false,
                     query: "a",
                     placeholder: None,
@@ -2713,27 +2629,6 @@ mod tests {
                 }
             }
         }
-    }
-    #[test]
-    fn theme_icon_shows_palette_samples() {
-        let th = Theme {
-            bg_alpha: 1.0,
-            text_alpha: 1.0,
-            select_alpha: 1.0,
-            border_alpha: 1.0,
-            ..crate::config::theme("nord")
-        };
-        let mut cv = Canvas::new(24, 24);
-        theme_icon(&mut cv, 0.0, 0.0, 24.0, &th);
-        // The canvas is premultiplied BGR; every alpha is 1 here, so channels are exact.
-        let px = |x: usize, y: usize| {
-            let o = (y * 24 + x) * 4;
-            [cv.buf[o + 2], cv.buf[o + 1], cv.buf[o]]
-        };
-        assert_eq!(px(7, 7), th.text, "title colour square");
-        assert_eq!(px(18, 7), lighten(th.select, 0.1), "selection square");
-        assert_eq!(px(12, 17), th.border, "border bar");
-        assert_eq!(px(1, 12), lighten(th.bg, 0.05), "window background");
     }
     #[test]
     fn custom_theme_layout_drives_slots_hits_scroll_bounds_and_emoji_cells() {
