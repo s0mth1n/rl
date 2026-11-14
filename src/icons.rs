@@ -522,6 +522,7 @@ fn sequence_glyph(face: &ttf_parser::Face, glyph: &str) -> Option<ttf_parser::Gl
 /// Small bounded cache. A miss is remembered too, so a missing icon is looked up once.
 pub struct Cache {
     map: HashMap<(String, u32), Option<Icon>>,
+    order: std::collections::VecDeque<(String, u32)>,
     themes: Vec<String>,
     emoji_font: Option<Option<memmap2::Mmap>>,
     /// PNG bytes supplied by the compositor for open windows (KWin), keyed by
@@ -537,6 +538,7 @@ impl Cache {
     pub fn new(theme: &str, emoji_font: &str) -> Self {
         Cache {
             map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
             themes: theme_chain(theme),
             emoji_font: if emoji_font.is_empty() {
                 None
@@ -558,6 +560,7 @@ impl Cache {
     pub fn forget_window_icons(&mut self) {
         self.window_paths.clear();
         self.map.retain(|(name, _), _| !name.starts_with("window:"));
+        self.order.retain(|key| self.map.contains_key(key));
     }
     pub fn ensure(&mut self, name: &str, size: u32) {
         // Raster icons are limited to 4 MiB each, including theme and scale overrides.
@@ -566,11 +569,16 @@ impl Cache {
         }
         let key = (name.to_string(), size);
         if self.map.contains_key(&key) {
+            self.order.retain(|old| old != &key);
+            self.order.push_back(key);
             return;
         }
         if self.map.len() >= 256 {
-            self.map.clear();
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
         }
+        self.order.push_back(key.clone());
         let symbol: Option<&[u8]> = match name {
             SEARCH => Some(include_bytes!("../assets/icons/search.svg").as_slice()),
             CLEAR => Some(CLEAR_SVG),
@@ -640,11 +648,6 @@ impl Cache {
         self.map.insert(key, icon);
     }
     pub fn ensure_input(&mut self, scale: u32) {
-        if self.map.len() > 94
-            && (self.get(SEARCH, 16 * scale).is_none() || self.get(CLEAR, 16 * scale).is_none())
-        {
-            self.map.clear();
-        }
         self.ensure(SEARCH, 16 * scale);
         self.ensure(CLEAR, 16 * scale);
         self.ensure(BACK, 16 * scale);
@@ -682,6 +685,22 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cache_evicts_one_least_recently_requested_icon() {
+        let mut cache = Cache::new("", "");
+        for index in 0..256 {
+            cache.ensure(&format!("phosphor:missing-{index}"), 16);
+        }
+        cache.ensure("phosphor:missing-0", 16);
+        cache.ensure(CLEAR, 16);
+        assert_eq!(cache.map.len(), 256);
+        assert_eq!(cache.order.len(), 256);
+        assert!(cache.map.contains_key(&("phosphor:missing-0".into(), 16)));
+        assert!(!cache.map.contains_key(&("phosphor:missing-1".into(), 16)));
+        assert!(cache.map.contains_key(&("phosphor:missing-255".into(), 16)));
+        assert!(cache.get(CLEAR, 16).is_some());
+    }
+
     #[test]
     fn clipboard_header_copy_uses_the_component_svg_at_requested_size() {
         let mut cache = Cache::new("", "");
@@ -752,12 +771,12 @@ mod tests {
         cache.ensure_input(1);
         assert_eq!(cache.map.len(), 21);
         for index in 0..90 {
-            cache.map.insert((format!("missing-{index}"), 16), None);
+            cache.ensure(&format!("phosphor:missing-{index}"), 16);
         }
         cache.ensure_input(4);
         assert!(cache.get(SEARCH, 64).is_some());
         assert!(cache.get(CLEAR, 64).is_some());
-        assert_eq!(cache.map.len(), 7);
+        assert_eq!(cache.map.len(), 118);
     }
 
     #[test]
