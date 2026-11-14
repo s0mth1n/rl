@@ -53,14 +53,12 @@ impl Menu {
         let s = scale as f32;
         let x = self.x as f32 * s;
         let y = self.y as f32 * s;
-        // Large drop shadow: black at 0.1 alpha, offsets 10px/4px, blur 15px/6px, spread -3px/-4px.
+        // Two shadow layers soften the menu edges.
         for (offset, blur, spread) in [(10.0_f32, 15.0_f32, -3.0_f32), (4.0, 6.0, -4.0)] {
             cv.shadow(
                 (x, y, WIDTH as f32 * s, HEIGHT as f32 * s),
                 (offset - 3.0_f32).max(0.0) * s,
-                // Fitted to the measured pixel profile (below and beside the menu):
-                // a tight gaussian (sigma = blur / 10) with the spread 3px larger than the
-                // nominal em number, with the tail 3px shorter.
+                // The tight blur keeps the shadow clear of nearby menu text.
                 blur * 0.2 * s,
                 (spread + 3.0) * s,
                 0.1,

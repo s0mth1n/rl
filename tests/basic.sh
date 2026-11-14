@@ -78,7 +78,7 @@ type_query ';Basic clipboard sample'
 shot clipboard-reloaded
 check_text clipboard-reloaded 'Basic clipboard sample'
 echo 'PASS clipboard survives restart'
-# A second launch exits 0 with "already running" when a daemon exists; it must not take over.
+# A second daemon exits 0 with "already running" and must not take over.
 "$Z" >"$OUT/second-daemon.log" 2>&1 || { echo 'FAIL second daemon failed instead of exiting 0'; exit 1; }
 grep -q 'already running' "$OUT/second-daemon.log" || { echo 'FAIL second daemon did not report the running one'; exit 1; }
 "$Z" hide

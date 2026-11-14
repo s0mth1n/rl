@@ -98,7 +98,7 @@ fi
 
 for tag in CBDT sbix COLR; do
     printf '%s' "$tag" > "$work/font"
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2317,SC2329
     fc-match() { printf '%s' "$work/font"; }
     if [[ "$tag" == COLR ]]; then
         if font_available emoji; then fail 'Accepted a COLR-only font'; fi

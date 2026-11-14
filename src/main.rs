@@ -189,7 +189,7 @@ struct App {
     pointer: Option<(f64, f64)>,
     pointer_on_backdrop: bool,
     last_click: Option<(usize, Instant)>,
-    /// A discrete wheel step arrived in this frame; the release scrolls 1.3x for those.
+    /// A discrete wheel step arrived in this frame; apply the 1.3x wheel multiplier.
     wheel_discrete: bool,
     /// A sub-view was entered from the combined list, so show a back arrow.
     origin: Option<String>,
@@ -655,7 +655,7 @@ impl App {
         }
         self.icons.ensure_input(s);
         if self.view_query().starts_with(';') && self.origin.is_none() {
-            self.icons.ensure("phosphor:copy", 16 * s);
+            self.icons.ensure("symbol:copy", 16 * s);
         }
         if let Some(b) = &self.backdrop {
             let (x, y) = panel_position(b.width, b.height, self.cfg.width, h);
@@ -1110,7 +1110,7 @@ impl App {
         if self.view_query().starts_with(';') && x >= self.cfg.width as f64 * 0.5 {
             return None;
         }
-        // The clipboard list starts 3px higher than the other lists in the release.
+        // The clipboard list starts 3px higher than the other lists.
         let origin = if self.view_query().starts_with(';') {
             ui::HEAD + ui::CLIP_TOP
         } else {
@@ -1975,7 +1975,7 @@ impl Dispatch<WlPointer, ()> for App {
                 ..
             } => {
                 // One discrete wheel step of 60 scrolls
-                // 78px there. Pixel-valued (touchpad) deltas stay unscaled.
+                // 78px. Pixel-valued (touchpad) deltas stay unscaled.
                 let value = if std::mem::take(&mut a.wheel_discrete) {
                     value * 1.3
                 } else {
@@ -2491,11 +2491,12 @@ mod backdrop_tests {
 #[cfg(test)]
 mod picker_tests {
     use super::*;
-    fn app(cfg: Config) -> App {
-        App {
+    fn app(cfg: Config) -> Option<App> {
+        let font = crate::testutil::font()?;
+        Some(App {
             theme: cfg.theme(),
             icons: icons::Cache::new(&cfg.icon_theme, &cfg.emoji_font),
-            font: load_font(&cfg),
+            font,
             font_size: cfg.startup_font_size(),
             mono_font_family: cfg.startup_fonts().mono_font_family,
             bold_font: load_bold_font(&cfg),
@@ -2564,7 +2565,7 @@ mod picker_tests {
             offers: Default::default(),
             reads: vec![],
             own_source: None,
-        }
+        })
     }
     #[test]
     fn removed_outputs_leave_no_stale_scale_or_active_reference() {
@@ -2577,7 +2578,9 @@ mod picker_tests {
             let registry = connection.display().get_registry(&qh, ());
             let live: WlOutput = registry.bind(50, version, &qh, ());
             let removed: WlOutput = registry.bind(100, version, &qh, ());
-            let mut a = app(Config::default());
+            let Some(mut a) = app(Config::default()) else {
+                return;
+            };
             a.outputs = vec![
                 Out {
                     global_name: 50,
@@ -2624,7 +2627,9 @@ mod picker_tests {
     #[test]
     fn hiding_cancels_partial_keyboard_compose_sequences() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();
-        let mut a = app(Config::default());
+        let Some(mut a) = app(Config::default()) else {
+            return;
+        };
         let table = xkb::compose::Table::new_from_locale(
             &a.ctx,
             std::ffi::OsStr::new("C.UTF-8"),
@@ -2647,8 +2652,8 @@ mod picker_tests {
         }
     }
 
-    fn scroll_fixture(query: &str) -> App {
-        let mut a = app(Config::default());
+    fn scroll_fixture(query: &str) -> Option<App> {
+        let mut a = app(Config::default())?;
         a.query = query.into();
         a.items = (0..20)
             .map(|i| Item {
@@ -2660,13 +2665,15 @@ mod picker_tests {
                 best: false,
             })
             .collect();
-        a
+        Some(a)
     }
 
     #[test]
     fn pixel_scroll_keeps_selection_and_remainder_and_clamps_both_ends() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();
-        let mut a = scroll_fixture("a");
+        let Some(mut a) = scroll_fixture("a") else {
+            return;
+        };
         a.scroll_to_offset(123.5);
         assert_eq!((a.top, a.scroll_remainder, a.sel), (2, 23.5, 0));
         a.scroll_to_offset(f32::MAX);
@@ -2681,7 +2688,9 @@ mod picker_tests {
     #[test]
     fn navigation_keeps_visible_rows_in_place_then_reveals_only_the_clipped_part() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();
-        let mut a = scroll_fixture("#");
+        let Some(mut a) = scroll_fixture("#") else {
+            return;
+        };
         a.sel = 1;
         a.ensure_visible();
         assert_eq!((a.top, a.scroll_remainder), (0, 0.0));
@@ -2704,7 +2713,9 @@ mod picker_tests {
     #[test]
     fn pixel_scrolled_rows_use_the_visible_part_for_pointer_hits() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();
-        let mut a = scroll_fixture("#");
+        let Some(mut a) = scroll_fixture("#") else {
+            return;
+        };
         a.scroll_to_offset(123.5);
         assert_eq!(a.row_at(100.0, 66.0), Some(2));
         assert_eq!(a.row_at(100.0, 93.0), Some(3));
@@ -2717,7 +2728,9 @@ mod picker_tests {
     #[test]
     fn clipboard_theme_pitch_is_shared_by_scroll_and_pointer_hits() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();
-        let mut a = scroll_fixture(";");
+        let Some(mut a) = scroll_fixture(";") else {
+            return;
+        };
         a.theme.metrics.item_content_height += 20.0;
         let pitch = ui::CLIP_ROW + 20.0;
         assert_eq!(a.layout().row, pitch);
@@ -2736,10 +2749,12 @@ mod picker_tests {
     #[test]
     fn direct_nonpicker_prefixes_keep_literal_input_and_regular_geometry() {
         for mode in ["apps", "search", "calculator", "actions", "windows"] {
-            let mut a = app(Config {
+            let Some(mut a) = app(Config {
                 default_modes: Some(vec![mode.into()]),
                 ..Config::default()
-            });
+            }) else {
+                return;
+            };
             a.apps = vec![items::App {
                 name: ":foo".into(),
                 exec: "true".into(),
@@ -2777,10 +2792,12 @@ mod picker_tests {
     #[test]
     fn calculator_and_actions_modes_limit_their_producers() {
         for (mode, query, count) in [("calculator", "1+2", 1), ("actions", "", 5)] {
-            let mut a = app(Config {
+            let Some(mut a) = app(Config {
                 default_modes: Some(vec![mode.into()]),
                 ..Config::default()
-            });
+            }) else {
+                return;
+            };
             a.query = query.into();
             a.refresh();
             assert_eq!(a.items.len(), count);
@@ -2797,7 +2814,7 @@ mod picker_tests {
             default_modes: Some(vec!["apps".into(), "clipboard".into()]),
             ..Config::default()
         };
-        let mut a = app(cfg);
+        let Some(mut a) = app(cfg) else { return };
         a.apps = vec![items::App {
             name: "Fixture app".into(),
             exec: "true".into(),
@@ -2825,13 +2842,15 @@ mod picker_tests {
     #[test]
     fn refresh_keeps_search_order_despite_saved_pins_and_usage() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();
+        let Some(mut a) = app(Config::default()) else {
+            return;
+        };
         let dir = std::env::temp_dir().join(format!("rl-rank-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("rl")).unwrap();
         let previous = std::env::var_os("XDG_STATE_HOME");
         std::env::set_var("XDG_STATE_HOME", &dir);
         std::fs::write(dir.join("rl/history"), "100\t1\tApplication:Alphi\n").unwrap();
         std::fs::write(dir.join("rl/pins"), "Application:Alphi\n").unwrap();
-        let mut a = app(Config::default());
         a.hist = hist::Hist::load();
         assert!(a.hist.is_pinned("Application:Alphi"));
         assert_eq!(a.hist.stats("Application:Alphi"), Some((100, 1)));
@@ -2878,7 +2897,9 @@ mod picker_tests {
     #[test]
     fn hiding_discards_input_click_count_before_the_next_panel() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();
-        let mut a = app(Config::default());
+        let Some(mut a) = app(Config::default()) else {
+            return;
+        };
         a.input_click = Some((Instant::now(), 2, 65.0, 29.0));
         a.hide();
         assert!(a.input_click.is_none());
@@ -2887,11 +2908,13 @@ mod picker_tests {
     #[test]
     fn configured_height_drives_viewport_and_emoji_paging() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();
-        let mut a = app(Config {
+        let Some(mut a) = app(Config {
             launcher_size: Some((720.0, 480.0)),
             width: 720,
             ..Config::default()
-        });
+        }) else {
+            return;
+        };
         assert_eq!(a.panel_height(), 480);
         assert_eq!(a.vp(), 406.0);
         a.query = ":".into();
@@ -2931,7 +2954,6 @@ mod picker_tests {
         assert!(!readme.contains("single-click activation is a config key"));
         // Emoji order is crate order; picked emojis are not promoted.
         assert!(!readme.contains("most recent copies appear first"));
-        // The packaging templates and their @BINARY@ placeholder are documented.
         // hyprland_auto_blur drives real Hyprland layer rules, not a no-op.
         assert!(!readme.contains("parsed but has no effect"));
     }

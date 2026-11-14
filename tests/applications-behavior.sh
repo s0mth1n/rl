@@ -6,7 +6,7 @@ cat > "$OUT/record-argv" <<'PY'
 #!/usr/bin/env python3
 import json, os, sys
 from pathlib import Path
-Path(sys.argv[1]).write_text(json.dumps({'args': sys.argv[2:], 'sid': os.getsid(0), 'pid': os.getpid(), 'marker': os.environ.get('PARITY_MARKER')}))
+Path(sys.argv[1]).write_text(json.dumps({'args': sys.argv[2:], 'sid': os.getsid(0), 'pid': os.getpid(), 'marker': os.environ.get('LAUNCH_MARKER')}))
 PY
 cat > "$OUT/fake-terminal" <<'PY'
 #!/usr/bin/env python3
@@ -17,7 +17,7 @@ PY
 chmod +x "$OUT/record-argv" "$OUT/fake-terminal"
 "$Z" quit
 for i in $(seq 30); do kill -0 "$RL_DAEMON_PID" 2>/dev/null || break; sleep .1; done
-TERMINAL="$OUT/fake-terminal" PARITY_MARKER=from-session "$Z" > "$OUT/apps-launcher.log" 2>&1 &
+TERMINAL="$OUT/fake-terminal" LAUNCH_MARKER=from-session "$Z" > "$OUT/apps-launcher.log" 2>&1 &
 record_test_pid "$!"
 for i in $(seq 30); do if "$Z" hide 2>/dev/null; then break; fi; sleep .1; done
 K="$here/target/release/examples/vkbd"
@@ -27,12 +27,12 @@ record_test_pid "$!"
 exec 3> "$OUT/apps-keys"
 "$Z" show
 sleep .3
-printf 't Parity Launch\ns .2\n' >&3
+printf 't Fixture Launch\ns .2\n' >&3
 sleep 1
 cat > "$XDG_DATA_HOME/applications/launch.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
-Name=Parity Launch
+Name=Fixture Launch
 Comment=Created while launcher is open
 Exec=$OUT/record-argv $OUT/launch-result literal\$HOME before%fafter ; touch $OUT/must-not-exist
 DESKTOP
@@ -54,12 +54,12 @@ echo 'PASS hot desktop creation, literal argv, detached session and environment'
 cat > "$XDG_DATA_HOME/applications/terminal.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
-Name=Parity Terminal
+Name=Fixture Terminal
 Exec=editor --new %U
 Terminal=true
 DESKTOP
 "$Z" show
-printf 't Parity Terminal\ns .3\n' >&3
+printf 't Fixture Terminal\ns .3\n' >&3
 sleep 1
 grim "$OUT/apps-terminal-live.png"
 printf 'k enter\ns .3\n' >&3

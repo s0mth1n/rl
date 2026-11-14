@@ -643,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn launcher_size_and_clipboard_defaults_follow_reference() {
+    fn launcher_size_and_clipboard_defaults_are_stable() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.launcher_size, None);
         assert_eq!(cfg.panel_size(), (600, 400));

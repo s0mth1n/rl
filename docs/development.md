@@ -48,8 +48,13 @@ Window rows show the title and application/workspace, with a Switch action that
 focuses the selected window ID. Launcher windows are excluded. A missing socket
 leaves application search available; failed reads are logged. IPC reads have a
 250 ms deadline and a 1 MiB reply limit. Hyprland, KWin and MangoWM have their own backends (see the README).
-not implemented.
 
 `tests/niri-windows.sh` runs the real launcher against a synthetic Niri socket
 under the headless compositor. It does not test a running Niri desktop.
 
+
+## Optional KWin support
+
+The default `kwin` Cargo feature enables KWin window switching through D-Bus.
+Build with `cargo build --release --no-default-features` to omit that backend
+and its zbus dependency. Other compositor backends remain available.

@@ -123,7 +123,7 @@ mod tests {
     }
 
     #[test]
-    fn argv_matches_reference_without_shell_expansion() {
+    fn argv_preserves_arguments_without_shell_expansion() {
         let env = HashMap::new();
         let command = command("/bin/echo 'two words' $HOME pre%fpost %%", false, &env).unwrap();
         assert_eq!(command.get_program(), "/bin/echo");

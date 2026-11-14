@@ -312,7 +312,7 @@ fn render(o: &Options) -> Result<(ui::Canvas, usize), Box<dyn Error>> {
     }
     icons.ensure_input(o.scale);
     if o.view == "clipboard" && !o.back {
-        icons.ensure("phosphor:copy", 16 * o.scale);
+        icons.ensure("symbol:copy", 16 * o.scale);
     }
     let mut canvas = ui::Canvas::new(o.cfg.width * o.scale, h * o.scale);
     let view = ui::View {

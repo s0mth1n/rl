@@ -19,33 +19,9 @@ COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-The header icons assets/icons/{search,layout-dashboard,settings,globe}.svg
-and the inline CircleX glyph in
-src/icons.rs are from Lucide (https://lucide.dev), via the copies bundled
-with gpui-component (https://github.com/longbridge/gpui-component).
-search.svg is derived from the Feather project, Copyright (c) 2013-present
-Cole Bemis, MIT License (same terms as above). The CircleX glyph inlined in
-src/icons.rs is Copyright (c) 2026 Lucide Icons and Contributors, ISC License:
+Bundled SVG symbols are original geometric drawings for rl, covered by the
+project MIT license in LICENSE. They are not imported icon-library assets.
 
-Permission to use, copy, modify, and/or distribute this software for any
-purpose with or without fee is hereby granted, provided that the above
-copyright notice and this permission notice appear in all copies.
-
-THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
-MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
-ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
-ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
-OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-
-The system action SVGs assets/icons/{power,reboot,moon,lock,sign-out}.svg
-and the AI view glyph assets/icons/brain.svg are Phosphor Icons (https://phosphoricons.com). Copyright (c) 2020 Phosphor Icons, MIT License. The permission
-notice above applies.
-
-List action and submenu SVGs in assets/icons/phosphor are from the Phosphor Icons project, Copyright (c) 2020 Phosphor Icons, MIT License.
-The full permission notice is in assets/icons/phosphor/LICENSE.
-
-The header Copy glyph in assets/icons/copy.svg is the Lucide copy bundled with
-gpui-component, Copyright (c) 2026 Lucide Icons and Contributors, ISC License
-(the full ISC permission notice above applies).
+Original top-level symbols: brain, copy, globe, layout-dashboard, lock, moon,
+power, reboot, search, settings, sign-out. Additional symbols are under
+assets/icons/symbols and use the same project license.

@@ -1177,7 +1177,7 @@ fn input_visible_text<'a>(query: &str, text: &'a str) -> &'a str {
     }
 }
 
-fn input_x(back: bool) -> f32 {
+pub(crate) fn input_x(back: bool) -> f32 {
     if back {
         49.7
     } else {
@@ -1634,16 +1634,7 @@ mod tests {
         v
     }
 
-    /// DejaVu Sans, the font examples/render.rs uses. None where it is not installed.
-    fn test_font() -> Option<Font<'static>> {
-        [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-        ]
-        .iter()
-        .find_map(|p| std::fs::read(p).ok())
-        .and_then(Font::try_from_vec)
-    }
+    use crate::testutil::font as test_font;
 
     /// Pixel at (x, y) as premultiplied B, G, R, A.
     fn px(cv: &Canvas, x: u32, y: u32) -> [u8; 4] {
@@ -1947,7 +1938,7 @@ mod tests {
         draw_input_with_placeholder(&mut empty, &font, &empty_input, Some(""));
         assert_eq!(lit(&empty, 22, 38, 20, 37), 0, "no prefix icon");
 
-        // selection: constant #1d4ed8
+        // Selection fill is independent of the theme.
         let mut icons = Cache::new("", "");
         icons.ensure_input(1);
         let vp = LIST_VP;
@@ -2073,7 +2064,7 @@ mod tests {
         let cv = drawn(&font, &items, 0, Theme::default());
         // panel: gray 15 at 0.7 alpha over a transparent buffer
         assert_eq!(px(&cv, 500, 30), [10, 10, 10, 178]);
-        // LauncherTheme.window_border is independent of the transparent border.
+        // The panel outline is independent of the transparent surface border.
         assert_eq!(px(&cv, 0, 110), [33, 33, 33, 185]);
         // selected row: white at 0.07 over the panel, not solid white
         assert_eq!(px(&cv, 480, 90), [27, 27, 27, 183]);
@@ -2287,12 +2278,7 @@ mod tests {
     #[test]
     fn long_input_keeps_its_unicode_suffix_and_caret_visible() {
         let _env = crate::testutil::ENV_LOCK.lock().unwrap();
-        let out = std::process::Command::new("fc-match")
-            .args(["-f", "%{file}", "sans-serif"])
-            .output()
-            .unwrap();
-        let data = std::fs::read(String::from_utf8(out.stdout).unwrap()).unwrap();
-        let font = Font::try_from_vec(data).unwrap();
+        let Some(font) = test_font() else { return };
         assert_eq!(input_tail(&font, 14.0, "", 30.0), "");
         assert_eq!(input_tail(&font, 14.0, "zed", 100.0), "zed");
         assert_eq!(input_tail(&font, 14.0, "a", 0.0), "");
@@ -2324,7 +2310,7 @@ mod tests {
     }
 
     #[test]
-    fn launcher_metrics_match_the_ported_layout() {
+    fn launcher_metrics_match_default_geometry() {
         let cfg = crate::config::Config::default();
         assert_eq!(
             (cfg.width, cfg.max_rows, cfg.startup_font_size()),

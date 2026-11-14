@@ -198,8 +198,9 @@ panel was not run there.
 
 ![Windows mode on niri](docs/screenshots/windows.png)
 
-The screenshots come from a nested niri build with a `background-effect` layer
-rule. `tests/screenshots.sh` regenerates them.
+The launcher, search, emoji and clipboard screenshots are from a private
+headless sway session. The blur and window screenshots are older nested niri
+captures with a `background-effect` layer rule.
 
 ## Development
 

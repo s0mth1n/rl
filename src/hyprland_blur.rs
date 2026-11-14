@@ -40,7 +40,7 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
     #[test]
-    fn blur_rules_use_the_launcher_namespace_in_reference_order() {
+    fn blur_rules_use_the_launcher_namespace() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("socket");
         let listener = UnixListener::bind(&path).unwrap();

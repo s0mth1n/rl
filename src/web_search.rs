@@ -41,8 +41,8 @@ impl ConfigSearchProvider {
 
     pub fn icon_name(&self) -> String {
         let name = self.icon.trim().to_ascii_lowercase();
-        if crate::icons::phosphor(&name).is_some() {
-            format!("phosphor:{name}")
+        if crate::icons::bundled_symbol(&name).is_some() {
+            format!("symbol:{name}")
         } else {
             if !name.is_empty() {
                 eprintln!(
@@ -50,7 +50,7 @@ impl ConfigSearchProvider {
                     self.icon
                 );
             }
-            "phosphor:magnifying-glass".into()
+            "symbol:magnifying-glass".into()
         }
     }
 }
@@ -116,11 +116,11 @@ mod tests {
             icon: " BOOK-OPEN ".into(),
         };
         assert_eq!(provider.build_url("a b+c/&?=é🙂-_.~"), "https://example.invalid/a%20b%2Bc%2F%26%3F%3D%C3%A9%F0%9F%99%82-_.~?again=a%20b%2Bc%2F%26%3F%3D%C3%A9%F0%9F%99%82-_.~");
-        assert_eq!(provider.icon_name(), "phosphor:book-open");
+        assert_eq!(provider.icon_name(), "symbol:book-open");
         let mut provider = provider;
         provider.icon = "unknown".into();
         provider.url = "https://example.invalid/static".into();
-        assert_eq!(provider.icon_name(), "phosphor:magnifying-glass");
+        assert_eq!(provider.icon_name(), "symbol:magnifying-glass");
         assert_eq!(
             provider.build_url("not inserted"),
             "https://example.invalid/static"

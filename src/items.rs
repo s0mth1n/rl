@@ -133,7 +133,7 @@ impl Search<'_> {
                                     if paths.len() == 1 {
                                         clip::clip_file_icon(&paths[0])
                                     } else {
-                                        "phosphor:file"
+                                        "symbol:file"
                                     }
                                     .to_string(),
                                 )
@@ -143,7 +143,7 @@ impl Search<'_> {
                                 Some(
                                     clip::file_url_path(&c.text)
                                         .map(|p| clip::clip_file_icon(&p))
-                                        .unwrap_or("phosphor:clipboard-text")
+                                        .unwrap_or("symbol:clipboard-text")
                                         .to_string(),
                                 )
                             },
@@ -165,7 +165,7 @@ impl Search<'_> {
                             title: format!("Image {} x {}", i.w, i.h),
                             sub: clip::timestamp(i.at, now),
                             tag: "Clipboard",
-                            icon: Some("phosphor:image".into()),
+                            icon: Some("symbol:image".into()),
                             action: Action::ClipImg(i.id, i.at),
                             best: false,
                         },
@@ -244,7 +244,7 @@ impl Search<'_> {
                         title: title.into(),
                         sub: sub.into(),
                         tag: "Basic",
-                        icon: Some(format!("phosphor:{icon}")),
+                        icon: Some(format!("symbol:{icon}")),
                         action: Action::View(view.into()),
                         best: false,
                     },
@@ -1039,7 +1039,7 @@ mod scan_tests {
     }
 
     #[test]
-    fn reference_parser_keeps_hidden_entries_and_basename_ids_win() {
+    fn desktop_parser_keeps_hidden_entries_and_basename_ids_win() {
         let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
         let root = tempfile::tempdir().unwrap();
         let user = root.path().join("user");
@@ -1206,7 +1206,7 @@ mod web_search_tests {
     }
 
     #[test]
-    fn defaults_custom_empty_and_invalid_config_match_reference() {
+    fn defaults_custom_empty_and_invalid_config_are_respected() {
         let cfg: Config = toml::from_str("").unwrap();
         let providers = cfg.search_providers.as_ref().unwrap();
         assert_eq!(
@@ -1230,7 +1230,7 @@ mod web_search_tests {
         assert_eq!(custom.search_providers.as_ref().unwrap().len(), 1);
         assert_eq!(
             rows(&custom, "!doc hello")[0].icon.as_deref(),
-            Some("phosphor:magnifying-glass")
+            Some("symbol:magnifying-glass")
         );
         assert!(rows(
             &toml::from_str::<Config>("search_providers=[]").unwrap(),

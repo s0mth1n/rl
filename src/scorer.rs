@@ -14,6 +14,7 @@ pub struct Scorer<'a> {
     matcher: SkimMatcherV2,
     config: &'a FuzzyConfig,
 }
+
 impl<'a> Scorer<'a> {
     pub fn new(config: &'a FuzzyConfig) -> Self {
         Self {
@@ -21,92 +22,61 @@ impl<'a> Scorer<'a> {
             config,
         }
     }
+
     pub fn score(&self, name: &str, description: &str, query: &str, kind: Kind) -> Option<i64> {
         if query.is_empty() {
             return Some(0);
         }
-        self.score_text_match(name, query, kind, false)
-            .or_else(|| self.score_text_match(description, query, kind, true))
-    }
-    fn score_text_match(
-        &self,
-        text: &str,
-        query: &str,
-        kind: Kind,
-        is_description: bool,
-    ) -> Option<i64> {
-        let match_result = self.matcher.fuzzy_indices(text, query);
-
-        let match_result = match_result.or_else(|| {
-            if query.contains(' ') {
-                let no_spaces: String = query.chars().filter(|c| *c != ' ').collect();
-                if let Some(result) = self.matcher.fuzzy_indices(text, &no_spaces) {
-                    return Some(result);
-                }
-
-                let with_hyphens = query.replace(' ', "-");
-                if let Some(result) = self.matcher.fuzzy_indices(text, &with_hyphens) {
-                    return Some(result);
-                }
-            }
-            None
-        });
-
-        let (base_score, indices) = match_result?;
-        let mut score = base_score;
-
-        if !is_description {
-            let query_lower = query.to_lowercase();
-            let text_lower = text.to_lowercase();
-            if text_lower == query_lower {
-                score += self.config.exact_match_bonus;
-            } else if text_lower.starts_with(&query_lower) {
-                score += self.config.prefix_match_bonus;
-            } else if self.matches_word_start(text, query) {
-                score += self.config.word_prefix_bonus;
-            }
-        }
-
-        score += self.calculate_contiguity_bonus(&indices);
-
-        if is_description {
-            score = (score as f64 * self.config.description_penalty) as i64;
-        }
-
-        score = self.apply_item_multiplier(score, kind);
-
-        Some(score)
-    }
-
-    fn calculate_contiguity_bonus(&self, indices: &[usize]) -> i64 {
-        if indices.len() <= 1 {
-            return self.config.contiguity_bonus;
-        }
-
-        let mut adjacent_count = 0;
-        for window in indices.windows(2) {
-            if window[1] == window[0] + 1 {
-                adjacent_count += 1;
-            }
-        }
-
-        let contiguity_ratio = adjacent_count as f64 / (indices.len() - 1) as f64;
-        (contiguity_ratio * self.config.contiguity_bonus as f64) as i64
-    }
-
-    fn matches_word_start(&self, text: &str, query: &str) -> bool {
+        let cfg = self.config;
         let query_lower = query.to_lowercase();
-        text.split_whitespace()
-            .any(|word| word.to_lowercase().starts_with(&query_lower))
-    }
-
-    fn apply_item_multiplier(&self, score: i64, kind: Kind) -> i64 {
-        let multiplier = match kind {
-            Kind::Action => self.config.action_score_multiplier,
-            Kind::Submenu => self.config.submenu_score_multiplier,
-            _ => 1.0,
-        };
-        (score as f64 * multiplier) as i64
+        for (text, description) in [(name, false), (description, true)] {
+            let matched = self.matcher.fuzzy_indices(text, query).or_else(|| {
+                if !query.contains(' ') {
+                    return None;
+                }
+                self.matcher
+                    .fuzzy_indices(text, &query.replace(' ', ""))
+                    .or_else(|| self.matcher.fuzzy_indices(text, &query.replace(' ', "-")))
+            });
+            let Some((mut score, positions)) = matched else {
+                continue;
+            };
+            if !description {
+                let lower = text.to_lowercase();
+                score += if lower == query_lower {
+                    cfg.exact_match_bonus
+                } else if lower.starts_with(&query_lower) {
+                    cfg.prefix_match_bonus
+                } else if lower
+                    .split_whitespace()
+                    .any(|word| word.starts_with(&query_lower))
+                {
+                    cfg.word_prefix_bonus
+                } else {
+                    0
+                };
+            }
+            let gaps = positions.len().saturating_sub(1);
+            let joined = positions
+                .windows(2)
+                .filter(|pair| pair[1] - pair[0] == 1)
+                .count();
+            score += if gaps == 0 {
+                cfg.contiguity_bonus
+            } else {
+                (joined as f64 / gaps as f64 * cfg.contiguity_bonus as f64) as i64
+            };
+            if description {
+                score = (score as f64 * cfg.description_penalty) as i64;
+            }
+            let weight = match kind {
+                Kind::Regular => 1.0,
+                Kind::Action => cfg.action_score_multiplier,
+                Kind::Submenu => cfg.submenu_score_multiplier,
+            };
+            return Some((score as f64 * weight) as i64);
+        }
+        None
     }
 }
 
@@ -117,7 +87,7 @@ mod tests {
         SkimMatcherV2::default().fuzzy_indices(text, query).unwrap()
     }
     #[test]
-    fn exact_prefix_word_and_contiguity_bonuses_match_reference() {
+    fn exact_prefix_word_and_contiguity_bonuses() {
         let cfg = FuzzyConfig::default();
         let scorer = Scorer::new(&cfg);
         for (text, query, bonus) in [
@@ -139,7 +109,7 @@ mod tests {
         );
     }
     #[test]
-    fn description_penalty_and_type_multipliers_apply_in_reference_order() {
+    fn description_penalty_precedes_type_multiplier() {
         let cfg = FuzzyConfig::default();
         let scorer = Scorer::new(&cfg);
         let raw = base("Web Browser", "browser").0 + 10_000;

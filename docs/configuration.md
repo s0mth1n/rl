@@ -65,13 +65,12 @@ icon = "book-open"
 ```
 
 `icon` is optional and defaults to magnifying-glass; names use the embedded
-Phosphor set. Query text is percent-encoded before each `{query}` substitution.
+symbol set. Query text is percent-encoded before each `{query}` substitution.
 
 Parsed applications are cached at `$XDG_CACHE_HOME/rl/apps.json` (normally
-`~/.cache/rl/apps.json`). A cache version mismatch, corrupt file or changed
-top-level XDG applications-directory mtime causes a rescan. Like the reference,
-in-place file edits and nested-directory edits can stay cached if the top-level
-directory mtime is unchanged. Deleting the cache forces the next load to rescan.
+`~/.cache/rl/apps.json`). The running daemon watches the application directories
+and reloads after installs, removals and edits. Cache versions and directory
+mtimes also protect startup loads; deleting the cache forces a fresh scan.
 
 ## Blur and transparency
 

@@ -40,9 +40,7 @@ pub fn data_dirs() -> Vec<PathBuf> {
     v
 }
 
-/// Last-resort icon search for names the theme index misses: `pixmaps` in every
-/// data dir (the reference lookup only reads /usr/share/pixmaps, which NixOS lacks)
-/// and the `apps` folders of every installed theme, whatever its index says.
+/// Last-resort search in every data directory: pixmaps and installed theme apps.
 fn scan_data_dirs(name: &str) -> Option<PathBuf> {
     scan_dirs(name, &data_dirs())
 }
@@ -174,33 +172,32 @@ pub const MODE_ACTIONS: &str = "builtin:mode-actions";
 pub const MODE_SEARCH: &str = "builtin:mode-search";
 pub const PALETTE: &str = "builtin:palette";
 
-const BACK_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg>"#;
-const PALETTE_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><circle cx="8.5" cy="10" r="1.2"/><circle cx="12" cy="7.5" r="1.2"/><circle cx="15.5" cy="10" r="1.2"/><circle cx="9" cy="14.5" r="1.2"/></svg>"#;
+const BACK_SVG: &[u8] = include_bytes!("../assets/icons/symbols/back.svg");
+const PALETTE_SVG: &[u8] = include_bytes!("../assets/icons/symbols/palette.svg");
 
-// Lucide circle-x (ISC, see NOTICE): the glyph the clear button shows.
-const CLEAR_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/></svg>"#;
+const CLEAR_SVG: &[u8] = include_bytes!("../assets/icons/symbols/clear.svg");
 
-pub fn phosphor(name: &str) -> Option<&'static [u8]> {
+pub fn bundled_symbol(name: &str) -> Option<&'static [u8]> {
     Some(match name {
-        "power" => include_bytes!("../assets/icons/phosphor/power.svg"),
-        "reboot" => include_bytes!("../assets/icons/phosphor/reboot.svg"),
-        "moon" => include_bytes!("../assets/icons/phosphor/moon.svg"),
-        "lock" => include_bytes!("../assets/icons/phosphor/lock.svg"),
-        "sign-out" => include_bytes!("../assets/icons/phosphor/sign-out.svg"),
-        "smiley" => include_bytes!("../assets/icons/phosphor/smiley.svg"),
-        "terminal" => include_bytes!("../assets/icons/phosphor/terminal.svg"),
-        "clipboard" => include_bytes!("../assets/icons/phosphor/clipboard-bold.svg"),
-        "clipboard-text" => include_bytes!("../assets/icons/phosphor/clipboard-text-bold.svg"),
-        "file" => include_bytes!("../assets/icons/phosphor/file-bold.svg"),
-        "file-text" => include_bytes!("../assets/icons/phosphor/file-text-bold.svg"),
-        "file-image" => include_bytes!("../assets/icons/phosphor/file-image-bold.svg"),
-        "image" => include_bytes!("../assets/icons/phosphor/image-bold.svg"),
-        "magnifying-glass" => include_bytes!("../assets/icons/phosphor/magnifying-glass-bold.svg"),
-        "globe" => include_bytes!("../assets/icons/phosphor/globe-bold.svg"),
-        "book-open" => include_bytes!("../assets/icons/phosphor/book-open-bold.svg"),
-        "youtube-logo" => include_bytes!("../assets/icons/phosphor/youtube-logo-bold.svg"),
-        "brain" => include_bytes!("../assets/icons/phosphor/brain-bold.svg"),
-        "palette" => include_bytes!("../assets/icons/phosphor/palette-bold.svg"),
+        "power" => include_bytes!("../assets/icons/symbols/power.svg"),
+        "reboot" => include_bytes!("../assets/icons/symbols/reboot.svg"),
+        "moon" => include_bytes!("../assets/icons/symbols/moon.svg"),
+        "lock" => include_bytes!("../assets/icons/symbols/lock.svg"),
+        "sign-out" => include_bytes!("../assets/icons/symbols/sign-out.svg"),
+        "smiley" => include_bytes!("../assets/icons/symbols/smiley.svg"),
+        "terminal" => include_bytes!("../assets/icons/symbols/terminal.svg"),
+        "clipboard" => include_bytes!("../assets/icons/symbols/clipboard.svg"),
+        "clipboard-text" => include_bytes!("../assets/icons/symbols/clipboard-text.svg"),
+        "file" => include_bytes!("../assets/icons/symbols/file.svg"),
+        "file-text" => include_bytes!("../assets/icons/symbols/file-text.svg"),
+        "file-image" => include_bytes!("../assets/icons/symbols/file-image.svg"),
+        "image" => include_bytes!("../assets/icons/symbols/image.svg"),
+        "magnifying-glass" => include_bytes!("../assets/icons/symbols/magnifying-glass.svg"),
+        "globe" => include_bytes!("../assets/icons/symbols/globe.svg"),
+        "book-open" => include_bytes!("../assets/icons/symbols/book-open.svg"),
+        "youtube-logo" => include_bytes!("../assets/icons/symbols/youtube-logo.svg"),
+        "brain" => include_bytes!("../assets/icons/symbols/brain.svg"),
+        "palette" => include_bytes!("../assets/icons/symbols/palette.svg"),
         _ => return None,
     })
 }
@@ -211,25 +208,24 @@ fn read_theme_setting(path: impl AsRef<Path>) -> std::io::Result<String> {
 }
 
 fn desktop_theme(config: &Path) -> Option<String> {
-    if let Ok(source) = read_theme_setting(config.join("kdeglobals")) {
-        let mut icons = false;
+    for (file, section, key) in [
+        ("kdeglobals", Some("Icons"), "Theme"),
+        ("gtk-3.0/settings.ini", None, "gtk-icon-theme-name"),
+        ("gtk-4.0/settings.ini", None, "gtk-icon-theme-name"),
+    ] {
+        let Ok(source) = read_theme_setting(config.join(file)) else {
+            continue;
+        };
+        let mut active = section.is_none();
         for line in source.lines().map(str::trim) {
             if line.starts_with('[') {
-                icons = line == "[Icons]";
-                continue;
-            }
-            if icons {
-                if let Some(theme) = line.strip_prefix("Theme=") {
-                    return Some(theme.into());
-                }
-            }
-        }
-    }
-    for file in ["gtk-3.0/settings.ini", "gtk-4.0/settings.ini"] {
-        if let Ok(source) = read_theme_setting(config.join(file)) {
-            for line in source.lines().map(str::trim) {
-                if let Some(theme) = line.strip_prefix("gtk-icon-theme-name=") {
-                    return Some(theme.into());
+                active = section.is_none()
+                    || line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) == section;
+            } else if active {
+                if let Some((name, value)) = line.split_once('=') {
+                    if name == key {
+                        return Some(value.to_owned());
+                    }
                 }
             }
         }
@@ -239,53 +235,55 @@ fn desktop_theme(config: &Path) -> Option<String> {
 
 /// KDE, GTK3, then GTK4 settings choose the theme; hicolor is the fallback.
 pub fn theme_chain(_theme: &str) -> Vec<String> {
-    static THEME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    let theme = THEME.get_or_init(|| {
-        let root = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-        desktop_theme(&root)
-    });
-    theme
-        .iter()
-        .cloned()
-        .chain(std::iter::once("hicolor".into()))
-        .collect()
+    static THEMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    THEMES
+        .get_or_init(|| {
+            let root = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+            let mut themes = root
+                .and_then(|p| desktop_theme(&p))
+                .into_iter()
+                .collect::<Vec<_>>();
+            themes.push("hicolor".to_owned());
+            themes
+        })
+        .clone()
 }
 
-/// Resolve at 64 px through the reference theme library, including inherited themes.
+/// Resolve a desktop icon through theme inheritance, then installed data directories.
 pub fn find(name: &str, themes: &[String]) -> Option<PathBuf> {
-    if name.starts_with('/') {
-        return Some(PathBuf::from(name)).filter(|path| path.exists());
+    let path = Path::new(name);
+    if path.is_absolute() {
+        return path.exists().then(|| path.to_owned());
     }
-    for theme in themes {
-        if let Some(path) = freedesktop_icons::lookup(name)
-            .with_size(64)
-            .with_theme(theme)
-            .find()
-        {
-            return Some(path);
-        }
-    }
-    freedesktop_icons::lookup(name)
-        .with_size(64)
-        .find()
+    themes
+        .iter()
+        .find_map(|theme| {
+            freedesktop_icons::lookup(name)
+                .with_size(64)
+                .with_theme(theme)
+                .find()
+        })
+        .or_else(|| freedesktop_icons::lookup(name).with_size(64).find())
         .or_else(|| scan_data_dirs(name))
 }
 
 pub fn find_window(name: &str, themes: &[String]) -> Option<PathBuf> {
+    let short = name.rsplit('.').next().unwrap_or(name);
+    let mut tried = std::collections::HashSet::new();
     for candidate in [
-        name.to_string(),
+        name.to_owned(),
         name.to_lowercase(),
-        name.rsplit('.').next().unwrap_or(name).to_string(),
-        name.rsplit('.').next().unwrap_or(name).to_lowercase(),
+        short.to_owned(),
+        short.to_lowercase(),
     ] {
-        if let Some(path) = find(&candidate, themes) {
-            return Some(path);
+        if tried.insert(candidate.clone()) {
+            if let Some(icon) = find(&candidate, themes) {
+                return Some(icon);
+            }
         }
     }
-    // Windows of apps whose class is not an icon name (Electron apps, KDE's
-    // org.kde.* classes): use the icon of the matching desktop entry.
     desktop_entry_icon(name).and_then(|icon| find(&icon, themes))
 }
 
@@ -592,13 +590,13 @@ impl Cache {
             DASHBOARD => Some(include_bytes!("../assets/icons/layout-dashboard.svg")),
             MODE_ACTIONS => Some(include_bytes!("../assets/icons/settings.svg")),
             MODE_SEARCH => Some(include_bytes!("../assets/icons/globe.svg")),
-            "phosphor:copy" => Some(include_bytes!("../assets/icons/copy.svg").as_slice()),
-            "phosphor:brain" => Some(include_bytes!("../assets/icons/brain.svg").as_slice()),
+            "symbol:copy" => Some(include_bytes!("../assets/icons/copy.svg").as_slice()),
+            "symbol:brain" => Some(include_bytes!("../assets/icons/brain.svg").as_slice()),
             _ => None,
         };
-        let icon = if symbol.is_none() && name.starts_with("phosphor:") {
-            let name = name.strip_prefix("phosphor:").unwrap();
-            phosphor(name)
+        let icon = if symbol.is_none() && name.starts_with("symbol:") {
+            let name = name.strip_prefix("symbol:").unwrap();
+            bundled_symbol(name)
                 .and_then(|svg| render_svg(svg, size * 2 / 3))
                 .map(|px| {
                     let inner = size * 2 / 3;
@@ -689,24 +687,24 @@ mod tests {
     fn cache_evicts_one_least_recently_requested_icon() {
         let mut cache = Cache::new("", "");
         for index in 0..256 {
-            cache.ensure(&format!("phosphor:missing-{index}"), 16);
+            cache.ensure(&format!("symbol:missing-{index}"), 16);
         }
-        cache.ensure("phosphor:missing-0", 16);
+        cache.ensure("symbol:missing-0", 16);
         cache.ensure(CLEAR, 16);
         assert_eq!(cache.map.len(), 256);
         assert_eq!(cache.order.len(), 256);
-        assert!(cache.map.contains_key(&("phosphor:missing-0".into(), 16)));
-        assert!(!cache.map.contains_key(&("phosphor:missing-1".into(), 16)));
-        assert!(cache.map.contains_key(&("phosphor:missing-255".into(), 16)));
+        assert!(cache.map.contains_key(&("symbol:missing-0".into(), 16)));
+        assert!(!cache.map.contains_key(&("symbol:missing-1".into(), 16)));
+        assert!(cache.map.contains_key(&("symbol:missing-255".into(), 16)));
         assert!(cache.get(CLEAR, 16).is_some());
     }
 
     #[test]
-    fn clipboard_header_copy_uses_the_component_svg_at_requested_size() {
+    fn clipboard_header_copy_uses_the_bundled_svg_at_requested_size() {
         let mut cache = Cache::new("", "");
         for size in [16, 32, 48] {
-            cache.ensure("phosphor:copy", size);
-            let icon = cache.get("phosphor:copy", size).unwrap();
+            cache.ensure("symbol:copy", size);
+            let icon = cache.get("symbol:copy", size).unwrap();
             assert!(icon.symbol);
             assert_eq!(
                 icon.px,
@@ -716,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn phosphor_assets_render_in_sixteen_pixel_glyph_boxes() {
+    fn symbol_assets_render_in_sixteen_pixel_glyph_boxes() {
         for name in [
             "smiley",
             "clipboard",
@@ -725,10 +723,10 @@ mod tests {
             "globe",
             "file-text",
         ] {
-            let source = phosphor(name).unwrap();
+            let source = bundled_symbol(name).unwrap();
             let expected = render_svg(source, 16).unwrap();
             let mut cache = Cache::new("", "");
-            let key = format!("phosphor:{name}");
+            let key = format!("symbol:{name}");
             cache.ensure(&key, 24);
             let icon = cache.get(&key, 24).unwrap();
             assert!(icon.symbol);
@@ -744,7 +742,7 @@ mod tests {
                 }
             }
         }
-        assert!(phosphor("not-an-icon").is_none());
+        assert!(bundled_symbol("not-an-icon").is_none());
     }
 
     #[test]
@@ -771,7 +769,7 @@ mod tests {
         cache.ensure_input(1);
         assert_eq!(cache.map.len(), 21);
         for index in 0..90 {
-            cache.ensure(&format!("phosphor:missing-{index}"), 16);
+            cache.ensure(&format!("symbol:missing-{index}"), 16);
         }
         cache.ensure_input(4);
         assert!(cache.get(SEARCH, 64).is_some());
@@ -891,7 +889,7 @@ mod resolver_tests {
         assert_eq!(desktop_theme(root.path()).as_deref(), Some("Third"));
     }
     #[test]
-    fn reference_lookup_fixture_worker() {
+    fn theme_lookup_fixture_worker() {
         let Some(root) = std::env::var_os("RL_ICON_LOOKUP_TEST_ROOT") else {
             return;
         };
@@ -916,7 +914,7 @@ mod resolver_tests {
         assert!(find(root.join("missing.svg").to_str().unwrap(), &themes).is_none());
     }
     #[test]
-    fn reference_lookup_uses_theme_inheritance_and_window_name_fallbacks() {
+    fn theme_lookup_uses_theme_inheritance_and_window_name_fallbacks() {
         let root = tempfile::tempdir().unwrap();
         for theme in ["Child", "Parent", "hicolor"] {
             let path = root.path().join(format!("data/icons/{theme}"));
@@ -946,7 +944,7 @@ mod resolver_tests {
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "icons::resolver_tests::reference_lookup_fixture_worker",
+                "icons::resolver_tests::theme_lookup_fixture_worker",
                 "--nocapture",
             ])
             .env("RL_ICON_LOOKUP_TEST_ROOT", root.path())
@@ -1039,15 +1037,15 @@ mod allocation_tests {
     #[test]
     fn oversized_theme_icons_are_not_allocated_or_cached() {
         let mut cache = Cache::new("", "");
-        for name in ["phosphor:palette", SEARCH, "😀", "/missing.png"] {
+        for name in ["symbol:palette", SEARCH, "😀", "/missing.png"] {
             for size in [0, 1025, 65536, u32::MAX] {
                 cache.ensure(name, size);
                 assert!(cache.get(name, size).is_none());
             }
         }
-        cache.ensure("phosphor:palette", 24);
+        cache.ensure("symbol:palette", 24);
         assert_eq!(
-            cache.get("phosphor:palette", 24).unwrap().px.len(),
+            cache.get("symbol:palette", 24).unwrap().px.len(),
             24 * 24 * 4
         );
     }

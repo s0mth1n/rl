@@ -22,12 +22,12 @@ impl SystemAction {
 
     pub fn details(&self) -> (&'static str, &str, &'static str) {
         match self {
-            Self::Shutdown => ("Shutdown", "Power off the system", "phosphor:power"),
-            Self::Reboot => ("Reboot", "Restart the system", "phosphor:reboot"),
-            Self::Suspend => ("Suspend", "Suspend to RAM", "phosphor:moon"),
-            Self::Lock => ("Lock Screen", "Lock the session", "phosphor:lock"),
-            Self::Logout => ("Log Out", "End the session", "phosphor:sign-out"),
-            Self::Command(cmd) => ("Custom Command", cmd, "phosphor:terminal"),
+            Self::Shutdown => ("Shutdown", "Power off the system", "symbol:power"),
+            Self::Reboot => ("Reboot", "Restart the system", "symbol:reboot"),
+            Self::Suspend => ("Suspend", "Suspend to RAM", "symbol:moon"),
+            Self::Lock => ("Lock Screen", "Lock the session", "symbol:lock"),
+            Self::Logout => ("Log Out", "End the session", "symbol:sign-out"),
+            Self::Command(cmd) => ("Custom Command", cmd, "symbol:terminal"),
         }
     }
 
@@ -135,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_commands_match_the_reference_without_running_them() {
+    fn builtin_commands_use_session_tools_without_running_them() {
         assert_eq!(
             SystemAction::ALL.map(|a| a.command()),
             [

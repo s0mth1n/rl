@@ -335,7 +335,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
             1.0,
         );
     }
-    let text_x = crate::ui::INPUT_X;
+    let text_x = crate::ui::input_x(true);
     cv.text(
         font,
         fs * 1.2,
@@ -352,7 +352,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
             INPUT_FG
         },
         1.0,
-        w - 48.0 * s,
+        w - (text_x + crate::ui::INPUT_RIGHT) * s,
     );
     cv.rrect(0.0, (HEAD - 1.0) * s, w, s, 0.0, SEPARATOR, SEPARATOR_ALPHA);
     // List/preview separator: theme.window_border, transparent under the daemon.
@@ -461,8 +461,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
                 );
             }
         }
-        // Show no Delete / Shift+Del chip on the selected row
-        // (it exists only in pinned ee71f96), so the title gets the full width.
+        // The title uses the full row width; there is no delete-key chip.
         let max_w = (split - tx - 16.0 * s).max(0.0);
         let text_top = box_y
             + (box_h - (m.item_title_line_height + m.layout_item_description_height) * s) / 2.0;
@@ -508,7 +507,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
         );
     }
     cv.clear_clip();
-    // The release draws a 1px divider between the list and the preview pane.
+    // A 1px divider separates the list from its preview.
     cv.rrect(
         split,
         HEAD * s,
@@ -519,7 +518,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View, history: &History) {
         crate::ui::SEPARATOR_ALPHA,
     );
     let x = split + (m.layout_separator_width + m.clipboard_preview_padding) * s;
-    // Preview text starts 4px higher.
+    // Raise preview text 4px within its line box.
     let y = (HEAD + LIST_PAD + m.clipboard_preview_padding - 4.0) * s;
     let pw = (w - x - (1.0 + m.clipboard_preview_padding) * s).max(0.0);
     let ph = (h - y - m.clipboard_preview_padding * s).max(0.0);
@@ -855,7 +854,7 @@ fn draw_color_preview(
     let code_gap = th.metrics.clipboard_color_code_gap * s;
     let preview_gap = th.metrics.clipboard_color_preview_gap * s;
     let codes_h = 3.0 * row_h + 2.0 * code_gap;
-    // The swatch sits 16px higher.
+    // Raise the swatch 16px within the preview.
     let top = y + (ph - swatch - preview_gap - codes_h) / 2.0 - 12.0 * s;
     let sx = x + (pw - swatch) / 2.0;
     cv.rrect(
@@ -915,16 +914,7 @@ fn draw_color_preview(
 mod tests {
     use super::*;
 
-    /// DejaVu Sans, the font examples/render.rs uses. None where it is not installed.
-    fn test_font() -> Option<Font<'static>> {
-        [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-        ]
-        .iter()
-        .find_map(|p| std::fs::read(p).ok())
-        .and_then(Font::try_from_vec)
-    }
+    use crate::testutil::font as test_font;
 
     #[test]
     fn clipboard_metrics_change_row_pitch_and_preview_pixels() {
