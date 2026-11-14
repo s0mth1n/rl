@@ -761,7 +761,7 @@ pub fn section_of(it: &Item) -> Option<&'static str> {
         "Window" => Some("Windows"),
         "Basic" | "System" => Some("Commands"),
         "Calculator" => Some("Calculator"),
-        "AI" | "Search" => Some("Search and AI"),
+        "AI" | "Search" => Some("Web Search"),
         _ => None,
     }
 }

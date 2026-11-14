@@ -344,7 +344,7 @@ fn module_section(module: config::ConfigModule) -> &'static str {
         Applications => "Applications",
         Windows => "Windows",
         Calculator => "Calculator",
-        Search => "Search and AI",
+        Search => "Web Search",
         _ => "Commands",
     }
 }
@@ -1275,7 +1275,7 @@ mod web_search_tests {
         );
         assert!(result.iter().filter(|i| i.tag == "Search").all(|i| !i.best
             && i.sub.is_empty()
-            && crate::ui::section_of(i) == Some("Search and AI")));
+            && crate::ui::section_of(i) == Some("Web Search")));
         assert_eq!(
             rows(&cfg, "!wiki Rust & C")[0].action,
             Action::WebSearch(
