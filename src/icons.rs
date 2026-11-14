@@ -527,6 +527,10 @@ pub struct Cache {
     /// PNG bytes supplied by the compositor for open windows (KWin), keyed by
     /// window address; used by "window-data:" icon names.
     window_pngs: HashMap<String, Vec<u8>>,
+    /// Resolved (or missed) icon file per window class. Resolving a class that
+    /// has no theme icon walks every icon theme and desktop entry, so the
+    /// answer is kept, misses included, until the application list changes.
+    window_paths: HashMap<String, Option<PathBuf>>,
 }
 
 impl Cache {
@@ -540,6 +544,7 @@ impl Cache {
                 Some(map_file(emoji_font))
             },
             window_pngs: HashMap::new(),
+            window_paths: HashMap::new(),
         }
     }
     /// Register compositor-provided PNG icon pixels for a window address.
@@ -548,6 +553,11 @@ impl Cache {
             self.window_pngs.clear();
         }
         self.window_pngs.insert(address.to_string(), png);
+    }
+    /// Drop remembered window icon lookups after installs or removals.
+    pub fn forget_window_icons(&mut self) {
+        self.window_paths.clear();
+        self.map.retain(|(name, _), _| !name.starts_with("window:"));
     }
     pub fn ensure(&mut self, name: &str, size: u32) {
         // Raster icons are limited to 4 MiB each, including theme and scale overrides.
@@ -617,7 +627,11 @@ impl Cache {
                 })
         } else {
             (if let Some(app_id) = name.strip_prefix("window:") {
-                find_window(app_id, &self.themes)
+                let themes = &self.themes;
+                self.window_paths
+                    .entry(app_id.to_string())
+                    .or_insert_with(|| find_window(app_id, themes))
+                    .clone()
             } else {
                 find(name, &self.themes)
             })

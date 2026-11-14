@@ -152,6 +152,7 @@ struct App {
     mono_font_family: Option<String>,
     bold_font: Option<Font<'static>>,
     apps: Vec<DesktopApp>,
+    apps_watched: bool,
     launched: Vec<std::process::Child>,
     windows: Vec<windows::Window>,
     items: Vec<Item>,
@@ -449,7 +450,11 @@ impl App {
         if self.compositor.is_none() || self.shell.is_none() {
             return;
         }
-        self.apps = app_cache::load(&self.cfg);
+        // The startup load plus the directory watcher keep `apps` current, so a
+        // show only reloads when no watcher could be started.
+        if !self.apps_watched {
+            self.apps = app_cache::load(&self.cfg);
+        }
         self.windows = if self
             .cfg
             .combined_modules()
@@ -2176,6 +2181,7 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
         mono_font_family: cfg.startup_fonts().mono_font_family,
         bold_font: load_bold_font(&cfg),
         apps: app_cache::load(&cfg),
+        apps_watched: false,
         launched: vec![],
         windows: vec![],
         items: vec![],
@@ -2253,6 +2259,7 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     let mut app_watch = app_watch::AppWatch::new()
         .map_err(|error| eprintln!("rl: cannot start application watcher: {error}"))
         .ok();
+    app.apps_watched = app_watch.is_some();
     loop {
         launch::reap(&mut app.launched);
         queue.dispatch_pending(&mut app)?;
@@ -2318,6 +2325,7 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
         }
         if app_watch.as_mut().is_some_and(|watch| watch.changed()) {
             app.apps = app_cache::load(&app.cfg);
+            app.icons.forget_window_icons();
             if app.shown {
                 app.refresh();
                 app.redraw(&qh);
@@ -2479,6 +2487,7 @@ mod picker_tests {
             mono_font_family: cfg.startup_fonts().mono_font_family,
             bold_font: load_bold_font(&cfg),
             apps: items::scan_apps(&cfg),
+            apps_watched: false,
             launched: vec![],
             windows: vec![],
             items: vec![],

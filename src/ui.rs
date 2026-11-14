@@ -901,7 +901,14 @@ fn enter_key(cv: &mut Canvas, _font: &Font, s: f32, right: f32, mid: f32, th: &T
     let bd = th.key_border;
     cv.rrect_outline(x, y, kw, kh, radius, s, bd.rgb, bd.alpha);
     let kc = th.key_color;
-    draw_return(cv, x + px + s, y + pt + s + lh / 2.0, return_glyph_width(fs), kc.rgb, kc.alpha);
+    draw_return(
+        cv,
+        x + px + s,
+        y + pt + s + lh / 2.0,
+        return_glyph_width(fs),
+        kc.rgb,
+        kc.alpha,
+    );
     kw
 }
 
@@ -1461,18 +1468,18 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
                 let c = th.action_label;
                 draw_arrow(cv, lx, y + layout.row / 2.0 * s, small_px, c.rgb, c.alpha);
             } else {
-            text_lh(
-                cv,
-                font,
-                small_px,
-                right - kw - 8.0 * s - lw,
-                y + (layout.row - 16.0) / 2.0 * s,
-                16.0 * s,
-                label,
-                th.action_label.rgb,
-                th.action_label.alpha,
-                lw + 4.0,
-            );
+                text_lh(
+                    cv,
+                    font,
+                    small_px,
+                    right - kw - 8.0 * s - lw,
+                    y + (layout.row - 16.0) / 2.0 * s,
+                    16.0 * s,
+                    label,
+                    th.action_label.rgb,
+                    th.action_label.alpha,
+                    lw + 4.0,
+                );
             }
             right -= kw + 8.0 * s + lw + 8.0 * s;
         }
@@ -2031,10 +2038,7 @@ mod tests {
         assert_eq!(actual.buf, expected.buf);
         for scale in [1.0, 2.0, 3.0] {
             let width = enter_key(&mut actual, &font, scale, 100.0, 15.0, &Theme::default());
-            assert_eq!(
-                width,
-                return_glyph_width(10.0 * scale) + 10.0 * scale
-            );
+            assert_eq!(width, return_glyph_width(10.0 * scale) + 10.0 * scale);
         }
     }
 
@@ -2053,10 +2057,7 @@ mod tests {
         for scale in [1.0, 2.0] {
             let mut cv = Canvas::new(400, 120);
             let width = enter_key(&mut cv, &font, scale, 150.0 * scale, 30.0 * scale, &theme);
-            assert_eq!(
-                width,
-                return_glyph_width(18.0 * scale) + 20.0 * scale
-            );
+            assert_eq!(width, return_glyph_width(18.0 * scale) + 20.0 * scale);
             let height = 36.0 * scale;
             let left = (150.0 * scale - width).ceil() as u32 + 2;
             let top = (30.0 * scale - height / 2.0).ceil() as u32;
