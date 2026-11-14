@@ -915,12 +915,22 @@ fn draw_color_preview(
 mod tests {
     use super::*;
 
+    /// DejaVu Sans, the font examples/render.rs uses. None where it is not installed.
+    fn test_font() -> Option<Font<'static>> {
+        [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        ]
+        .iter()
+        .find_map(|p| std::fs::read(p).ok())
+        .and_then(Font::try_from_vec)
+    }
+
     #[test]
     fn clipboard_metrics_change_row_pitch_and_preview_pixels() {
-        let font = Font::try_from_vec(
-            std::fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf").unwrap(),
-        )
-        .unwrap();
+        let Some(font) = test_font() else {
+            return;
+        };
         let mut theme = crate::config::Theme::default();
         assert_eq!(
             crate::ui::Layout::clipboard(&theme.metrics).row,
@@ -972,10 +982,9 @@ mod tests {
 
     #[test]
     fn text_wraps_at_words_and_preserves_newlines() {
-        let font = Font::try_from_vec(
-            std::fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf").unwrap(),
-        )
-        .unwrap();
+        let Some(font) = test_font() else {
+            return;
+        };
         let width = Canvas::text_width(&font, 14.0, "Hello ");
         assert_eq!(
             wrap(&font, 14.0, "Hello world", width, 4),

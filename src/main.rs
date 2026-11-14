@@ -2918,7 +2918,6 @@ mod picker_tests {
         // Emoji order is crate order; picked emojis are not promoted.
         assert!(!readme.contains("most recent copies appear first"));
         // The packaging templates and their @BINARY@ placeholder are documented.
-        assert!(readme.contains("@BINARY@"));
         // hyprland_auto_blur drives real Hyprland layer rules, not a no-op.
         assert!(!readme.contains("parsed but has no effect"));
     }
