@@ -1049,7 +1049,7 @@ mod tests {
     fn selected_image_is_cached_until_size_changes() {
         let image = Img {
             id: 1,
-            png: Some(png()),
+            png: Some(png().into()),
             path: std::path::PathBuf::new(),
             w: 2,
             h: 1,

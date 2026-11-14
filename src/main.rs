@@ -22,6 +22,7 @@ mod launch;
 mod modes;
 mod scorer;
 mod scroll;
+mod shutdown;
 mod socket_path;
 mod state_io;
 mod system_actions;
@@ -213,6 +214,7 @@ struct App {
     xkb: Option<xkb::State>,
     compose: Option<xkb::compose::State>,
     clip: clip::History,
+    clip_saver: clip::Saver,
     dc_manager: Option<ZwlrDataControlManagerV1>,
     dc_device: Option<ZwlrDataControlDeviceV1>,
     offers: std::collections::HashMap<wayland_client::backend::ObjectId, Vec<String>>,
@@ -1015,7 +1017,7 @@ impl App {
                 let position = self.sel;
                 if let Some(action) = selected {
                     if self.clip.remove(&action) && self.cfg.clipboard_persist {
-                        self.clip.save();
+                        self.clip_saver.save(&self.clip);
                     }
                 }
                 self.refresh();
@@ -1234,7 +1236,7 @@ impl App {
                     }
                 }
                 if self.cfg.clipboard_persist {
-                    self.clip.save();
+                    self.clip_saver.save(&self.clip);
                 }
                 if self.shown && self.view_query().starts_with(';') {
                     self.refresh();
@@ -2148,6 +2150,7 @@ fn main() {
 fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     launch::capture_environment();
     let cfg = Config::load();
+    let shutdown = shutdown::Shutdown::new()?;
     // Guard against two daemons racing past the connect check: without the
     // lock the second unlinks the first's live socket and both stay running.
     let lock_path = format!("{}.lock", sock());
@@ -2239,6 +2242,7 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
         xkb: None,
         compose: None,
         clip: clip::History::new(0),
+        clip_saver: clip::Saver::default(),
         dc_manager: None,
         dc_device: None,
         offers: Default::default(),
@@ -2278,6 +2282,11 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
             },
             libc::pollfd {
                 fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: shutdown.fd(),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -2322,6 +2331,9 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
         }
         unsafe {
             libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout);
+        }
+        if fds[2].revents & libc::POLLIN != 0 {
+            return Ok(());
         }
         if app_watch.as_mut().is_some_and(|watch| watch.changed()) {
             app.apps = app_cache::load(&app.cfg);
@@ -2403,6 +2415,7 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = s.write_all(b"ok\n");
                     }
                     "reload" => {
+                        app.clip_saver.flush();
                         let _ = s.write_all(b"ok\n");
                         let _ = std::fs::remove_file(sock());
                         if let Ok(exe) = std::env::current_exe() {
@@ -2545,6 +2558,7 @@ mod picker_tests {
             xkb: None,
             compose: None,
             clip: clip::History::new(0),
+            clip_saver: clip::Saver::default(),
             dc_manager: None,
             dc_device: None,
             offers: Default::default(),

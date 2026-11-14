@@ -142,11 +142,12 @@ pub fn preview(text: &str) -> String {
     }
 }
 
+#[derive(Clone)]
 pub struct Img {
     pub id: u64,
     /// PNG bytes while held in memory (fresh copies); `None` once the image
     /// is stored, in which case `path` provides the bytes on demand.
-    pub png: Option<Vec<u8>>,
+    pub png: Option<std::sync::Arc<Vec<u8>>>,
     pub path: std::path::PathBuf,
     pub w: u32,
     pub h: u32,
@@ -159,7 +160,7 @@ impl Img {
     /// store reads as unavailable.
     pub fn bytes(&self) -> Option<Vec<u8>> {
         if let Some(png) = &self.png {
-            return Some(png.clone());
+            return Some(png.as_ref().clone());
         }
         let png = crate::state_io::read(&self.path, MAX_IMAGE).ok()?;
         if png.len() > MAX_IMAGE || png_size(&png) != Some((self.w, self.h)) || fnv(&png) != self.id
@@ -375,6 +376,65 @@ pub(crate) fn unesc(t: &str) -> String {
 }
 
 #[derive(Default)]
+pub struct Saver {
+    pending: std::sync::Arc<std::sync::Mutex<Option<History>>>,
+    sender: Option<std::sync::mpsc::SyncSender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Saver {
+    pub fn save(&mut self, history: &History) {
+        self.save_to(history, dir());
+    }
+
+    fn save_to(&mut self, history: &History, dir: std::path::PathBuf) {
+        if self.sender.is_none() {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let pending = self.pending.clone();
+            let worker_dir = dir.clone();
+            match std::thread::Builder::new()
+                .name("clipboard-save".into())
+                .spawn(move || {
+                    while receiver.recv().is_ok() {
+                        let history = pending.lock().unwrap().take();
+                        if let Some(history) = history {
+                            history.save_to(&worker_dir);
+                        }
+                    }
+                }) {
+                Ok(worker) => {
+                    self.sender = Some(sender);
+                    self.worker = Some(worker);
+                }
+                Err(error) => {
+                    eprintln!("rl: cannot start clipboard saver: {error}");
+                    history.save_to(&dir);
+                    return;
+                }
+            }
+        }
+        *self.pending.lock().unwrap() = Some(history.clone());
+        // One wake is enough: the worker always takes the newest snapshot.
+        let _ = self.sender.as_ref().unwrap().try_send(());
+    }
+
+    pub fn flush(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            if worker.join().is_err() {
+                eprintln!("rl: clipboard saver stopped unexpectedly");
+            }
+        }
+    }
+}
+
+impl Drop for Saver {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+#[derive(Clone, Default)]
 pub struct History {
     pub entries: Vec<Clip>,
     pub images: Vec<Img>,
@@ -487,7 +547,7 @@ impl History {
             0,
             Img {
                 id,
-                png: Some(png.to_vec()),
+                png: Some(std::sync::Arc::new(png.to_vec())),
                 path: dir().join(format!("{id}.png")),
                 w,
                 h,
@@ -496,11 +556,6 @@ impl History {
         );
         self.trim();
         true
-    }
-
-    /// Write the history to disk so a restart does not lose it.
-    pub fn save(&self) {
-        self.save_to(&dir())
     }
 
     pub fn save_to(&self, d: &std::path::Path) {
@@ -521,7 +576,7 @@ impl History {
             s.push_str(&format!("i\t{}\t{}\t{}\t{}\n", i.at, i.id, i.w, i.h));
             let p = d.join(format!("{}.png", i.id));
             if let Some(png) = &i.png {
-                let _ = crate::state_io::write(&p, png);
+                let _ = crate::state_io::write(&p, png.as_slice());
             } else if !p.exists() {
                 // Stored image saved under another directory: carry the file.
                 if let Some(png) = i.bytes() {
@@ -529,6 +584,13 @@ impl History {
                 }
             }
         }
+        let tmp = d.join("state.tmp");
+        if crate::state_io::write(&tmp, s).is_err()
+            || std::fs::rename(&tmp, d.join("state")).is_err()
+        {
+            return;
+        }
+        // Old images stay until the new index is in place.
         if let Ok(rd) = std::fs::read_dir(d) {
             for f in rd.flatten() {
                 let n = f.file_name();
@@ -542,10 +604,6 @@ impl History {
                     }
                 }
             }
-        }
-        let tmp = d.join("state.tmp");
-        if crate::state_io::write(&tmp, s).is_ok() {
-            let _ = std::fs::rename(&tmp, d.join("state"));
         }
     }
 
@@ -658,6 +716,53 @@ mod tests {
         a.iter().map(|s| s.to_string()).collect()
     }
     #[test]
+    fn saver_flushes_latest_text_images_and_removals() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = History::new(4);
+        let image = tests_png(2, 1);
+        assert!(history.push_image(&image));
+        let bytes = history.images[0].png.as_ref().unwrap().clone();
+        let snapshot = history.clone();
+        assert!(std::sync::Arc::ptr_eq(
+            &bytes,
+            snapshot.images[0].png.as_ref().unwrap()
+        ));
+        let mut saver = Saver::default();
+        saver.save_to(&history, dir.path().to_owned());
+        for index in 0..100 {
+            assert!(history.push(&format!("copy {index}")));
+            saver.save_to(&history, dir.path().to_owned());
+        }
+        saver.flush();
+        let saved = History::load_from(dir.path(), 4);
+        assert_eq!(saved.entries, history.entries);
+        assert!(saved.images.is_empty());
+        assert!(!dir.path().join(format!("{}.png", fnv(&image))).exists());
+        assert!(history.push_image(&image));
+        saver.save_to(&history, dir.path().to_owned());
+        drop(saver);
+        let saved = History::load_from(dir.path(), 4);
+        assert_eq!(saved.entries, history.entries);
+        assert_eq!(saved.images[0].bytes(), Some(image));
+        assert!(!dir.path().join("state.tmp").exists());
+    }
+
+    #[test]
+    fn failed_index_commit_keeps_previously_stored_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = History::new(4);
+        assert!(history.push_image(&tests_png(1, 1)));
+        history.save_to(dir.path());
+        let path = dir.path().join(format!("{}.png", history.images[0].id));
+        assert!(path.exists());
+        history.images.clear();
+        std::fs::create_dir(dir.path().join("state.tmp")).unwrap();
+        history.save_to(dir.path());
+        assert!(path.exists());
+        assert_eq!(History::load_from(dir.path(), 4).images.len(), 1);
+    }
+
+    #[test]
     fn timestamps_follow_clipboard_age() {
         for (age, expected) in [
             (0, "Just now"),
@@ -699,7 +804,7 @@ mod tests {
         assert_eq!(texts(&history), v(&["second"]));
         history.images.push(Img {
             id: 1,
-            png: Some(vec![]),
+            png: Some(std::sync::Arc::new(vec![])),
             path: std::path::PathBuf::new(),
             w: 1,
             h: 1,
@@ -707,7 +812,7 @@ mod tests {
         });
         history.images.push(Img {
             id: 2,
-            png: Some(vec![]),
+            png: Some(std::sync::Arc::new(vec![])),
             path: std::path::PathBuf::new(),
             w: 1,
             h: 1,

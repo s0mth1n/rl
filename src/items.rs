@@ -848,7 +848,7 @@ mod tests {
         history.push("image notes");
         history.images.push(clip::Img {
             id: 42,
-            png: Some(Vec::new()),
+            png: Some(Vec::new().into()),
             path: std::path::PathBuf::new(),
             w: 1,
             h: 1,
@@ -905,7 +905,7 @@ mod tests {
         history.images = vec![
             clip::Img {
                 id: 1,
-                png: Some(Vec::new()),
+                png: Some(Vec::new().into()),
                 path: std::path::PathBuf::new(),
                 w: 1,
                 h: 1,
@@ -913,7 +913,7 @@ mod tests {
             },
             clip::Img {
                 id: 2,
-                png: Some(Vec::new()),
+                png: Some(Vec::new().into()),
                 path: std::path::PathBuf::new(),
                 w: 1,
                 h: 1,
