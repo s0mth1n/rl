@@ -193,6 +193,7 @@ fn hyprland_focus(socket: &Path, address: &str) -> Result<(), String> {
 // The zbus glue cannot run without a KDE session bus; the parsing half is
 // pure and unit-tested below.
 
+#[cfg(feature = "kwin")]
 fn kwin_connect() -> Option<zbus::blocking::Connection> {
     std::env::var_os("KDE_SESSION_VERSION")?;
     let conn = zbus::blocking::Connection::session().ok()?;
@@ -203,6 +204,7 @@ fn kwin_connect() -> Option<zbus::blocking::Connection> {
 }
 
 /// KRunner match tuple: (match_id, text, subtext, type, relevance, properties).
+#[cfg(feature = "kwin")]
 type KwinMatch = (
     String,
     String,
@@ -214,6 +216,7 @@ type KwinMatch = (
 
 /// Keep only the activate-action entries ("0_<uuid>") and derive the class
 /// from the runner's icon name, else the title's last " - " segment.
+#[cfg(any(feature = "kwin", test))]
 fn kwin_window(
     match_id: &str,
     title: &str,
@@ -233,6 +236,7 @@ fn kwin_window(
     })
 }
 
+#[cfg(feature = "kwin")]
 fn kwin_list(conn: &zbus::blocking::Connection) -> Result<Vec<Window>, String> {
     let runner =
         zbus::blocking::Proxy::new(conn, "org.kde.KWin", "/WindowsRunner", "org.kde.krunner1")
@@ -252,6 +256,7 @@ fn kwin_list(conn: &zbus::blocking::Connection) -> Result<Vec<Window>, String> {
         .collect())
 }
 
+#[cfg(feature = "kwin")]
 fn kwin_focus(conn: &zbus::blocking::Connection, address: &str) -> Result<(), String> {
     let runner =
         zbus::blocking::Proxy::new(conn, "org.kde.KWin", "/WindowsRunner", "org.kde.krunner1")
@@ -281,6 +286,7 @@ fn kwin_focus(conn: &zbus::blocking::Connection, address: &str) -> Result<(), St
 /// Decode the runner's icon-data property. The D-Bus structure is
 /// (width i32, height i32, rowstride i32, has_alpha bool, bits i32,
 /// channels i32, pixels [u8]); the pixels become a PNG.
+#[cfg(feature = "kwin")]
 fn kwin_icon_from_value(value: &zbus::zvariant::OwnedValue) -> Option<Vec<u8>> {
     use zbus::zvariant::{Structure, Value};
     let fields: &Structure = value.downcast_ref().ok()?;
@@ -304,6 +310,7 @@ fn kwin_icon_from_value(value: &zbus::zvariant::OwnedValue) -> Option<Vec<u8>> {
 }
 
 /// Re-encode raw icon pixels as PNG (pure; unit-tested without D-Bus).
+#[cfg(any(feature = "kwin", test))]
 fn icon_png(
     width: i32,
     height: i32,
@@ -457,6 +464,7 @@ fn mango_focus(socket: &Path, address: &str) -> Result<(), String> {
 
 enum Backend {
     Hyprland(PathBuf),
+    #[cfg(feature = "kwin")]
     KWin(zbus::blocking::Connection),
     Niri(PathBuf),
     Mango(PathBuf),
@@ -467,6 +475,7 @@ fn detect() -> Backend {
     if let Some(socket) = hyprland_socket() {
         return Backend::Hyprland(socket);
     }
+    #[cfg(feature = "kwin")]
     if let Some(conn) = kwin_connect() {
         return Backend::KWin(conn);
     }
@@ -482,6 +491,7 @@ fn detect() -> Backend {
 pub fn scan() -> Vec<Window> {
     let result = match detect() {
         Backend::Hyprland(socket) => hyprland_list(&socket),
+        #[cfg(feature = "kwin")]
         Backend::KWin(conn) => kwin_list(&conn),
         Backend::Niri(socket) => niri_list(&socket),
         Backend::Mango(socket) => mango_list(&socket),
@@ -499,6 +509,7 @@ pub fn scan() -> Vec<Window> {
 pub fn focus(address: &str) -> Result<(), String> {
     match detect() {
         Backend::Hyprland(socket) => hyprland_focus(&socket, address),
+        #[cfg(feature = "kwin")]
         Backend::KWin(conn) => kwin_focus(&conn, address),
         Backend::Niri(socket) => niri_focus(&socket, address),
         Backend::Mango(socket) => mango_focus(&socket, address),
