@@ -460,6 +460,31 @@ impl Canvas {
         }
     }
 
+    /// Anti-aliased line with round caps, drawn without any font.
+    #[allow(clippy::too_many_arguments)]
+    pub fn line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, c: Rgb, alpha: f32) {
+        let r = width / 2.0;
+        let (minx, maxx) = (x0.min(x1) - r - 1.0, x0.max(x1) + r + 1.0);
+        let (miny, maxy) = (y0.min(y1) - r - 1.0, y0.max(y1) + r + 1.0);
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let len2 = dx * dx + dy * dy;
+        for py in miny.floor() as i32..=maxy.ceil() as i32 {
+            for px in minx.floor() as i32..=maxx.ceil() as i32 {
+                let (fx, fy) = (px as f32 + 0.5 - x0, py as f32 + 0.5 - y0);
+                let t = if len2 > 0.0 {
+                    ((fx * dx + fy * dy) / len2).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let d = (fx - t * dx).hypot(fy - t * dy);
+                let cov = (r - d + 0.5).clamp(0.0, 1.0);
+                if cov > 0.0 && py >= self.clip_top && py < self.clip_y {
+                    self.blend(px, py, c, cov * alpha);
+                }
+            }
+        }
+    }
+
     pub fn text_width(font: &Font, size: f32, s: &str) -> f32 {
         let sc = em_scale(font, size);
         font.layout(s, sc, point(0.0, 0.0)).last().map_or(0.0, |g| {
@@ -805,7 +830,7 @@ fn action_label(a: &Action) -> &'static str {
         Action::Calculate(_) => "Copy",
         Action::Window(_) => "Switch",
         Action::Clip(..) | Action::ClipFiles(..) | Action::ClipImg(..) => "Copy",
-        Action::View(_) => "→",
+        Action::View(_) => "",
     }
 }
 
@@ -828,8 +853,37 @@ fn text_lh(
     cv.text(font, size, x, y + gap, s, c, alpha, max_w);
 }
 
+/// Right arrow drawn from lines, `size` wide, vertically centred on `mid`.
+fn draw_arrow(cv: &mut Canvas, x: f32, mid: f32, size: f32, c: Rgb, alpha: f32) {
+    let sw = (size * 0.12).max(1.0);
+    let h = size * 0.28;
+    let x1 = x + size - sw / 2.0;
+    cv.line(x + sw / 2.0, mid, x1, mid, sw, c, alpha);
+    cv.line(x1 - h, mid - h, x1, mid, sw, c, alpha);
+    cv.line(x1 - h, mid + h, x1, mid, sw, c, alpha);
+}
+
+/// Return/enter glyph drawn from lines: stem down on the right, bar back to
+/// the left, arrow head on the left. `size` is the glyph box width and height.
+fn draw_return(cv: &mut Canvas, x: f32, mid: f32, size: f32, c: Rgb, alpha: f32) {
+    let sw = (size * 0.11).max(1.0);
+    let h = size * 0.26;
+    let top = mid - size * 0.3;
+    let bot = mid + size * 0.22;
+    let (l, r) = (x + sw / 2.0 + h * 0.4, x + size - sw / 2.0);
+    cv.line(r, top, r, bot, sw, c, alpha);
+    cv.line(r, bot, l, bot, sw, c, alpha);
+    cv.line(l + h, bot - h, l, bot, sw, c, alpha);
+    cv.line(l + h, bot + h, l, bot, sw, c, alpha);
+}
+
+/// Width of the return glyph box at font size `fs`.
+fn return_glyph_width(fs: f32) -> f32 {
+    fs * 0.9
+}
+
 /// Small "return" key glyph: a box with an arrow, right edge at `right`. Returns its width.
-fn enter_key(cv: &mut Canvas, font: &Font, s: f32, right: f32, mid: f32, th: &Theme) -> f32 {
+fn enter_key(cv: &mut Canvas, _font: &Font, s: f32, right: f32, mid: f32, th: &Theme) -> f32 {
     let m = th.metrics;
     let fs = m.action_indicator_key_font_size * s;
     let lh = m.action_indicator_key_line_height * s;
@@ -838,7 +892,7 @@ fn enter_key(cv: &mut Canvas, font: &Font, s: f32, right: f32, mid: f32, th: &Th
     let pb = m.action_indicator_key_padding_bottom * s;
     let radius = m.action_indicator_key_border_radius * s;
     let (kw, kh) = (
-        Canvas::text_width(font, fs, "↵") + 2.0 * px + 2.0 * s,
+        return_glyph_width(fs) + 2.0 * px + 2.0 * s,
         lh + pt + pb + 2.0 * s,
     );
     let (x, y) = (right - kw, mid - kh / 2.0);
@@ -847,18 +901,7 @@ fn enter_key(cv: &mut Canvas, font: &Font, s: f32, right: f32, mid: f32, th: &Th
     let bd = th.key_border;
     cv.rrect_outline(x, y, kw, kh, radius, s, bd.rgb, bd.alpha);
     let kc = th.key_color;
-    text_lh(
-        cv,
-        font,
-        fs,
-        x + px + s,
-        y + pt + s,
-        lh,
-        "↵",
-        kc.rgb,
-        kc.alpha,
-        kw,
-    );
+    draw_return(cv, x + px + s, y + pt + s + lh / 2.0, return_glyph_width(fs), kc.rgb, kc.alpha);
     kw
 }
 
@@ -1407,7 +1450,17 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
         if selected {
             let label = action_label(&it.action);
             let kw = enter_key(cv, font, s, right, y + layout.row / 2.0 * s, th);
-            let lw = Canvas::text_width(font, small_px, label);
+            let is_view = matches!(it.action, Action::View(_));
+            let lw = if is_view {
+                small_px
+            } else {
+                Canvas::text_width(font, small_px, label)
+            };
+            let lx = right - kw - 8.0 * s - lw;
+            if is_view {
+                let c = th.action_label;
+                draw_arrow(cv, lx, y + layout.row / 2.0 * s, small_px, c.rgb, c.alpha);
+            } else {
             text_lh(
                 cv,
                 font,
@@ -1420,6 +1473,7 @@ pub fn draw(cv: &mut Canvas, font: &Font, v: &View) {
                 th.action_label.alpha,
                 lw + 4.0,
             );
+            }
             right -= kw + 8.0 * s + lw + 8.0 * s;
         }
         let tx = ix + icon_size + 8.0 * s;
@@ -1979,7 +2033,7 @@ mod tests {
             let width = enter_key(&mut actual, &font, scale, 100.0, 15.0, &Theme::default());
             assert_eq!(
                 width,
-                Canvas::text_width(&font, 10.0 * scale, "↵") + 10.0 * scale
+                return_glyph_width(10.0 * scale) + 10.0 * scale
             );
         }
     }
@@ -2001,7 +2055,7 @@ mod tests {
             let width = enter_key(&mut cv, &font, scale, 150.0 * scale, 30.0 * scale, &theme);
             assert_eq!(
                 width,
-                Canvas::text_width(&font, 18.0 * scale, "↵") + 20.0 * scale
+                return_glyph_width(18.0 * scale) + 20.0 * scale
             );
             let height = 36.0 * scale;
             let left = (150.0 * scale - width).ceil() as u32 + 2;
